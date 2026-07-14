@@ -193,7 +193,7 @@ class ProductMasterV2(ctk.CTk):
         super().__init__()
         ctk.set_appearance_mode('light')
         ctk.set_default_color_theme('blue')
-        self.title('Orchid Event Manager - Product Master')
+        self.title('Orchid Event Manager - Product Master (Navigation Fix)')
         self.geometry('1220x900')
         self.minsize(1080, 760)
         self.configure(fg_color=WINDOW_BG)
@@ -381,19 +381,31 @@ class ProductMasterV2(ctk.CTk):
         self.incomplete_only_var.set(False)
         self.apply_filters()
 
-    def apply_filters(self):
+    def get_matching_style_keys(self):
         search_text = self.search_var.get().strip().lower()
         incomplete_only = self.incomplete_only_var.get()
         matched = []
+
         for style_key in self.all_style_keys:
             rows = self.get_style_rows(style_key)
+
             if incomplete_only and self.style_is_complete(rows):
                 continue
-            combined = ' '.join(clean_text(value) for value in rows[COLUMNS].to_numpy().flatten()).lower()
+
+            combined = ' '.join(
+                clean_text(value)
+                for value in rows[COLUMNS].to_numpy().flatten()
+            ).lower()
+
             if search_text and search_text not in combined:
                 continue
+
             matched.append(style_key)
-        self.filtered_style_keys = matched
+
+        return matched
+
+    def apply_filters(self):
+        self.filtered_style_keys = self.get_matching_style_keys()
         self.style_position = 0
         self.refresh_progress()
         self.show_current_style()
@@ -478,16 +490,48 @@ class ProductMasterV2(ctk.CTk):
         return True
 
     def save_and_next_style(self):
-        current_key = self.filtered_style_keys[self.style_position] if self.filtered_style_keys else None
+        if not self.filtered_style_keys:
+            return
+
+        current_key = self.filtered_style_keys[self.style_position]
+
+        try:
+            current_global_position = self.all_style_keys.index(current_key)
+        except ValueError:
+            current_global_position = -1
+
         if not self.save_current_style():
             return
-        self.apply_filters()
-        if current_key in self.filtered_style_keys:
-            current_index = self.filtered_style_keys.index(current_key)
-            self.style_position = min(current_index+1, len(self.filtered_style_keys)-1)
-        else:
-            self.style_position = min(self.style_position, max(len(self.filtered_style_keys)-1, 0))
+
+        # Rebuild the filtered list without resetting to the first style.
+        self.filtered_style_keys = self.get_matching_style_keys()
+        self.refresh_progress()
+
+        if not self.filtered_style_keys:
+            self.style_position = 0
+            self.show_current_style()
+            return
+
+        # Always move forward in the full catalog order. This prevents
+        # Save & Next from bouncing between the same two incomplete styles.
+        next_key = None
+        for candidate in self.all_style_keys[current_global_position + 1:]:
+            if candidate in self.filtered_style_keys:
+                next_key = candidate
+                break
+
+        if next_key is not None:
+            self.style_position = self.filtered_style_keys.index(next_key)
+            self.show_current_style()
+            return
+
+        # No later matching style remains. Stay at the final matching style
+        # and clearly indicate that the end of the filtered list was reached.
+        self.style_position = len(self.filtered_style_keys) - 1
         self.show_current_style()
+        self.status_label.configure(
+            text='Reached the end of the current filtered style list.'
+        )
 
     def previous_style(self):
         if self.filtered_style_keys and self.style_position > 0:
