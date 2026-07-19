@@ -320,9 +320,13 @@ def _canonical_vendor(value: object, registry: dict[str, str] | None = None) -> 
 
 
 def _build_review_data(
-    shopify_csv_path: Path, product_master_path: Path, decoration_fulfillment: str = STANDARD_ORCHID_WORKFLOW
+    shopify_csv_path: Path,
+    product_master_path: Path,
+    decoration_fulfillment: str = STANDARD_ORCHID_WORKFLOW,
+    normalized_orders: pd.DataFrame | None = None,
+    parsed_orders: pd.DataFrame | None = None,
 ):
-    raw = normalize_order_export(shopify_csv_path)
+    raw = normalized_orders.copy(deep=True) if normalized_orders is not None else normalize_order_export(shopify_csv_path)
     if "Name" in raw.columns:
         raw["Name"] = raw["Name"].replace("", pd.NA).ffill().fillna("")
     for column in ["Billing Company", "Billing Name", "Notes", "Created at"]:
@@ -334,7 +338,11 @@ def _build_review_data(
                 .fillna("")
             )
 
-    parsed = parse_shopify_orders(shopify_csv_path, product_master_path).copy()
+    parsed = (
+        parsed_orders.copy(deep=True)
+        if parsed_orders is not None
+        else parse_shopify_orders(shopify_csv_path, product_master_path, normalized_orders=raw).copy()
+    )
     master = load_extended_master(product_master_path)
 
     for column in [
@@ -352,13 +360,22 @@ def _build_review_data(
     parsed["Quantity"] = pd.to_numeric(parsed["Quantity"], errors="coerce").fillna(0).astype(int)
 
     resolved_records = []
+    resolution_cache = {}
     for _, source in parsed.iterrows():
-        result = resolve_product(
-            source.get("Style Number", ""),
-            source.get("Product Name", ""),
-            source.get("Garment Color", ""),
-            master,
+        resolution_key = tuple(
+            clean_text(source.get(field, "")).casefold()
+            for field in ("Style Number", "Product Name", "Garment Color")
         )
+        result = resolution_cache.get(resolution_key)
+        if result is None:
+            result = resolve_product(
+                source.get("Style Number", ""),
+                source.get("Product Name", ""),
+                source.get("Garment Color", ""),
+                master,
+                master_prepared=True,
+            )
+            resolution_cache[resolution_key] = result
         record = source.to_dict()
         record.update(result.as_dict())
 
@@ -1010,6 +1027,8 @@ def generate_review_workbook(
     decoration_fulfillment: str = STANDARD_ORCHID_WORKFLOW,
     regenerate_helper: Path | None = None,
     previous_review_path: Path | None = None,
+    normalized_orders: pd.DataFrame | None = None,
+    parsed_orders: pd.DataFrame | None = None,
 ) -> dict:
     report_mode = normalize_report_mode(report_mode)
     decoration_fulfillment = normalize_decoration_fulfillment(decoration_fulfillment)
@@ -1018,7 +1037,8 @@ def generate_review_workbook(
     master_signature = product_master_signature(product_master_path)
     # Always reload the active Product Master from disk immediately before building.
     detail, review, excluded, raw = _build_review_data(
-        Path(shopify_csv_path), product_master_path, decoration_fulfillment
+        Path(shopify_csv_path), product_master_path, decoration_fulfillment,
+        normalized_orders=normalized_orders, parsed_orders=parsed_orders,
     )
     now = datetime.now()
     stamp = now.strftime("%Y%m%d_%H%M%S_%f")

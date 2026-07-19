@@ -303,11 +303,13 @@ def _live_routes(
     report_mode: str,
     unresolved_ids: set[str],
     data_root: Path | None,
+    lines: list[dict[str, object]] | None = None,
 ) -> list[dict[str, str]]:
-    try:
-        lines = load_review_lines(path)
-    except Exception:
-        lines = []
+    if lines is None:
+        try:
+            lines = load_review_lines(path)
+        except Exception:
+            lines = []
 
     prepared: list[dict[str, object]] = []
     for record in lines:
@@ -506,7 +508,7 @@ def load_mission_control_snapshot(workbook_path: Path, data_root: Path | None = 
         })
 
     issues = list(issues_by_key.values())
-    routes = _live_routes(path, snapshot["report_mode"], blocked_line_ids, data_root)
+    routes = _live_routes(path, snapshot["report_mode"], blocked_line_ids, data_root, lines=all_lines)
     blocked_routes = [route for route in routes if clean(route.get("status", "")).casefold() != "ready"]
     line_count = len(included_lines)
     snapshot["issues"] = issues

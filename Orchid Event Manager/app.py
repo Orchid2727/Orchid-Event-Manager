@@ -15,7 +15,7 @@ from openpyxl import load_workbook
 from PIL import Image as PILImage, ImageDraw, ImageFont
 from tkinter import filedialog, messagebox, simpledialog
 
-from modules.shopify_parser import parse_shopify_orders
+from modules.shopify_parser import normalize_order_export, parse_shopify_orders
 from modules.catalog_manager import (
     backup_file,
     clean_product_master,
@@ -23,10 +23,7 @@ from modules.catalog_manager import (
     restore_seed_product_master,
     save_product_candidate_list,
 )
-from modules.review_workbook import generate_review_workbook
-from modules.final_po_generator import generate_final_purchase_orders, generate_employee_totals_pdf
 from modules.purchase_order_generator import safe_filename
-from modules.routing_diagnostics import generate_routing_diagnostic_workbook
 from modules.paths import (
     data_dir,
     legacy_data_dir,
@@ -127,6 +124,17 @@ def _clean(value: object) -> str:
     return " ".join(str(value or "").split())
 
 
+def _file_stamp(path: Path | None) -> tuple[str, int, int]:
+    if not path:
+        return ("", 0, 0)
+    candidate = Path(path)
+    try:
+        stat = candidate.stat()
+        return (str(candidate.resolve()), int(stat.st_mtime_ns), int(stat.st_size))
+    except (FileNotFoundError, OSError):
+        return (str(candidate), 0, 0)
+
+
 def should_show_employee_totals(
     snapshot: dict, workbook_exists: bool, current_mode: str = "", imported_line_count: int = 0
 ) -> bool:
@@ -136,9 +144,17 @@ def should_show_employee_totals(
     return bool(workbook_exists and line_count > 0 and report_mode == UNIFORM_SIZING_EVENT)
 
 
+_PRODUCT_MASTER_HEALTH_CACHE_KEY: tuple[str, int, int] | None = None
+_PRODUCT_MASTER_HEALTH_CACHE_VALUE: dict[str, int] | None = None
+
+
 def _product_master_health() -> dict[str, int]:
+    global _PRODUCT_MASTER_HEALTH_CACHE_KEY, _PRODUCT_MASTER_HEALTH_CACHE_VALUE
     result = {"records": 0, "styles": 0, "complete": 0, "incomplete": 0, "percent": 0}
     master_path = live_product_master_path()
+    cache_key = _file_stamp(master_path)
+    if cache_key == _PRODUCT_MASTER_HEALTH_CACHE_KEY and _PRODUCT_MASTER_HEALTH_CACHE_VALUE is not None:
+        return dict(_PRODUCT_MASTER_HEALTH_CACHE_VALUE)
     if not master_path.exists():
         return result
     try:
@@ -198,6 +214,8 @@ def _product_master_health() -> dict[str, int]:
         "incomplete": max(styles - complete, 0),
         "percent": round((complete / styles) * 100) if styles else 0,
     })
+    _PRODUCT_MASTER_HEALTH_CACHE_KEY = cache_key
+    _PRODUCT_MASTER_HEALTH_CACHE_VALUE = dict(result)
     return result
 
 
@@ -216,7 +234,7 @@ class OrchidPurchaseManager(ctk.CTk):
     def __init__(self):
         super().__init__()
         ctk.set_appearance_mode("light")
-        self.title("Orchid Purchase Manager Professional 4.8.19")
+        self.title("Orchid Purchase Manager Professional 4.8.20")
         self.geometry("1400x900")
         self.minsize(1180, 760)
         self.configure(fg_color=BG)
@@ -263,6 +281,12 @@ class OrchidPurchaseManager(ctk.CTk):
         self._logo_pulse_running = False
         self._logo_pulse_after_ids = []
         self._outsourced_logo_dialog_pending = False
+        self._mission_snapshot_cache_key = None
+        self._mission_snapshot_cache: dict = {}
+        self._dashboard_refresh_key = None
+        self._normalized_import_cache = None
+        self._parsed_import_cache = None
+        self._import_cache_key = None
 
         try:
             enforce_permanent_vendor_overrides(live_product_master_path())
@@ -274,10 +298,12 @@ class OrchidPurchaseManager(ctk.CTk):
         install_native_scroll_support(
             self,
             [
-                self.mc_work_scroll,
-                self.mc_employee_scroll,
-                self.settings_scroll,
-                self.review_decision_frame,
+                frame for frame in (
+                    getattr(self, "mc_work_scroll", None),
+                    getattr(self, "mc_employee_scroll", None),
+                    getattr(self, "settings_scroll", None),
+                    getattr(self, "review_decision_frame", None),
+                ) if frame is not None
             ],
         )
         self.refresh_dashboard()
@@ -698,6 +724,25 @@ class OrchidPurchaseManager(ctk.CTk):
                 digest.update(chunk)
         return digest.hexdigest()
 
+    def _remember_import_frames(self, path: Path, normalized, parsed) -> None:
+        self._import_cache_key = (_file_stamp(path), _file_stamp(live_product_master_path()))
+        self._normalized_import_cache = normalized.copy(deep=True)
+        self._parsed_import_cache = parsed.copy(deep=True)
+
+    def _cached_import_frames(self, path: Path):
+        key = (_file_stamp(path), _file_stamp(live_product_master_path()))
+        if key != self._import_cache_key:
+            return None, None
+        normalized = (
+            self._normalized_import_cache.copy(deep=True)
+            if self._normalized_import_cache is not None else None
+        )
+        parsed = (
+            self._parsed_import_cache.copy(deep=True)
+            if self._parsed_import_cache is not None else None
+        )
+        return normalized, parsed
+
     def _load_review_state(self) -> dict:
         try:
             if REVIEW_STATE_FILE.exists():
@@ -924,7 +969,7 @@ class OrchidPurchaseManager(ctk.CTk):
         footer = ctk.CTkFrame(sidebar, fg_color="transparent")
         footer.grid(row=4, column=0, sticky="ew", padx=16, pady=(10, 18))
         ctk.CTkLabel(
-            footer, text="v 4.8.19", text_color="#CFC4E0",
+            footer, text="v 4.8.20", text_color="#CFC4E0",
             font=ctk.CTkFont(size=12), justify="left", anchor="w",
         ).pack(anchor="w", padx=8, pady=(0, 10))
         ctk.CTkFrame(footer, height=1, fg_color="#40375A").pack(fill="x", padx=7, pady=(0, 11))
@@ -997,14 +1042,33 @@ class OrchidPurchaseManager(ctk.CTk):
         self.page_container.grid_columnconfigure(0, weight=1)
 
         self.build_dashboard_page()
-        self.build_import_page()
-        self.build_master_page()
-        self.build_review_page()
-        self.build_purchase_page()
-        self.build_employee_totals_page()
-        self.build_outsourced_job_logo_page()
-        self.build_archive_page()
-        self.build_settings_page()
+        self._page_builders = {
+            "import": self.build_import_page,
+            "master": self.build_master_page,
+            "review": self.build_review_page,
+            "purchase": self.build_purchase_page,
+            "employees": self.build_employee_totals_page,
+            "job_logo": self.build_outsourced_job_logo_page,
+            "archive": self.build_archive_page,
+            "settings": self.build_settings_page,
+        }
+
+    def _ensure_page_built(self, page: str) -> None:
+        if page in self.pages:
+            return
+        builder = getattr(self, "_page_builders", {}).get(page)
+        if builder is None:
+            return
+        builder()
+        if page in {"import", "master", "review", "purchase", "employees"}:
+            self._dashboard_refresh_key = None
+        scrollable_names = {
+            "review": ("review_decision_frame",),
+            "employees": ("mc_employee_scroll",),
+            "settings": ("settings_scroll",),
+        }
+        for name in scrollable_names.get(page, ()):
+            register_scrollable(self, getattr(self, name, None))
 
     def _schedule_wave_header_resize(self, event=None):
         """Debounce high-resolution header rendering while the window resizes."""
@@ -1119,8 +1183,8 @@ class OrchidPurchaseManager(ctk.CTk):
                 if alpha:
                     pixels[x, y] = (248, 246, 252, alpha)
 
-        # Keep branding at the approved 4.8.19 size even though 4.8.19 uses a
-        # taller header to create a stronger dark frame around the workspace.
+        # Keep branding at the approved 4.8.19 size while 4.8.20 improves
+        # performance; the taller header continues to frame the workspace.
         branding_height = min(canvas.height, 256)
         target_width = max(1, round(canvas.width * 0.18 * scale))
         target_height = max(1, round(branding_height * 0.29 * scale))
@@ -1198,6 +1262,9 @@ class OrchidPurchaseManager(ctk.CTk):
                     page = "master"
             except Exception:
                 pass
+        self._ensure_page_built(page)
+        if page not in self.pages:
+            page = "dashboard"
         self.active_page = page
         for frame in self.pages.values():
             frame.grid_remove()
@@ -1865,6 +1932,8 @@ class OrchidPurchaseManager(ctk.CTk):
         self.regenerate_current_review(silent=True)
 
     def regenerate_current_review(self, silent: bool = False):
+        from modules.review_workbook import generate_review_workbook
+
         if self._regenerating_review:
             return
         self._regenerating_review = True
@@ -2117,14 +2186,27 @@ class OrchidPurchaseManager(ctk.CTk):
         self.after(bloom_start, show_bloom)
         self.after(bloom_start + (650 if reduced else 1050), hide_bloom)
 
-    def _mission_snapshot(self) -> dict:
+    def _mission_snapshot(self, force: bool = False) -> dict:
         if not self.last_review_workbook or not self.last_review_workbook.exists():
-            return {"issues": [], "routes": [], "review_count": 0, "blocked_route_count": 0,
-                    "workflow_blocked": False, "line_count": 0, "ready_count": 0,
-                    "event_name": "", "report_mode": "", "employee_totals": [],
-                    "employee_count": 0, "employee_grand_total": 0.0}
+            self._mission_snapshot_cache_key = ("none",)
+            self._mission_snapshot_cache = {
+                "issues": [], "routes": [], "review_count": 0, "blocked_route_count": 0,
+                "workflow_blocked": False, "line_count": 0, "ready_count": 0,
+                "event_name": "", "report_mode": "", "employee_totals": [],
+                "employee_count": 0, "employee_grand_total": 0.0,
+            }
+            return self._mission_snapshot_cache
+        cache_key = (
+            _file_stamp(self.last_review_workbook),
+            _file_stamp(DATA / "mission_control_state.json"),
+        )
+        if not force and cache_key == self._mission_snapshot_cache_key:
+            return self._mission_snapshot_cache
         try:
-            return load_mission_control_snapshot(self.last_review_workbook, DATA)
+            snapshot = load_mission_control_snapshot(self.last_review_workbook, DATA)
+            self._mission_snapshot_cache_key = cache_key
+            self._mission_snapshot_cache = snapshot
+            return snapshot
         except Exception as error:
             return {"issues": [], "routes": [], "review_count": 0, "blocked_route_count": 0,
                     "workflow_blocked": False, "line_count": 0, "ready_count": 0,
@@ -2453,6 +2535,8 @@ class OrchidPurchaseManager(ctk.CTk):
         )
 
     def _employee_totals_pdf_path(self):
+        from modules.final_po_generator import generate_employee_totals_pdf
+
         if not self.last_review_workbook or not self.last_review_workbook.exists():
             raise FileNotFoundError("Create a Uniform Sizing Event purchase packet first.")
         # Save onscreen discounts first so the shared PDF is current.
@@ -2730,6 +2814,19 @@ class OrchidPurchaseManager(ctk.CTk):
             self.current_event_name = snapshot.get("event_name") or self.current_event_name or "General Sales Period"
             self.current_mode = snapshot.get("report_mode") or self.current_mode
 
+        refresh_key = (
+            self._mission_snapshot_cache_key,
+            _file_stamp(live_product_master_path()),
+            _file_stamp(self.selected_csv),
+            _file_stamp(self.last_purchase_order_dir),
+            self.current_event_name,
+            self.current_mode,
+            self.current_decoration_fulfillment,
+        )
+        if refresh_key == self._dashboard_refresh_key:
+            self._apply_dashboard_view()
+            return
+
         review_count = int(snapshot.get("review_count", 0))
         product_master_count = int(snapshot.get("product_master_count", 0))
         purchase_review_count = int(snapshot.get("purchase_review_count", review_count))
@@ -2962,7 +3059,7 @@ class OrchidPurchaseManager(ctk.CTk):
 
         show_employee_totals = self._configure_dashboard_workspace(snapshot)
         self._render_work_queue(snapshot)
-        if show_employee_totals:
+        if show_employee_totals and hasattr(self, "mc_employee_scroll"):
             self._render_employee_totals(snapshot)
         self._refresh_management_dashboard(snapshot, purchase_generated_for_current)
         self._apply_dashboard_view()
@@ -2974,6 +3071,7 @@ class OrchidPurchaseManager(ctk.CTk):
         self.refresh_review_page()
         self.refresh_purchase_page()
         self.refresh_current_event_page(snapshot)
+        self._dashboard_refresh_key = refresh_key
 
     def open_product_master_search(self):
         value = " ".join(self.mc_product_search_var.get().split()) if hasattr(self, "mc_product_search_var") else ""
@@ -4905,7 +5003,7 @@ class OrchidPurchaseManager(ctk.CTk):
 
         optional = self.section_card(
             scroll, 4, "Safe Product Candidate Preview",
-            "Review new product/style numbers found in the selected order export. Professional 4.8.19 does not mass-add order lines to Product Master, so a large import cannot create hundreds of incomplete permanent records."
+            "Review new product/style numbers found in the selected order export. Professional 4.8.20 does not mass-add order lines to Product Master, so a large import cannot create hundreds of incomplete permanent records."
         )
         self.primary_button(optional, "Create Candidate List", self.process_csv)
 
@@ -4931,10 +5029,10 @@ class OrchidPurchaseManager(ctk.CTk):
 
         about = self.section_card(
             scroll, 7, "About Orchid Purchase Manager",
-            "Professional 4.8.19\nUses a stronger dark frame, a pale lavender workspace, and wider action cards while preserving the approved branding."
+            "Professional 4.8.20\nOpens and navigates faster by reusing unchanged Product Master, workbook, and import results while preserving the approved 4.8.19 design."
         )
         ctk.CTkLabel(
-            about, text="Version 4.8.19 Pro", text_color=PURPLE_DARK,
+            about, text="Version 4.8.20 Pro", text_color=PURPLE_DARK,
             font=ctk.CTkFont(size=18, weight="bold"), anchor="w",
         ).grid(row=2, column=0, padx=22, pady=(0, 20), sticky="w")
 
@@ -5099,7 +5197,11 @@ class OrchidPurchaseManager(ctk.CTk):
             return
         candidate = Path(path)
         try:
-            parsed = parse_shopify_orders(candidate, live_product_master_path())
+            normalized = normalize_order_export(candidate)
+            parsed = parse_shopify_orders(
+                candidate, live_product_master_path(), normalized_orders=normalized
+            )
+            self._remember_import_frames(candidate, normalized, parsed)
         except Exception as error:
             messagebox.showerror(
                 "Unable to Import Order CSV",
@@ -5184,7 +5286,13 @@ class OrchidPurchaseManager(ctk.CTk):
         if not self.selected_csv:
             return
         try:
-            parsed = parse_shopify_orders(self.selected_csv, live_product_master_path())
+            normalized, parsed = self._cached_import_frames(self.selected_csv)
+            if parsed is None:
+                normalized = normalize_order_export(self.selected_csv)
+                parsed = parse_shopify_orders(
+                    self.selected_csv, live_product_master_path(), normalized_orders=normalized
+                )
+                self._remember_import_frames(self.selected_csv, normalized, parsed)
             result = save_product_candidate_list(live_product_master_path(), parsed, REPORTS)
             self.imported_line_count = len(parsed)
             self.dashboard_status.configure(
@@ -5484,6 +5592,8 @@ class OrchidPurchaseManager(ctk.CTk):
         REVIEW_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
     def create_review_workbook(self):
+        from modules.review_workbook import generate_review_workbook
+
         if not self.selected_csv or not self.selected_csv.exists():
             messagebox.showinfo(
                 "Import Orders First",
@@ -5498,11 +5608,14 @@ class OrchidPurchaseManager(ctk.CTk):
         try:
             master_path = live_product_master_path()
             before_signature = product_master_signature(master_path)
+            normalized_orders, parsed_orders = self._cached_import_frames(self.selected_csv)
             self._save_review_state(report_mode, event_name, decoration_fulfillment)
             result = generate_review_workbook(self.selected_csv, master_path, REPORTS,
                                               report_mode=report_mode, event_name=event_name,
                                               decoration_fulfillment=decoration_fulfillment,
-                                              regenerate_helper=REGENERATE_HELPER)
+                                              regenerate_helper=REGENERATE_HELPER,
+                                              normalized_orders=normalized_orders,
+                                              parsed_orders=parsed_orders)
             self.current_event_name = result["event_name"] or "General Sales Period"
             self.current_mode = result["report_mode"]
             self.current_decoration_fulfillment = result.get("decoration_fulfillment", decoration_fulfillment)
@@ -5519,6 +5632,7 @@ class OrchidPurchaseManager(ctk.CTk):
                     report_mode=report_mode, event_name=event_name,
                     decoration_fulfillment=decoration_fulfillment,
                     regenerate_helper=REGENERATE_HELPER, previous_review_path=first_workbook,
+                    normalized_orders=normalized_orders,
                 )
                 self.last_review_workbook = Path(result["output_path"])
                 self._candidate_sync_workbook = str(self.last_review_workbook.resolve())
@@ -5571,6 +5685,8 @@ class OrchidPurchaseManager(ctk.CTk):
             messagebox.showerror("Unable to Create Review Workbook", str(error))
 
     def create_routing_diagnostics(self):
+        from modules.routing_diagnostics import generate_routing_diagnostic_workbook
+
         if not self.selected_csv:
             self.choose_csv()
         if not self.selected_csv:
@@ -5595,6 +5711,8 @@ class OrchidPurchaseManager(ctk.CTk):
             messagebox.showerror("Unable to Create Routing Diagnostics", str(error))
 
     def _run_final_purchase_order_generation(self, workbook_path: Path, po_overrides=None):
+        from modules.final_po_generator import generate_final_purchase_orders
+
         try:
             overrides = po_overrides if po_overrides is not None else load_po_overrides(DATA, workbook_path)
             result = generate_final_purchase_orders(Path(workbook_path), REPORTS, po_number_overrides=overrides)
@@ -5777,6 +5895,8 @@ def _show_regeneration_error(message: str) -> None:
 
 def regenerate_review_from_saved_state(request_path: Path | None = None):
     """Regenerate from a workbook request file or the app's saved state."""
+    from modules.review_workbook import generate_review_workbook
+
     try:
         if request_path:
             request = Path(request_path).expanduser().resolve()

@@ -342,7 +342,7 @@ class ProductMasterV2(ctk.CTk):
         super().__init__()
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
-        self.title("Orchid Purchase Manager - Product Master 4.8.19")
+        self.title("Orchid Purchase Manager - Product Master 4.8.20")
         self.geometry("1320x930")
         self.minsize(1120, 780)
         self.configure(fg_color=WINDOW_BG)

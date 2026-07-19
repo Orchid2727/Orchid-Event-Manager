@@ -68,13 +68,22 @@ def build_routing_diagnostics(shopify_csv_path: Path, product_master_path: Path)
     parsed["Quantity"] = pd.to_numeric(parsed["Quantity"], errors="coerce").fillna(0).astype(int)
 
     rows = []
+    resolution_cache = {}
     for idx, source in parsed.iterrows():
-        result = resolve_product(
-            source.get("Style Number", ""),
-            source.get("Product Name", ""),
-            source.get("Garment Color", ""),
-            master,
+        resolution_key = tuple(
+            clean_text(source.get(field, "")).casefold()
+            for field in ("Style Number", "Product Name", "Garment Color")
         )
+        result = resolution_cache.get(resolution_key)
+        if result is None:
+            result = resolve_product(
+                source.get("Style Number", ""),
+                source.get("Product Name", ""),
+                source.get("Garment Color", ""),
+                master,
+                master_prepared=True,
+            )
+            resolution_cache[resolution_key] = result
         record = source.to_dict()
         record.update(result.as_dict())
         if not result.matched and clean_text(source.get("Parser Source", "")).casefold() == "smart custom item":

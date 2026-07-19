@@ -690,8 +690,8 @@ def _review_reason_after_variant_override(parsed: dict) -> str:
     return "; ".join(reasons)
 
 
-def parse_shopify_orders(csv_path, product_master_path=None):
-    orders = normalize_order_export(csv_path)
+def parse_shopify_orders(csv_path, product_master_path=None, normalized_orders: pd.DataFrame | None = None):
+    orders = normalized_orders.copy(deep=True) if normalized_orders is not None else normalize_order_export(csv_path)
     master_index = load_master_index(product_master_path)
     for column in ["Billing Company", "Billing Name", "Notes", "Created at"]:
         if column in orders.columns:

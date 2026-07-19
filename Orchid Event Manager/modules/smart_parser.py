@@ -91,8 +91,21 @@ class MasterIndex:
     colors: list[str]
 
 
+_MASTER_INDEX_CACHE_KEY: tuple[str, int, int] | None = None
+_MASTER_INDEX_CACHE_VALUE: MasterIndex | None = None
+
+
 def load_master_index(path: Path | None) -> MasterIndex:
+    global _MASTER_INDEX_CACHE_KEY, _MASTER_INDEX_CACHE_VALUE
     columns = ["Product Name", "Style Number", "Garment Color", "Vendor", "Product Aliases", "Vendor Color Code", "Color Aliases"]
+    resolved = Path(path).resolve() if path else None
+    if resolved and resolved.exists():
+        stat = resolved.stat()
+        cache_key = (str(resolved), int(stat.st_mtime_ns), int(stat.st_size))
+    else:
+        cache_key = (str(resolved or ""), 0, 0)
+    if cache_key == _MASTER_INDEX_CACHE_KEY and _MASTER_INDEX_CACHE_VALUE is not None:
+        return _MASTER_INDEX_CACHE_VALUE
     if not path or not Path(path).exists():
         frame = pd.DataFrame(columns=columns)
     else:
@@ -115,7 +128,10 @@ def load_master_index(path: Path | None) -> MasterIndex:
         alias_colors | set(COMMON_COLORS),
         key=lambda value: (-len(_normalized_phrase(value)), value.casefold()),
     )
-    return MasterIndex(frame=frame, styles=styles, by_style=by_style, colors=colors)
+    result = MasterIndex(frame=frame, styles=styles, by_style=by_style, colors=colors)
+    _MASTER_INDEX_CACHE_KEY = cache_key
+    _MASTER_INDEX_CACHE_VALUE = result
+    return result
 
 
 def _extract_size(text: str) -> tuple[str, str]:

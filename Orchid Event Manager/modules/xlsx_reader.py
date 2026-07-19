@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
 import re
 import zipfile
@@ -8,6 +9,16 @@ import xml.etree.ElementTree as ET
 NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 NS_PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+_SHEET_ROWS_CACHE: OrderedDict[tuple[str, int, int, str], tuple[tuple[object, ...], ...]] = OrderedDict()
+_SHEET_ROWS_CACHE_LIMIT = 12
+
+
+def _cache_rows(key: tuple[str, int, int, str], rows: list[list[object]]) -> None:
+    _SHEET_ROWS_CACHE[key] = tuple(tuple(row) for row in rows)
+    _SHEET_ROWS_CACHE.move_to_end(key)
+    while len(_SHEET_ROWS_CACHE) > _SHEET_ROWS_CACHE_LIMIT:
+        _SHEET_ROWS_CACHE.popitem(last=False)
 
 
 def _column_index(cell_reference: str) -> int:
@@ -57,6 +68,12 @@ def _sheet_paths(archive: zipfile.ZipFile) -> dict[str, str]:
 
 def read_sheet_rows(xlsx_path: Path, sheet_name: str) -> list[list[object]]:
     path = Path(xlsx_path)
+    stat = path.stat()
+    cache_key = (str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size), str(sheet_name))
+    cached = _SHEET_ROWS_CACHE.get(cache_key)
+    if cached is not None:
+        _SHEET_ROWS_CACHE.move_to_end(cache_key)
+        return [list(row) for row in cached]
     with zipfile.ZipFile(path, "r") as archive:
         sheets = _sheet_paths(archive)
         if sheet_name not in sheets:
@@ -65,6 +82,7 @@ def read_sheet_rows(xlsx_path: Path, sheet_name: str) -> list[list[object]]:
         root = ET.fromstring(archive.read(sheets[sheet_name]))
         sheet_data = root.find(f"{{{NS_MAIN}}}sheetData")
         if sheet_data is None:
+            _cache_rows(cache_key, [])
             return []
         output = []
         for row in sheet_data.findall(f"{{{NS_MAIN}}}row"):
@@ -103,6 +121,7 @@ def read_sheet_rows(xlsx_path: Path, sheet_name: str) -> list[list[object]]:
                 output.append(row_values)
             else:
                 output.append([])
+        _cache_rows(cache_key, output)
         return output
 
 

@@ -23,6 +23,10 @@ from modules.purchase_rules import (
     row_rules,
 )
 
+
+_MASTER_CACHE_KEY: tuple[str, int, int] | None = None
+_MASTER_CACHE_FRAME: pd.DataFrame | None = None
+
 BASE_COLUMNS = [
     "Product Name",
     "Style Number",
@@ -94,11 +98,23 @@ def ensure_master_columns(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_extended_master(path: Path) -> pd.DataFrame:
+    global _MASTER_CACHE_KEY, _MASTER_CACHE_FRAME
+    path = Path(path)
+    if path.exists():
+        stat = path.stat()
+        cache_key = (str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size))
+    else:
+        cache_key = (str(path.resolve()), 0, 0)
+    if cache_key == _MASTER_CACHE_KEY and _MASTER_CACHE_FRAME is not None:
+        return _MASTER_CACHE_FRAME.copy(deep=True)
     try:
         frame = pd.read_csv(path, dtype=str).fillna("")
     except Exception:
         frame = pd.DataFrame(columns=MASTER_COLUMNS)
-    return ensure_master_columns(apply_purchase_rule_defaults(apply_blank_garment_defaults(frame)))
+    result = ensure_master_columns(apply_purchase_rule_defaults(apply_blank_garment_defaults(frame)))
+    _MASTER_CACHE_KEY = cache_key
+    _MASTER_CACHE_FRAME = result.copy(deep=True)
+    return result
 
 
 def _color_terms(row: pd.Series) -> list[str]:
@@ -226,8 +242,9 @@ def resolve_product(
     parsed_product: object,
     parsed_color: object,
     master: pd.DataFrame,
+    master_prepared: bool = False,
 ) -> ResolveResult:
-    frame = ensure_master_columns(master)
+    frame = master if master_prepared else ensure_master_columns(master)
     style_key = normalize_style(parsed_style)
     product_key = normalize_phrase(parsed_product)
     parsed_color_text = clean(parsed_color)

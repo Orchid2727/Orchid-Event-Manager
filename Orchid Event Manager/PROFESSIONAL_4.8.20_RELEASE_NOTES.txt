@@ -1,0 +1,23 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.8.20
+
+PERFORMANCE UPDATE
+
+- Builds the dashboard first and creates secondary pages only when they are
+  opened, reducing the work required before the main window is usable.
+- Caches Purchase Review status, Product Master health, Product Master parsing,
+  and workbook sheets by file modification signature. Changes on disk invalidate
+  each cache automatically.
+- Skips a full dashboard and hidden-page rebuild when no underlying state has
+  changed, making repeat navigation substantially more responsive.
+- Reads the validated Shopify or Report Toaster export once and reuses it during
+  the first Purchase Review generation.
+- Resolves each repeated style/product/color combination once per review instead
+  of rebuilding and rescanning the complete Product Master for every order line.
+- Reuses the already-loaded Purchase Review lines while calculating vendor
+  routes instead of parsing the workbook a second time.
+- Defers review, diagnostic, and final-report generator imports until those
+  actions are requested.
+- Replaces the launch-time dependency import test with a lightweight package
+  metadata check and records a verified runtime marker for immediate later launches.
+- Preserves the Professional 4.8.19 header, sidebar, logo alignment, workspace,
+  report rules, Product Master workflow, and existing saved data locations.

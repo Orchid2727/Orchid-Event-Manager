@@ -1,7 +1,21 @@
-ORCHID PURCHASE MANAGER PROFESSIONAL 4.8.19 - TEST RESULTS
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.8.20 - TEST RESULTS
 
 PASS - All Python source modules compile successfully.
-PASS - Application, Product Master, VERSION files, builder, launcher, bootstrap, and Mac bundle report 4.8.19.
+PASS - Application, Product Master, VERSION files, builder, launcher, bootstrap, and Mac bundle report 4.8.20.
+PASS - Dashboard is constructed at startup; secondary pages are constructed once on first use.
+PASS - Repeated mission snapshots use one disk load until the workbook or PO override state changes.
+PASS - Snapshot cache invalidates when the workbook file signature changes.
+PASS - Product Master signature, normalized catalog, smart-parser index, and health caches invalidate when the CSV changes.
+PASS - Cached and uncached order parsing produce identical rows and import metadata.
+PASS - Purchase Review generation succeeds with cached normalized and parsed order frames.
+PASS - Prepared-master and compatibility product resolution return identical purchasing fields.
+PASS - The 392-line repeated-style Purchase Review fixture improved from 13.0520 to 1.3719 seconds (9.51x).
+PASS - The 392-line / 98-style fixture improved from 13.1677 to 2.1411 seconds (6.15x).
+PASS - Cold and warm Mission Control snapshots produce identical issues, routes, counts, and totals.
+PASS - Reusing workbook sheet rows reduced the measured repeat snapshot fixture from 0.0277 to 0.0126 seconds (2.20x).
+PASS - Review, routing-diagnostic, and final-report modules are deferred until their actions are requested.
+PASS - Bootstrap dependency checks use package metadata without importing every heavy library.
+PASS - Verified shared runtime marker bypasses the dependency subprocess on later launches.
 PASS - CustomTkinter header overlay from v4.8.12 is removed.
 PASS - Rendered header contains no large white background rectangle.
 PASS - Purple swirl, wave, ribbon, and bottom-stripe artwork are removed.

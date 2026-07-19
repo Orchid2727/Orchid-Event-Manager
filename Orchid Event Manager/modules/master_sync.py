@@ -10,6 +10,10 @@ from modules.paths import product_master_path
 from modules.product_resolver import load_extended_master, normalize_style
 
 
+_SIGNATURE_CACHE_KEY: tuple[str, int, int] | None = None
+_SIGNATURE_CACHE_VALUE: dict[str, object] | None = None
+
+
 def live_product_master_path() -> Path:
     """Return the active Product Master path every time it is needed."""
     return product_master_path()
@@ -22,6 +26,7 @@ def load_live_product_master() -> tuple[Path, pd.DataFrame]:
 
 
 def product_master_signature(path: Path | None = None) -> dict[str, object]:
+    global _SIGNATURE_CACHE_KEY, _SIGNATURE_CACHE_VALUE
     path = Path(path or live_product_master_path())
     if not path.exists():
         return {
@@ -33,6 +38,11 @@ def product_master_signature(path: Path | None = None) -> dict[str, object]:
             "records": 0,
             "styles": 0,
         }
+    stat = path.stat()
+    cache_key = (str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size))
+    if cache_key == _SIGNATURE_CACHE_KEY and _SIGNATURE_CACHE_VALUE is not None:
+        return dict(_SIGNATURE_CACHE_VALUE)
+
     payload = path.read_bytes()
     try:
         frame = pd.read_csv(path, dtype=str).fillna("")
@@ -44,8 +54,8 @@ def product_master_signature(path: Path | None = None) -> dict[str, object]:
             style = normalize_style(row.get("Style Number", ""))
             name = " ".join(str(row.get("Product Name", "") or "").split()).casefold()
             styles.add(f"style:{style}" if style else f"product:{name}")
-    modified = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %I:%M:%S %p")
-    return {
+    modified = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %I:%M:%S %p")
+    result = {
         "path": str(path),
         "exists": True,
         "modified": modified,
@@ -54,6 +64,9 @@ def product_master_signature(path: Path | None = None) -> dict[str, object]:
         "records": int(len(frame)),
         "styles": int(len(styles)),
     }
+    _SIGNATURE_CACHE_KEY = cache_key
+    _SIGNATURE_CACHE_VALUE = dict(result)
+    return result
 
 
 def style_exists(style_number: object, frame: pd.DataFrame | None = None) -> bool:
