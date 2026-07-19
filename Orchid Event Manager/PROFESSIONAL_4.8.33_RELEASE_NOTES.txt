@@ -1,0 +1,21 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.8.33
+
+CUSTOMER-INSTRUCTION TARGETING, REQUIRED DECORATION PROMPTS, AND JOB REPORT LOGO
+
+- Routes style-specific purchasing notes only to the matching product line. For
+  example, “980 style instead of 966” now stops only the 966 line instead of
+  unrelated hats, shirts, or other products in the same order.
+- Shows a visible Instruction Decision control for non-decoration customer notes,
+  so style substitutions and similar order-specific changes can be acknowledged
+  after the affected fields are corrected.
+- In All Orders + Standard Orchid Workflow, blanket embroidery notes such as
+  “Embroider everything,” “Embroider all,” and “EMB everything” still create
+  Purchase Review prompts for every applicable product line in the order.
+- Any note that says screen print, screen-print, screenprint, screen printed, or
+  screen printing now remains a Purchase Review prompt in Standard Orchid
+  Workflow. Product/style and garment-family targeting still limits the prompt to
+  the applicable lines when the note identifies them.
+- Restores the Logo button to the left sidebar and allows a job logo to be uploaded
+  for standard outsourced screen-print reports as well as Entire Order Outsourced
+  packets.
+- Includes Professional 4.8.32 and all earlier fixes.

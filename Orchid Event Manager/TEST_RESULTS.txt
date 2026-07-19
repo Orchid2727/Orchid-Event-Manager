@@ -1,4 +1,30 @@
-ORCHID PURCHASE MANAGER PROFESSIONAL 4.8.30 - TEST RESULTS
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.8.33 - TEST RESULTS
+
+NEW 4.8.33 SOURCE CHECKS
+
+PASS - All Python source modules compile successfully.
+PASS - “980 style instead of 966” extracts 966 as the existing line that needs review.
+PASS - The 966 pants line receives the customer decision; unrelated 6511 cap and BIGTOPTEE lines do not.
+PASS - “Embroider everything,” “Embroider all,” and “EMB everything” are recognized as blanket order instructions.
+PASS - Blanket embroidery instructions create prompts on every product line even when ordinary Standard Workflow decoration prompts are disabled.
+PASS - Any explicit screen-print wording, including “screen print,” “screen printing,” “screen-print,” and “screenprint,” remains a Purchase Review prompt in Standard Workflow.
+PASS - A blanket screen-print note prompts every order line; a targeted screen-print note prompts only the matching product family or style.
+PASS - Ordinary non-blanket embroidery notes remain deferred in All Orders + Standard Workflow.
+PASS - The customer-instruction editor exposes acknowledgement choices for general purchasing notes.
+PASS - The Logo button remains visible in the left sidebar.
+PASS - Job Report Logo accepts any active Purchase Review, including standard outsourced screen-print workflows.
+
+INHERITED PROFESSIONAL 4.8.32 REGRESSION BASELINE
+
+PASS - Process Imported Orders displays a circular processing symbol.
+PASS - Initial Import Orders retains its distinct import arrow.
+PASS - Dashboard flower watermark opacity is 9% instead of 3.5%.
+
+PASS - All Orders + Standard Orchid Workflow defers ordinary line-specific decoration-note prompts.
+PASS - Uniform Sizing Event keeps decoration-note prompts.
+PASS - Entire Order Outsourced keeps decoration-note prompts.
+PASS - Standard workflow still preserves decoration notes for downstream paperwork.
+PASS - Non-decoration purchasing decisions remain blocking in every workflow.
 
 PASS - Renaming PT88BK to PT88 and entering Black saves without a hidden blank-color row.
 PASS - Shared vendor and product details transfer from the removed placeholder.
@@ -54,7 +80,7 @@ PASS - Save & Next reports remaining setup requirements instead of silently rese
 PASS - NKFQ4794-style records retain vendor, decoration type, decoration color, and reviewed setup state after cleaning.
 
 PASS - All Python source modules compile successfully.
-PASS - Application, Product Master, VERSION files, builder, launcher, bootstrap, and Mac bundle report 4.8.30.
+PASS - Application, Product Master, VERSION files, builder, launcher, bootstrap, and Mac bundle report 4.8.32 in the inherited base package.
 PASS - Dashboard is constructed at startup; secondary pages are constructed once on first use.
 PASS - Repeated mission snapshots use one disk load until the workbook or PO override state changes.
 PASS - Snapshot cache invalidates when the workbook file signature changes.

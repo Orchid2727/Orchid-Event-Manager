@@ -59,6 +59,19 @@ _GLOBAL_DECORATION_SCOPE = re.compile(
     r"\b(?:logos?|decoration)\s+on\s+(?:the\s+)?(?:front|back|sleeve|sleeves)\b)"
 )
 
+# Blanket process wording must stop in Purchase Review even when All Orders is
+# using the Standard Orchid Workflow. These notes change the decoration process
+# for the full order and cannot safely be deferred to downstream paperwork.
+_BLANKET_DECORATION_SCOPE = re.compile(
+    r"(?i)(?:"
+    r"\b(?:embroider(?:y|ed|ing)?|EMB|screen[- ]?print(?:ed|ing)?)\b"
+    r"(?:\s+(?:on\s+)?)?(?:everything|all(?:\s+(?:items?|garments?|products?))?)\b|"
+    r"\b(?:everything|all(?:\s+(?:items?|garments?|products?))?)\b"
+    r"(?:\s+(?:is|are|should\s+be|to\s+be)?)?\s*"
+    r"(?:embroider(?:ed|y)?|screen[- ]?print(?:ed|ing)?)\b"
+    r")"
+)
+
 # These instructions matter to purchasing or decoration. Decoration instructions
 # are blocking; the remaining terms are visible context unless a decision term is
 # also present.
@@ -151,6 +164,51 @@ def decision_note_requires_review(value: object) -> bool:
 
 
 
+def _normalized_style_key(value: object) -> str:
+    key = re.sub(r"\s+", "", str(value or "")).upper().strip("-.,:;()[]{}")
+    if not key:
+        return ""
+    if (re.search(r"[A-Z]", key) and re.search(r"\d", key)) or re.fullmatch(r"\d{3,6}", key):
+        return key
+    return ""
+
+
+def decision_target_styles(value: object) -> set[str]:
+    """Return the existing/current styles targeted by a purchasing decision.
+
+    For substitutions, the style after ``instead of`` or before ``with/to`` is
+    the line that must be reviewed. Example: ``980 style instead of 966`` targets
+    the current 966 line, not every item in the order.
+    """
+    note = extract_purchase_instructions(value)
+    if not note:
+        return set()
+    candidates: set[str] = set()
+    substitution_patterns = (
+        r"(?i)\binstead\s+of\s+(?:(?:style|item|product|sku)\s*#?\s*)?([A-Z0-9][A-Z0-9-]{1,19})\b",
+        r"(?i)\brather\s+than\s+(?:(?:style|item|product|sku)\s*#?\s*)?([A-Z0-9][A-Z0-9-]{1,19})\b",
+        r"(?i)\breplace\s+(?:(?:style|item|product|sku)\s*#?\s*)?([A-Z0-9][A-Z0-9-]{1,19})\s+with\b",
+        r"(?i)\bchange\s+(?:(?:style|item|product|sku)\s*#?\s*)?([A-Z0-9][A-Z0-9-]{1,19})\s+to\b",
+        r"(?i)\bfrom\s+(?:(?:style|item|product|sku)\s*#?\s*)?([A-Z0-9][A-Z0-9-]{1,19})\s+to\b",
+        r"(?i)\bsubstitute\s+(?:[A-Z0-9][A-Z0-9-]{1,19})\s+for\s+(?:(?:style|item|product|sku)\s*#?\s*)?([A-Z0-9][A-Z0-9-]{1,19})\b",
+    )
+    for pattern in substitution_patterns:
+        for raw in re.findall(pattern, note):
+            key = _normalized_style_key(raw)
+            if key:
+                candidates.add(key)
+    if candidates:
+        return candidates
+    for raw in re.findall(
+        r"(?i)\b(?:style|item|product|sku)\s*#?\s*([A-Z0-9][A-Z0-9-]{1,19})\b",
+        note,
+    ):
+        key = _normalized_style_key(raw)
+        if key:
+            candidates.add(key)
+    return candidates
+
+
 def decoration_target_styles(value: object) -> set[str]:
     """Extract explicit product/style references from an instruction note.
 
@@ -161,7 +219,7 @@ def decoration_target_styles(value: object) -> set[str]:
     note = extract_purchase_instructions(value)
     if not note:
         return set()
-    candidates: set[str] = set()
+    candidates: set[str] = set(decision_target_styles(note))
     patterns = (
         r"(?i)\b(?:style|item|product|sku)\s*#?\s*([A-Z0-9][A-Z0-9-]{1,19})\b",
         r"(?i)\b(?:name|logo|embroider|embroidery|emb|patch)\s+on\s+([A-Z0-9][A-Z0-9-]{1,19})\b",
@@ -169,17 +227,31 @@ def decoration_target_styles(value: object) -> set[str]:
     )
     for pattern in patterns:
         for raw in re.findall(pattern, note):
-            key = re.sub(r"\s+", "", str(raw)).upper().strip("-.,:;")
-            if not key:
-                continue
-            if (re.search(r"[A-Z]", key) and re.search(r"\d", key)) or re.fullmatch(r"\d{3,6}", key):
+            key = _normalized_style_key(raw)
+            if key:
                 candidates.add(key)
     return candidates
 
 
+def blanket_decoration_note_requires_review(value: object) -> bool:
+    note = extract_purchase_instructions(value)
+    return bool(note and decoration_note_requires_review(note) and _BLANKET_DECORATION_SCOPE.search(note))
+
+
+def screen_print_note_requires_review(value: object) -> bool:
+    """Keep every explicit screen-print instruction in Purchase Review.
+
+    Standard Orchid Workflow may defer ordinary decoration notes, but the user
+    specifically needs any wording that says screen print, screen-print,
+    screenprint, screen printed, or screen printing to remain an up-front prompt.
+    """
+    note = extract_purchase_instructions(value)
+    return bool(note and re.search(r"(?i)\bscreen[- ]?print(?:ed|ing)?\b", note))
+
+
 def decoration_note_is_global(value: object) -> bool:
     note = extract_purchase_instructions(value)
-    return bool(note and _GLOBAL_DECORATION_SCOPE.search(note))
+    return bool(note and (_GLOBAL_DECORATION_SCOPE.search(note) or _BLANKET_DECORATION_SCOPE.search(note)))
 
 def decoration_target_families(value: object) -> set[str]:
     note = extract_purchase_instructions(value).casefold()
@@ -201,30 +273,52 @@ def decoration_target_families(value: object) -> set[str]:
     return families
 
 
+def _style_targets_line(style_targets: set[str], line_text: object) -> bool:
+    text_raw = clean_note(line_text)
+    if not text_raw:
+        return False
+    line_tokens = {
+        _normalized_style_key(token)
+        for token in re.findall(r"(?i)\b[A-Z0-9][A-Z0-9-]{1,29}\b", text_raw)
+    }
+    line_tokens.discard("")
+    return bool(style_targets & line_tokens)
+
+
+def _families_target_line(families: set[str], line_text: object) -> bool:
+    text = clean_note(line_text).casefold()
+    if not text:
+        return False
+    return any(
+        any(re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text) for term in _TARGET_FAMILIES[family])
+        for family in families
+    )
+
+
+def decision_note_targets_line(value: object, line_text: object) -> bool:
+    """Route a non-decoration purchasing decision to its intended line."""
+    if not decision_note_requires_review(value):
+        return False
+    style_targets = decision_target_styles(value)
+    if style_targets:
+        return _style_targets_line(style_targets, line_text)
+    families = decoration_target_families(value)
+    if families:
+        return _families_target_line(families, line_text)
+    return True
+
+
 def decoration_note_targets_line(value: object, line_text: object) -> bool:
     """Return True when an order-level decoration note applies to this line."""
     if not decoration_note_requires_review(value):
         return False
-    text_raw = clean_note(line_text)
-    text = text_raw.casefold()
-    if not text:
-        return False
-
     style_targets = decoration_target_styles(value)
     if style_targets:
-        line_tokens = {
-            re.sub(r"\s+", "", token).upper()
-            for token in re.findall(r"(?i)\b[A-Z0-9][A-Z0-9-]{1,29}\b", text_raw)
-        }
-        return bool(style_targets & line_tokens)
-
+        return _style_targets_line(style_targets, line_text)
     families = decoration_target_families(value)
     if not families:
         return True
-    for family in families:
-        if any(re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text) for term in _TARGET_FAMILIES[family]):
-            return True
-    return False
+    return _families_target_line(families, line_text)
 
 
 def note_requires_review(value: object) -> bool:
@@ -248,7 +342,7 @@ def note_requires_review_for_line(
     if note_requires_review(line_note):
         return True
     if decision_note_requires_review(order_note):
-        return True
+        return decision_note_targets_line(order_note, line_text)
     if not decoration_note_requires_review(order_note):
         return False
     # Ambiguous order-level decoration notes are represented by one consolidated

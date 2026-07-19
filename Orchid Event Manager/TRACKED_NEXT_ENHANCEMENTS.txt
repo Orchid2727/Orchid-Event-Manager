@@ -1,5 +1,7 @@
 Orchid Purchase Manager - Tracked Next Enhancements
 
-The outsourced decoration job report and the in-house receiving and decoration report were implemented in Professional 4.7.4.
+Professional 4.8.33 implemented the recent customer-instruction targeting,
+blanket embroidery prompt exception, all screen-print-note prompt exception,
+visible instruction decision control, and permanent Logo sidebar access.
 
 No additional decoration-report enhancement is currently marked as pending.

@@ -14,8 +14,11 @@ from modules.decoration_locations import (
     normalize_decoration_location,
 )
 from modules.note_rules import (
+    blanket_decoration_note_requires_review,
     combine_purchase_instructions,
     decision_note_requires_review,
+    decision_note_targets_line,
+    decision_target_styles,
     decoration_note_requires_review,
     decoration_note_targets_line,
     decoration_note_is_global,
@@ -24,6 +27,7 @@ from modules.note_rules import (
     note_action_label,
     note_requires_review,
     note_requires_review_for_line,
+    screen_print_note_requires_review,
 )
 
 from modules.purchase_order_generator import (
@@ -233,7 +237,21 @@ def _line_note_context(row: pd.Series) -> str:
     ]))
 
 
-def _mandatory_note_review_flags(frame: pd.DataFrame) -> pd.Series:
+def decoration_note_prompts_enabled(
+    report_mode: str = GENERAL_SALES_PERIOD,
+    decoration_fulfillment: str = STANDARD_ORCHID_WORKFLOW,
+) -> bool:
+    """Prompt for decoration notes only in workflows that require up-front decisions."""
+    return (
+        normalize_report_mode(report_mode) == UNIFORM_SIZING_EVENT
+        or is_entire_order_outsourced(decoration_fulfillment)
+    )
+
+
+def _mandatory_note_review_flags(
+    frame: pd.DataFrame,
+    allow_decoration_prompts: bool = True,
+) -> pd.Series:
     """Mark the exact purchase lines that must stop for a note decision.
 
     Order-level decoration notes are routed to named garment families when the note
@@ -250,13 +268,40 @@ def _mandatory_note_review_flags(frame: pd.DataFrame) -> pd.Series:
 
         for index, row in group.iterrows():
             line_note = clean_text(row.get("Shopify Line Notes", ""))
-            if note_requires_review(line_note):
+            standard_workflow_override = (
+                blanket_decoration_note_requires_review(line_note)
+                or screen_print_note_requires_review(line_note)
+            )
+            if decision_note_requires_review(line_note) or standard_workflow_override or (
+                allow_decoration_prompts and decoration_note_requires_review(line_note)
+            ):
                 flags.at[index] = True
 
         if decision_note_requires_review(order_note):
-            flags.loc[indices] = True
+            style_targets = decision_target_styles(order_note)
+            family_targets = decoration_target_families(order_note)
+            if style_targets or family_targets:
+                matches = [
+                    index for index, row in group.iterrows()
+                    if decision_note_targets_line(order_note, _line_note_context(row))
+                ]
+                # If a referenced style is absent, show one consolidated decision
+                # rather than attaching the note to every unrelated order line.
+                if not matches:
+                    matches = indices[:1]
+                flags.loc[matches] = True
+            else:
+                flags.loc[indices] = True
             continue
-        if not decoration_note_requires_review(order_note):
+
+        standard_workflow_override = (
+            blanket_decoration_note_requires_review(order_note)
+            or screen_print_note_requires_review(order_note)
+        )
+        if (
+            not decoration_note_requires_review(order_note)
+            or (not allow_decoration_prompts and not standard_workflow_override)
+        ):
             continue
 
         style_targets = decoration_target_styles(order_note)
@@ -323,6 +368,7 @@ def _build_review_data(
     shopify_csv_path: Path,
     product_master_path: Path,
     decoration_fulfillment: str = STANDARD_ORCHID_WORKFLOW,
+    report_mode: str = GENERAL_SALES_PERIOD,
     normalized_orders: pd.DataFrame | None = None,
     parsed_orders: pd.DataFrame | None = None,
 ):
@@ -428,7 +474,10 @@ def _build_review_data(
     # are valuable routing data. Use them to classify product lines before asking
     # the user to make repetitive style-by-style decisions.
     merged = infer_order_decorations(merged, service_totals_from_raw(raw))
-    merged["_Mandatory Note Review"] = _mandatory_note_review_flags(merged)
+    allow_decoration_prompts = decoration_note_prompts_enabled(report_mode, decoration_fulfillment)
+    merged["_Mandatory Note Review"] = _mandatory_note_review_flags(
+        merged, allow_decoration_prompts=allow_decoration_prompts
+    )
 
     rows = []
     for _, row in merged.iterrows():
@@ -589,7 +638,7 @@ def _build_review_data(
     return detail, review, excluded, raw
 
 
-def _revalidate_detail(detail: pd.DataFrame) -> pd.DataFrame:
+def _revalidate_detail(detail: pd.DataFrame, allow_decoration_prompts: bool = True) -> pd.DataFrame:
     """Recalculate blockers after carried-forward Review & Edit corrections.
 
     Product Master changes remain authoritative, while user-entered order-specific
@@ -599,6 +648,9 @@ def _revalidate_detail(detail: pd.DataFrame) -> pd.DataFrame:
     if detail.empty:
         return detail.copy()
     result = detail.copy()
+    scoped_note_flags = _mandatory_note_review_flags(
+        result, allow_decoration_prompts=allow_decoration_prompts
+    )
     for index, row in result.iterrows():
         style = clean_text(row.get("Product #", ""))
         description = clean_text(row.get("Description", ""))
@@ -668,13 +720,7 @@ def _revalidate_detail(detail: pd.DataFrame) -> pd.DataFrame:
         raw_note = clean_text(row.get("Shopify Order Notes", ""))
         line_note = clean_text(row.get("Shopify Line Notes", ""))
         purchase_instructions = clean_text(row.get("Purchase Instructions", "")) or combine_purchase_instructions(raw_note, line_note)
-        mandatory_note_review = normalize_bool(row.get("Mandatory Note Review", ""), False)
-        if not mandatory_note_review:
-            mandatory_note_review = note_requires_review_for_line(
-                raw_note,
-                line_note,
-                " ".join(filter(None, [description, clean_text(row.get("Original Shopify Line", "")), clean_text(row.get("Product Category", "")), style])),
-            )
+        mandatory_note_review = bool(scoped_note_flags.at[index])
         if mandatory_note_review:
             reasons.append("Customer decision required")
 
@@ -704,7 +750,11 @@ def _revalidate_detail(detail: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def _apply_previous_review_edits(detail: pd.DataFrame, previous_review_path: Path | None) -> pd.DataFrame:
+def _apply_previous_review_edits(
+    detail: pd.DataFrame,
+    previous_review_path: Path | None,
+    allow_decoration_prompts: bool = True,
+) -> pd.DataFrame:
     """Carry visible Review & Edit corrections into a regenerated workbook.
 
     Completed order-specific decisions must stay completed after Product Master
@@ -778,7 +828,7 @@ def _apply_previous_review_edits(detail: pd.DataFrame, previous_review_path: Pat
             if field in {"Include", "Do Not Outsource", "Quantity"} or clean_text(value):
                 result.at[index, field] = value
 
-    result = _revalidate_detail(result)
+    result = _revalidate_detail(result, allow_decoration_prompts=allow_decoration_prompts)
 
     # Revalidation intentionally recreates hard blockers. Preserve a user's
     # completed manual decision only when no hard blocker remains.
@@ -1038,6 +1088,7 @@ def generate_review_workbook(
     # Always reload the active Product Master from disk immediately before building.
     detail, review, excluded, raw = _build_review_data(
         Path(shopify_csv_path), product_master_path, decoration_fulfillment,
+        report_mode=report_mode,
         normalized_orders=normalized_orders, parsed_orders=parsed_orders,
     )
     now = datetime.now()
@@ -1048,7 +1099,11 @@ def generate_review_workbook(
     output_path = output_dir / f"Orchid_Purchase_Review{event_part}__{stamp}.xlsx"
     regeneration_request_path = output_path.with_suffix(".orchidregen")
 
-    detail = _apply_previous_review_edits(detail, previous_review_path)
+    detail = _apply_previous_review_edits(
+        detail,
+        previous_review_path,
+        allow_decoration_prompts=decoration_note_prompts_enabled(report_mode, decoration_fulfillment),
+    )
 
     master = load_extended_master(Path(product_master_path))
     vendor_registry = dict(PREFERRED_VENDOR_CASE)

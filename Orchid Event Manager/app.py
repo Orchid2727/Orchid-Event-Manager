@@ -100,6 +100,7 @@ TEXT = "#14111F"
 MUTED = "#6A6375"
 BG = "#F3F0F7"
 WHITE = "#FFFFFF"
+DASHBOARD_WATERMARK_OPACITY = 0.09
 SUCCESS = "#16A34A"
 WARNING = "#E56A00"
 DANGER = "#9C0006"
@@ -234,7 +235,7 @@ class OrchidPurchaseManager(ctk.CTk):
     def __init__(self):
         super().__init__()
         ctk.set_appearance_mode("light")
-        self.title("Orchid Purchase Manager Professional 4.8.30")
+        self.title("Orchid Purchase Manager Professional 4.8.33")
         self.geometry("1400x900")
         self.minsize(1180, 760)
         self.configure(fg_color=BG)
@@ -575,6 +576,11 @@ class OrchidPurchaseManager(ctk.CTk):
                 pass
 
     def _active_review_needs_decoration_note_upgrade(self) -> bool:
+        if (
+            self.current_mode != UNIFORM_SIZING_EVENT
+            and normalize_decoration_fulfillment(self.current_decoration_fulfillment) != ENTIRE_ORDER_OUTSOURCED
+        ):
+            return False
         path = self.last_review_workbook
         if not path or not path.exists() or not REVIEW_STATE_FILE.exists():
             return False
@@ -935,7 +941,7 @@ class OrchidPurchaseManager(ctk.CTk):
             ("review", "☑   Purchase Review"),
             ("purchase", "▤   Purchase Orders"),
             ("employees", "▦   Employee Totals"),
-            ("job_logo", "◉   Outsourced Job Logo"),
+            ("job_logo", "◉   Logo"),
         ]
         for row, (page, label) in enumerate(items, start=1):
             button = ctk.CTkButton(
@@ -950,7 +956,6 @@ class OrchidPurchaseManager(ctk.CTk):
                 button.grid_remove()
             if page == "job_logo":
                 self.outsourced_logo_nav_button = button
-                button.grid_remove()
 
         divider = ctk.CTkFrame(nav, height=1, fg_color="#40375A", corner_radius=0)
         divider.grid(row=7, column=0, sticky="ew", padx=10, pady=(16, 12))
@@ -969,7 +974,7 @@ class OrchidPurchaseManager(ctk.CTk):
         footer = ctk.CTkFrame(sidebar, fg_color="transparent")
         footer.grid(row=4, column=0, sticky="ew", padx=16, pady=(10, 18))
         ctk.CTkLabel(
-            footer, text="v 4.8.30", text_color="#CFC4E0",
+            footer, text="v 4.8.33", text_color="#CFC4E0",
             font=ctk.CTkFont(size=12), justify="left", anchor="w",
         ).pack(anchor="w", padx=8, pady=(0, 10))
         ctk.CTkFrame(footer, height=1, fg_color="#40375A").pack(fill="x", padx=7, pady=(0, 11))
@@ -1488,7 +1493,10 @@ class OrchidPurchaseManager(ctk.CTk):
         hero.grid_propagate(False)
         hero.grid_columnconfigure(0, weight=1)
         self.mc_hero = hero
-        self._add_orchid_watermark(hero, size=(420, 420), relx=0.5, rely=0.58, opacity=0.035)
+        self._add_orchid_watermark(
+            hero, size=(420, 420), relx=0.5, rely=0.58,
+            opacity=DASHBOARD_WATERMARK_OPACITY,
+        )
 
         self.mc_animation_frame = ctk.CTkFrame(hero, fg_color="transparent", height=42)
         self.mc_animation_frame.grid(row=0, column=0, sticky="ew", padx=28, pady=(8, 0))
@@ -2231,12 +2239,10 @@ class OrchidPurchaseManager(ctk.CTk):
             else:
                 self.employee_nav_button.grid_remove()
         if hasattr(self, "outsourced_logo_nav_button"):
-            if normalize_decoration_fulfillment(self.current_decoration_fulfillment) == ENTIRE_ORDER_OUTSOURCED and self.last_review_workbook:
-                self.outsourced_logo_nav_button.grid()
-            else:
-                self.outsourced_logo_nav_button.grid_remove()
-                if self.active_page == "job_logo":
-                    self.after_idle(lambda: self.show_page("dashboard"))
+            # The job-report logo is used by standard outsourced screen-print
+            # reports as well as Entire Order Outsourced packets, so keep this
+            # setup page permanently available in the sidebar.
+            self.outsourced_logo_nav_button.grid()
         return show_employee_totals
 
     def _render_work_queue(self, snapshot: dict):
@@ -2592,12 +2598,12 @@ class OrchidPurchaseManager(ctk.CTk):
         card.grid_columnconfigure(0, weight=1)
         page.grid_rowconfigure(0, weight=1)
         ctk.CTkLabel(
-            card, text="Outsourced Job Logo", text_color=PURPLE_DARK,
+            card, text="Job Report Logo", text_color=PURPLE_DARK,
             font=ctk.CTkFont(size=28, weight="bold"),
         ).grid(row=0, column=0, padx=30, pady=(34, 6))
         ctk.CTkLabel(
             card,
-            text="Upload the customer or job logo that should appear on the Outsourced Decoration Job Report.",
+            text="Upload the customer or job logo that should appear on the Outsourced Decoration Job Report, including standard screen-print workflows.",
             text_color=MUTED, font=ctk.CTkFont(size=14), wraplength=720, justify="center",
         ).grid(row=1, column=0, padx=30, pady=(0, 24))
         self.outsourced_logo_preview = ctk.CTkLabel(
@@ -2650,17 +2656,14 @@ class OrchidPurchaseManager(ctk.CTk):
     def refresh_outsourced_job_logo_page(self):
         if not hasattr(self, "outsourced_logo_status"):
             return
-        applicable = (
-            normalize_decoration_fulfillment(self.current_decoration_fulfillment) == ENTIRE_ORDER_OUTSOURCED
-            and bool(self.last_review_workbook and self.last_review_workbook.exists())
-        )
+        applicable = bool(self.last_review_workbook and self.last_review_workbook.exists())
         current = self._outsourced_job_logo_path() if applicable else None
         state = "normal" if applicable else "disabled"
         self.outsourced_logo_upload_button.configure(state=state)
         self.outsourced_logo_regenerate_button.configure(state=state)
         if not applicable:
-            self.outsourced_logo_preview.configure(image=None, text="Available for Entire Order Outsourced events")
-            self.outsourced_logo_status.configure(text="Create or resume an outsourced event first.", text_color=WARNING)
+            self.outsourced_logo_preview.configure(image=None, text="Create a Purchase Review first")
+            self.outsourced_logo_status.configure(text="Import orders and create the Purchase Review before uploading a logo.", text_color=WARNING)
             self.outsourced_logo_preview_button.configure(state="disabled")
             self.outsourced_logo_remove_button.configure(state="disabled")
             return
@@ -2684,11 +2687,8 @@ class OrchidPurchaseManager(ctk.CTk):
         self.outsourced_logo_remove_button.configure(state="normal")
 
     def manage_outsourced_job_logo(self, action: str = "upload"):
-        if normalize_decoration_fulfillment(self.current_decoration_fulfillment) != ENTIRE_ORDER_OUTSOURCED:
-            messagebox.showinfo("Outsourced Job Logo", "This option is available for Entire Order Outsourced events.")
-            return
         if not self.last_review_workbook or not self.last_review_workbook.exists():
-            messagebox.showinfo("Outsourced Job Logo", "Create the Purchase Review before uploading the event logo.")
+            messagebox.showinfo("Job Report Logo", "Create the Purchase Review before uploading the event logo.")
             return
         current = self._outsourced_job_logo_path()
         if action == "preview":
@@ -2722,7 +2722,7 @@ class OrchidPurchaseManager(ctk.CTk):
         try:
             selected = filedialog.askopenfilename(
                 parent=self,
-                title="Choose Outsourced Job Logo",
+                title="Choose Job Report Logo",
                 filetypes=[
                     ("Logo images", "*.png *.jpg *.jpeg *.webp"),
                     ("PNG images", "*.png"), ("JPEG images", "*.jpg *.jpeg"),
@@ -2995,7 +2995,9 @@ class OrchidPurchaseManager(ctk.CTk):
         self._highlight_mission_card(active_card)
         self.mc_step_label.configure(text="")
         hero_icons = {1: "↑", 2: "◇", 3: "☑", 4: "▤"}
-        self.mc_banner_icon.configure(text="✓" if completed else hero_icons.get(step_number, "◆"))
+        processing_import = bool(step_number == 1 and self.selected_csv and not has_active_review)
+        hero_icon = "↻" if processing_import else hero_icons.get(step_number, "◆")
+        self.mc_banner_icon.configure(text="✓" if completed else hero_icon)
         hero_colors = {
             1: ("#2563EB", "#EAF2FF"),
             2: (PURPLE, PURPLE_LIGHT),
@@ -3898,6 +3900,13 @@ class OrchidPurchaseManager(ctk.CTk):
         return "screen" in decoration_key
 
     def _review_instruction_decision_options(self, decoration_type: str | None = None) -> list[str]:
+        instruction_kind = getattr(self, "_review_instruction_kind", "decoration")
+        if instruction_kind == "general":
+            return [
+                "Choose an instruction decision",
+                "Follow Note as Written",
+                "Keep Product Master Default",
+            ]
         options = list(INSTRUCTION_DECISION_OPTIONS)
         if self._review_outsourcing_exception_applicable(decoration_type):
             options.append(DO_NOT_OUTSOURCE_DECISION)
@@ -4500,13 +4509,16 @@ class OrchidPurchaseManager(ctk.CTk):
         note_key = _clean(note_text).casefold()
         is_outsource_instruction = any(term in note_key for term in OUTSOURCE_INSTRUCTION_TERMS)
         is_decoration_instruction = bool(is_customer_decision and decoration_note_requires_review(note_text))
-        is_instruction_decision = bool(
-            is_customer_decision and (is_decoration_instruction or is_outsource_instruction)
+        is_instruction_decision = bool(is_customer_decision)
+        self._review_instruction_kind = (
+            "decoration" if is_decoration_instruction else
+            "outsource" if is_outsource_instruction else
+            "general"
         )
         if is_instruction_decision:
             self._set_review_instruction_callout(note_text, True)
             instruction_text = (
-                "Choose an explicit instruction decision below, confirm the order fields, then save."
+                "Choose an explicit instruction decision below, update any affected order fields, then save."
             )
             if is_decoration_instruction:
                 recommendation, recommendation_reason = decoration_instruction_recommendation(
@@ -4516,7 +4528,8 @@ class OrchidPurchaseManager(ctk.CTk):
                 recommendation = DO_NOT_OUTSOURCE_DECISION
                 recommendation_reason = "The note directs this one item to Orchid instead of the outside decorator."
             else:
-                recommendation, recommendation_reason = "", ""
+                recommendation = "Follow Note as Written"
+                recommendation_reason = "Update the product, size, color, vendor, or other order-specific fields to match the instruction."
             if recommendation:
                 self.review_recommendation.configure(
                     text=f"Recommended: {recommendation} — {recommendation_reason}", padx=14, pady=10
@@ -4524,15 +4537,8 @@ class OrchidPurchaseManager(ctk.CTk):
                 self.review_recommendation.grid()
             else:
                 self.review_recommendation.grid_remove()
-        elif is_customer_decision:
-            self._set_review_instruction_callout("", False)
-            self.review_recommendation.grid_remove()
-            instruction_text = (
-                f"Order instruction: {note_text}\nMake the needed order-specific choice, then save."
-                if note_text else
-                "Review this order-specific instruction, make the needed choice, then save."
-            )
         else:
+            self._review_instruction_kind = ""
             self.review_recommendation.grid_remove()
         self.review_instructions.configure(text=instruction_text)
         self._review_default_decoration_type = values.get("Decoration Type", "")
@@ -4583,9 +4589,14 @@ class OrchidPurchaseManager(ctk.CTk):
         note_text = current_values.get("Purchase Instructions") or current_values.get("Shopify Order Notes")
         note_key = _clean(note_text).casefold()
         is_outsource_instruction = any(term in note_key for term in OUTSOURCE_INSTRUCTION_TERMS)
+        is_decoration_instruction = decoration_note_requires_review(note_text)
         is_instruction_decision = bool(
             "customer decision required" in _clean(issue.get("reason", "")).casefold()
-            and (decoration_note_requires_review(note_text) or is_outsource_instruction)
+        )
+        self._review_instruction_kind = (
+            "decoration" if is_decoration_instruction else
+            "outsource" if is_outsource_instruction else
+            "general"
         )
         choice = values.get("Decoration Decision", "")
         if choice == DO_NOT_OUTSOURCE_DECISION:
@@ -4613,9 +4624,9 @@ class OrchidPurchaseManager(ctk.CTk):
             return
         if is_instruction_decision:
             choice = values.get("Decoration Decision", "")
-            valid_choices = set(INSTRUCTION_DECISION_OPTIONS[1:])
-            if self._review_outsourcing_exception_applicable(values.get("Decoration Type", "")):
-                valid_choices.add(DO_NOT_OUTSOURCE_DECISION)
+            valid_choices = set(
+                self._review_instruction_decision_options(values.get("Decoration Type", ""))[1:]
+            )
             if choice not in valid_choices:
                 choices_text = ", ".join(sorted(valid_choices))
                 messagebox.showwarning(
@@ -5003,7 +5014,7 @@ class OrchidPurchaseManager(ctk.CTk):
 
         optional = self.section_card(
             scroll, 4, "Safe Product Candidate Preview",
-            "Review new product/style numbers found in the selected order export. Professional 4.8.30 does not mass-add order lines to Product Master, so a large import cannot create hundreds of incomplete permanent records."
+            "Review new product/style numbers found in the selected order export. Professional 4.8.33 does not mass-add order lines to Product Master, so a large import cannot create hundreds of incomplete permanent records."
         )
         self.primary_button(optional, "Create Candidate List", self.process_csv)
 
@@ -5029,10 +5040,10 @@ class OrchidPurchaseManager(ctk.CTk):
 
         about = self.section_card(
             scroll, 7, "About Orchid Purchase Manager",
-            "Professional 4.8.30\nFixes false Missing purchasing color warnings caused by hidden merge placeholders."
+            "Professional 4.8.33\nTargets customer instructions to the correct lines, keeps blanket embroidery and every screen-print note in review, and restores Logo access."
         )
         ctk.CTkLabel(
-            about, text="Version 4.8.30 Pro", text_color=PURPLE_DARK,
+            about, text="Version 4.8.33 Pro", text_color=PURPLE_DARK,
             font=ctk.CTkFont(size=18, weight="bold"), anchor="w",
         ).grid(row=2, column=0, padx=22, pady=(0, 20), sticky="w")
 
