@@ -1,0 +1,16 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.8.19
+
+NEW IN 4.8.19
+
+- Strengthens the dark application frame by widening the sidebar from 248 to
+  270 pixels and increasing the header from 128 to 148 pixels.
+- Keeps the approved header lockup at its Professional 4.8.18 size and centers
+  it optically within the taller header.
+- Shifts the complete lockup 16 pixels left so its visual center aligns with
+  the import/upload icon and the centered action cards below.
+- Changes the workspace from near-white to a visible pale lavender-gray,
+  reducing the stark empty appearance of the no-event screen.
+- Widens the workflow/action area and the Current Event card for a more balanced
+  use of the available desktop space.
+- Preserves the text-only Current Event sidebar, description fix, event-logo
+  reports, and Job Logo verification tools.

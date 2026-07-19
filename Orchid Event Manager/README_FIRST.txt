@@ -1,37 +1,15 @@
-ORCHID EVENT MANAGER v1.1 - COMPLETE PROJECT
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.8.19
 
-This is a complete, integrated project folder. It includes:
-- A branded dashboard
-- Shopify CSV import
-- Automatic Product Master updates
-- Product Master v2 Style Mode
-- Automatic duplicate prevention
-- Built-in Clean & Backup button
-- A double-click Mac launcher
-- Your uploaded Product Master, cleaned and preserved
+1. Unzip the downloaded folder.
+2. Close any older Orchid Purchase Manager version.
+3. Right-click Orchid Purchase Manager Professional 4.8.19.app and choose Open.
 
-SAFE INSTALLATION
-1. Close every Orchid Event Manager and Product Master window.
-2. On your Desktop, rename your current folder:
-      Orchid Event Manager
-   to:
-      Orchid Event Manager OLD
-3. Move this new folder to your Desktop.
-4. Rename the new folder exactly:
-      Orchid Event Manager
-5. Open the folder and double-click:
-      Launch_Orchid.command
-6. If macOS blocks it, right-click Launch_Orchid.command, choose Open, then Open again.
+NEW IN 4.8.19
+- Widens the dark sidebar and increases the dark header height.
+- Keeps the approved logo size while centering it in the taller header.
+- Moves the logo lockup 16 pixels left for better optical alignment.
+- Replaces the bright workspace with a pale lavender-gray canvas.
+- Widens the workflow and Current Event cards for better balance.
 
-Your old folder remains untouched as a full backup.
-
-NORMAL LAUNCH AFTER INSTALLATION
-Double-click Launch_Orchid.command. You no longer need to type Terminal commands.
-
-IMPORTANT
-Do not delete Orchid Event Manager OLD until you have confirmed:
-- the dashboard opens
-- Product Master opens
-- your saved vendors and decoration information appear
-
-The new data/product_master.csv was created from the Product Master you uploaded and cleaned to remove duplicates while preserving filled fields.
+Your Product Master, active purchase packet, and completed reports continue to
+use the existing Orchid Application Support and Reports locations.
