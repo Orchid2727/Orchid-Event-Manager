@@ -234,7 +234,7 @@ class OrchidPurchaseManager(ctk.CTk):
     def __init__(self):
         super().__init__()
         ctk.set_appearance_mode("light")
-        self.title("Orchid Purchase Manager Professional 4.8.25")
+        self.title("Orchid Purchase Manager Professional 4.8.30")
         self.geometry("1400x900")
         self.minsize(1180, 760)
         self.configure(fg_color=BG)
@@ -969,7 +969,7 @@ class OrchidPurchaseManager(ctk.CTk):
         footer = ctk.CTkFrame(sidebar, fg_color="transparent")
         footer.grid(row=4, column=0, sticky="ew", padx=16, pady=(10, 18))
         ctk.CTkLabel(
-            footer, text="v 4.8.25", text_color="#CFC4E0",
+            footer, text="v 4.8.30", text_color="#CFC4E0",
             font=ctk.CTkFont(size=12), justify="left", anchor="w",
         ).pack(anchor="w", padx=8, pady=(0, 10))
         ctk.CTkFrame(footer, height=1, fg_color="#40375A").pack(fill="x", padx=7, pady=(0, 11))
@@ -5003,7 +5003,7 @@ class OrchidPurchaseManager(ctk.CTk):
 
         optional = self.section_card(
             scroll, 4, "Safe Product Candidate Preview",
-            "Review new product/style numbers found in the selected order export. Professional 4.8.25 does not mass-add order lines to Product Master, so a large import cannot create hundreds of incomplete permanent records."
+            "Review new product/style numbers found in the selected order export. Professional 4.8.30 does not mass-add order lines to Product Master, so a large import cannot create hundreds of incomplete permanent records."
         )
         self.primary_button(optional, "Create Candidate List", self.process_csv)
 
@@ -5029,10 +5029,10 @@ class OrchidPurchaseManager(ctk.CTk):
 
         about = self.section_card(
             scroll, 7, "About Orchid Purchase Manager",
-            "Professional 4.8.25\nAdds Flame Resistant Product Master defaults for no decoration and never outsourcing."
+            "Professional 4.8.30\nFixes false Missing purchasing color warnings caused by hidden merge placeholders."
         )
         ctk.CTkLabel(
-            about, text="Version 4.8.25 Pro", text_color=PURPLE_DARK,
+            about, text="Version 4.8.30 Pro", text_color=PURPLE_DARK,
             font=ctk.CTkFont(size=18, weight="bold"), anchor="w",
         ).grid(row=2, column=0, padx=22, pady=(0, 20), sticky="w")
 

@@ -32,6 +32,7 @@ from modules.decoration_locations import (
     DECORATION_LOCATIONS,
     STANDARD_DECORATION_LOCATIONS,
     LEFT_CHEST,
+    HAT,
     OTHER_CUSTOM,
     NOT_APPLICABLE_IN_HOUSE,
     NOT_APPLICABLE_NO_DECORATION,
@@ -61,6 +62,7 @@ PRODUCT_MASTER_PATH = product_master_path()
 PRODUCT_MASTER_PID_FILE = PRODUCT_MASTER_PATH.parent / "product_master.pid"
 PRODUCT_MASTER_REQUEST_FILE = PRODUCT_MASTER_PATH.parent / "product_master_open_request.json"
 PRODUCT_MASTER_UPDATE_MARKER = product_master_update_marker_path()
+NEVER_OUTSOURCE_OVERRIDE_FILE = PRODUCT_MASTER_PATH.parent / "never_outsource_overrides.json"
 COLUMNS = [
     "Product Name",
     "Style Number",
@@ -243,6 +245,41 @@ def style_group_key(row):
     return f"product:{canonical_product_name(row['Product Name']).casefold()}"
 
 
+def remove_blank_color_placeholders(master):
+    """Remove a stale blank placeholder once a color-required style has real colors."""
+    if master.empty:
+        return master
+    result = master.copy()
+    result["_style_group"] = result.apply(style_group_key, axis=1)
+    drop_indices = []
+    shared_columns = [
+        "Product Name", "Style Number", "Vendor", "Decoration Type",
+        "Decoration Location", "Decoration Placement Instructions", "Product ID",
+        "Product Aliases", "Product Category", "Requires Size", "Requires Color",
+        "Requires Decoration", NEVER_OUTSOURCE_COLUMN,
+    ]
+    for _, group in result.groupby("_style_group", sort=False, dropna=False):
+        blank_mask = group["Garment Color"].astype(str).str.strip().eq("")
+        if not blank_mask.any() or blank_mask.all():
+            continue
+        requires_color = normalize_bool(first_nonblank(group["Requires Color"]), True)
+        if not requires_color:
+            continue
+        blank_rows = group[blank_mask]
+        colored_indices = group[~blank_mask].index
+        for column in shared_columns:
+            fallback = first_nonblank(blank_rows[column])
+            if not fallback:
+                continue
+            for index in colored_indices:
+                if not clean_text(result.at[index, column]):
+                    result.at[index, column] = fallback
+        drop_indices.extend(blank_rows.index.tolist())
+    if drop_indices:
+        result = result.drop(index=drop_indices)
+    return result.drop(columns=["_style_group"]).reset_index(drop=True)
+
+
 def clean_and_deduplicate_master(master):
     master = master.copy()
     for column in COLUMNS:
@@ -284,7 +321,7 @@ def clean_and_deduplicate_master(master):
                 "Setup Required": first_nonblank(group["Setup Required"]),
             }
         )
-    result = pd.DataFrame(rows, columns=COLUMNS)
+    result = remove_blank_color_placeholders(pd.DataFrame(rows, columns=COLUMNS))
     if not result.empty:
         missing_id = result["Product ID"].astype(str).str.strip().eq("")
         result.loc[missing_id, "Product ID"] = result.loc[missing_id].apply(
@@ -337,6 +374,37 @@ def save_product_master(master):
         return None
 
 
+def load_never_outsource_overrides():
+    """Load only deliberate user choices, separate from legacy generated defaults."""
+    try:
+        payload = json.loads(NEVER_OUTSOURCE_OVERRIDE_FILE.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            return {str(key): bool(value) for key, value in payload.items()}
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+        pass
+    return {}
+
+
+def save_never_outsource_overrides(overrides):
+    try:
+        NEVER_OUTSOURCE_OVERRIDE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = NEVER_OUTSOURCE_OVERRIDE_FILE.with_suffix(".tmp")
+        temporary.write_text(json.dumps(overrides, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.replace(NEVER_OUTSOURCE_OVERRIDE_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def editor_never_outsource_value(key, overrides, saved_value, product_name, category, style_number):
+    """Resolve the editor switch while distinguishing legacy No from a manual override."""
+    if key in overrides:
+        return bool(overrides[key])
+    if default_never_outsource(product_name, category, style_number):
+        return True
+    return normalize_bool(saved_value, False)
+
+
 class ProductMasterV2(ctk.CTk):
     """Product Master editor. The class name remains compatible with older app versions."""
 
@@ -344,7 +412,7 @@ class ProductMasterV2(ctk.CTk):
         super().__init__()
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
-        self.title("Orchid Purchase Manager - Product Master 4.8.25")
+        self.title("Orchid Purchase Manager - Product Master 4.8.30")
         self.geometry("1320x930")
         self.minsize(1120, 780)
         self.configure(fg_color=WINDOW_BG)
@@ -362,6 +430,8 @@ class ProductMasterV2(ctk.CTk):
         self.session_saved_styles = set()
         self.session_backup_path = None
         self._save_toast_after_id = None
+        self.never_outsource_overrides = load_never_outsource_overrides()
+        self._never_outsource_touched = False
 
         self.vendor_options = list(WORKBOOK_VENDORS)
         for vendor in self.master_data.get("Vendor", pd.Series(dtype=str)):
@@ -488,6 +558,10 @@ class ProductMasterV2(ctk.CTk):
         """Build an index once so large Product Masters do not require repeated full-file scans."""
         self.all_style_keys = []
         self.style_rows_cache = {}
+        # Product completeness is derived from the current master rows. Clear
+        # it only when those rows are reindexed, then reuse it while browsing.
+        self.style_complete_cache = {}
+        self._complete_count_cache = None
         for index, row in self.master_data.iterrows():
             key = style_group_key(row)
             if key not in self.style_rows_cache:
@@ -542,10 +616,20 @@ class ProductMasterV2(ctk.CTk):
         return not self.style_issues(rows)
 
     def completed_style_count(self):
-        return sum(1 for key in self.all_style_keys if self.style_is_complete(self.get_style_rows(key)))
+        if self._complete_count_cache is None:
+            self._complete_count_cache = sum(
+                1 for key in self.all_style_keys if self.style_key_is_complete(key)
+            )
+        return self._complete_count_cache
+
+    def style_key_is_complete(self, key):
+        """Cache catalog health until Product Master data actually changes."""
+        if key not in self.style_complete_cache:
+            self.style_complete_cache[key] = self.style_is_complete(self.get_style_rows(key))
+        return self.style_complete_cache[key]
 
     def incomplete_style_keys(self):
-        return [key for key in self.all_style_keys if not self.style_is_complete(self.get_style_rows(key))]
+        return [key for key in self.all_style_keys if not self.style_key_is_complete(key)]
 
     def vendor_style_counts(self):
         counts = {}
@@ -686,7 +770,9 @@ class ProductMasterV2(ctk.CTk):
         return label
 
     def refresh_dashboard(self):
-        self.build_style_list()
+        # The style index is rebuilt whenever master_data changes. Rebuilding
+        # it here made every search and catalog repaint discard the cached
+        # completeness result and re-evaluate the entire Product Master.
         total = len(self.all_style_keys)
         complete = self.completed_style_count()
         incomplete = total - complete
@@ -1142,10 +1228,11 @@ class ProductMasterV2(ctk.CTk):
         self.never_outsource_switch = ctk.CTkSwitch(
             rules, text="Never outsource — ship to Orchid", variable=self.never_outsource_var,
             onvalue=True, offvalue=False, progress_color=PURPLE,
+            command=self.on_never_outsource_changed,
         )
         self.never_outsource_switch.grid(row=3, column=1, sticky="w", padx=18, pady=(5, 3))
         ctk.CTkLabel(
-            rules, text="Headwear defaults to Yes. Turn off only for a rare product that may be outsourced.",
+            rules, text="Headwear, bottoms, bags, and Flame Resistant products default to Yes. Turn off only for a rare exception.",
             text_color=TEXT_MUTED, font=ctk.CTkFont(size=10), anchor="w", wraplength=520,
         ).grid(row=4, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 14))
 
@@ -1287,7 +1374,7 @@ class ProductMasterV2(ctk.CTk):
         ranked = []
         for position, key in enumerate(self.all_style_keys):
             rows = self.get_style_rows(key)
-            is_complete = self.style_is_complete(rows)
+            is_complete = self.style_key_is_complete(key)
             if catalog_filter == "Needs Setup" and is_complete:
                 continue
             if catalog_filter == "Complete" and not is_complete:
@@ -1394,9 +1481,18 @@ class ProductMasterV2(ctk.CTk):
         self.requires_size_var.set(normalize_bool(rules["Requires Size"], True))
         self.requires_color_var.set(normalize_bool(rules["Requires Color"], True))
         self.requires_decoration_var.set(normalize_bool(rules["Requires Decoration"], True))
-        self.never_outsource_var.set(normalize_bool(first_nonblank(rows[NEVER_OUTSOURCE_COLUMN]), default_never_outsource(
-            self.product_name_var.get(), self.category_var.get(), self.style_number_var.get()
-        )))
+        # Older Orchid versions wrote No into every blank row, which is not
+        # evidence that the user deliberately overrode a newer category default.
+        never_outsource = editor_never_outsource_value(
+            key,
+            self.never_outsource_overrides,
+            first_nonblank(rows[NEVER_OUTSOURCE_COLUMN]),
+            self.product_name_var.get(),
+            self.category_var.get(),
+            self.style_number_var.get(),
+        )
+        self.never_outsource_var.set(never_outsource)
+        self._never_outsource_touched = False
         vendors = list(dict.fromkeys(clean_text(v) for v in rows["Vendor"] if clean_text(v)))
         decorations = list(dict.fromkeys(clean_text(v) for v in rows["Decoration Type"] if clean_text(v)))
         locations = list(dict.fromkeys(clean_text(v) for v in rows["Decoration Location"] if clean_text(v)))
@@ -1502,8 +1598,15 @@ class ProductMasterV2(ctk.CTk):
             )
             if inferred_decoration:
                 self.decoration_type_var.set(inferred_decoration)
+        if selected_category == "Hats / Headwear" and defaults["requires_decoration"]:
+            self.decoration_location_var.set(HAT)
+            self.custom_decoration_location_var.set("")
         self.update_decoration_color_state()
         self.status_label.configure(text=f"Applied {selected_category} purchase defaults.")
+
+    def on_never_outsource_changed(self):
+        """Remember that this switch value was an intentional user choice."""
+        self._never_outsource_touched = True
 
     def on_decoration_location_selected(self, choice: str):
         is_custom = clean_text(choice) == OTHER_CUSTOM
@@ -1756,7 +1859,8 @@ class ProductMasterV2(ctk.CTk):
                 parent=self,
             )
             return False
-        rows = self.get_style_rows(self.current_style_key)
+        original_key = self.current_style_key
+        rows = self.get_style_rows(original_key)
         if rows.empty:
             messagebox.showwarning(
                 "Product Record Unavailable",
@@ -1845,6 +1949,12 @@ class ProductMasterV2(ctk.CTk):
         self.build_style_list()
         new_key = f"style:{style_number}" if style_number else f"product:{product_name.casefold()}"
         self.current_style_key = new_key if new_key in self.all_style_keys else None
+        if self._never_outsource_touched:
+            self.never_outsource_overrides[new_key] = bool(self.never_outsource_var.get())
+            if original_key != new_key:
+                self.never_outsource_overrides.pop(original_key, None)
+            save_never_outsource_overrides(self.never_outsource_overrides)
+            self._never_outsource_touched = False
         self.session_saved_styles.add(style_number or product_name or self.current_style_key or "Unknown")
         self.refresh_progress()
 

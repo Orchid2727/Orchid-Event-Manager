@@ -1,0 +1,11 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.8.30
+
+PURCHASING COLOR MERGE REPAIR
+
+- Fixes Save & Next incorrectly reporting Missing purchasing color after a
+  visible color such as Black was entered.
+- When a style number is changed to an existing style, a real purchasing-color
+  row now replaces the older hidden blank placeholder.
+- Useful shared vendor and product details from the placeholder are retained.
+- Products that genuinely do not require color keep their blank rows.
+- Includes the v4.8.30 Hat location default and all earlier fixes.

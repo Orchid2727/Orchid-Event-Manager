@@ -51,12 +51,18 @@ def is_flame_resistant_category(category: Any = "") -> bool:
     return clean(category).casefold() == "flame resistant"
 
 
+def is_bags_category(category: Any = "") -> bool:
+    """Return True for Orchid's saved bags category."""
+    return clean(category).casefold() == "bags"
+
+
 def default_never_outsource(product_name: Any = "", category: Any = "", style_number: Any = "") -> bool:
     """Return the Orchid shipping default for products that must stay in house."""
     return (
         is_headwear_product(product_name, category, style_number)
         or is_pants_jeans_shorts_category(category)
         or is_flame_resistant_category(category)
+        or is_bags_category(category)
     )
 
 

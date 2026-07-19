@@ -1,4 +1,28 @@
-ORCHID PURCHASE MANAGER PROFESSIONAL 4.8.25 - TEST RESULTS
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.8.30 - TEST RESULTS
+
+PASS - Renaming PT88BK to PT88 and entering Black saves without a hidden blank-color row.
+PASS - Shared vendor and product details transfer from the removed placeholder.
+PASS - A style with only one blank color row remains available for setup.
+PASS - Products configured with Color Not Required retain valid blank rows.
+
+PASS - Selecting Hats / Headwear immediately sets Decoration Location to Hat.
+PASS - Hat category selection clears stale custom-location text.
+PASS - Reopening an existing product preserves its deliberately saved headwear location.
+
+PASS - Products categorized as Bags default Never Outsource to Yes.
+PASS - Recognized backpack, duffel, tote, messenger bag, briefcase, and cooler descriptions infer Bags.
+PASS - A legacy Bags record containing automatic No opens with Never Outsource enabled.
+PASS - A deliberate manual Bags override remains respected.
+
+PASS - Wrangler jean with legacy Never Outsource = No opens with Never Outsource enabled.
+PASS - Pants / Jeans / Shorts, headwear, and Flame Resistant receive the current default.
+PASS - A deliberate manual Never Outsource override remains respected on reopen.
+PASS - Saving a corrected legacy product writes Yes to Product Master.
+
+PASS - Completed-item Edit reuses cached catalog completeness instead of rescanning every style.
+PASS - Repeated progress refreshes perform zero additional style completeness evaluations.
+PASS - Rebuilding the style index after Product Master data changes invalidates the cache.
+PASS - Dashboard search and repaint no longer rebuild the unchanged style index.
 
 PASS - Flame Resistant appears in the permanent Product Master category list.
 PASS - FR, fire-resistant, and flame-resistant descriptions infer Flame Resistant before shirt or outerwear categories.
@@ -30,7 +54,7 @@ PASS - Save & Next reports remaining setup requirements instead of silently rese
 PASS - NKFQ4794-style records retain vendor, decoration type, decoration color, and reviewed setup state after cleaning.
 
 PASS - All Python source modules compile successfully.
-PASS - Application, Product Master, VERSION files, builder, launcher, bootstrap, and Mac bundle report 4.8.25.
+PASS - Application, Product Master, VERSION files, builder, launcher, bootstrap, and Mac bundle report 4.8.30.
 PASS - Dashboard is constructed at startup; secondary pages are constructed once on first use.
 PASS - Repeated mission snapshots use one disk load until the workbook or PO override state changes.
 PASS - Snapshot cache invalidates when the workbook file signature changes.
