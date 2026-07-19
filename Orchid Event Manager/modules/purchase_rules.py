@@ -30,6 +30,7 @@ CATEGORY_OPTIONS = [
     "Drinkware",
     "Towels / Blankets",
     "Safety Workwear",
+    "Flame Resistant",
     "Accessories",
     "Other",
 ]
@@ -71,6 +72,8 @@ def infer_category(product_name: Any, style_number: Any = "") -> str:
     text = f"{clean(product_name)} {clean(style_number)}".casefold()
     lower_body_text = re.sub(r"\bshort[- ]sleeve\b", "sleeve", text)
 
+    if _has(text, r"\b(fr|fr[- ]?rated|flame[- ]?resistant|fire[- ]?resistant|flame[- ]?retardant|fire[- ]?retardant)\b"):
+        return "Flame Resistant"
     if is_blank_garment_product(product_name, style_number=style_number):
         return "Pants / Jeans / Shorts"
     if _has(lower_body_text, r"\b(jean|jeans|pant|pants|trouser|trousers|shorts|slacks?|cargo pant|bib overall)\b"):
@@ -103,6 +106,8 @@ def category_defaults(category: Any, product_name: Any = "", style_number: Any =
         return {"requires_size": False, "requires_color": False, "requires_decoration": False}
     category_text = clean(category) or infer_category(product_name, style_number)
     if category_text == "Pants / Jeans / Shorts":
+        return {"requires_size": True, "requires_color": True, "requires_decoration": False}
+    if category_text == "Flame Resistant":
         return {"requires_size": True, "requires_color": True, "requires_decoration": False}
     if category_text in {"Hats / Headwear", "Bags", "Drinkware", "Towels / Blankets", "Accessories"}:
         return {"requires_size": False, "requires_color": True, "requires_decoration": True}

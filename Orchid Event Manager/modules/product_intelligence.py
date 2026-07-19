@@ -34,7 +34,7 @@ def infer_default_decoration(category: Any, product_name: Any = "", style_number
     category_text = clean(category) or infer_category(product_name, style_number)
     text = f"{clean(product_name)} {clean(style_number)}".casefold()
 
-    if category_text == "Pants / Jeans / Shorts":
+    if category_text in {"Pants / Jeans / Shorts", "Flame Resistant"}:
         return BLANK_DECORATION_LABEL
     if category_text == "Hats / Headwear":
         return EMBROIDERY

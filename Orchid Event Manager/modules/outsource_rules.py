@@ -40,9 +40,24 @@ def is_headwear_product(product_name: Any = "", category: Any = "", style_number
     return bool(re.search(r"\b(hat|hats|cap|caps|beanie|beanies|boonie|boonies|booney|booneys|visor|headwear)\b", text))
 
 
+def is_pants_jeans_shorts_category(category: Any = "") -> bool:
+    """Return True for Orchid's saved bottoms category."""
+    category_text = re.sub(r"\s*/\s*", " / ", clean(category).casefold())
+    return category_text == "pants / jeans / shorts"
+
+
+def is_flame_resistant_category(category: Any = "") -> bool:
+    """Return True for Orchid's saved flame-resistant category."""
+    return clean(category).casefold() == "flame resistant"
+
+
 def default_never_outsource(product_name: Any = "", category: Any = "", style_number: Any = "") -> bool:
-    """Headwear is decorated in house and should never be sent to an outside decorator."""
-    return is_headwear_product(product_name, category, style_number)
+    """Return the Orchid shipping default for products that must stay in house."""
+    return (
+        is_headwear_product(product_name, category, style_number)
+        or is_pants_jeans_shorts_category(category)
+        or is_flame_resistant_category(category)
+    )
 
 
 def resolve_never_outsource(

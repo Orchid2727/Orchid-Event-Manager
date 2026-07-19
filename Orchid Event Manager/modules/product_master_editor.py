@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import traceback
 from tkinter import messagebox, simpledialog
 from PIL import Image as PILImage
 
@@ -280,6 +281,7 @@ def clean_and_deduplicate_master(master):
                 "Requires Color": first_nonblank(group["Requires Color"]),
                 "Requires Decoration": first_nonblank(group["Requires Decoration"]),
                 NEVER_OUTSOURCE_COLUMN: first_nonblank(group[NEVER_OUTSOURCE_COLUMN]),
+                "Setup Required": first_nonblank(group["Setup Required"]),
             }
         )
     result = pd.DataFrame(rows, columns=COLUMNS)
@@ -342,7 +344,7 @@ class ProductMasterV2(ctk.CTk):
         super().__init__()
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
-        self.title("Orchid Purchase Manager - Product Master 4.8.20")
+        self.title("Orchid Purchase Manager - Product Master 4.8.25")
         self.geometry("1320x930")
         self.minsize(1120, 780)
         self.configure(fg_color=WINDOW_BG)
@@ -392,6 +394,7 @@ class ProductMasterV2(ctk.CTk):
         self.never_outsource_var = ctk.BooleanVar(value=False)
         self.advanced_visible = False
         self.apply_color_var = ctk.StringVar(value="")
+        self._suspend_editor_filter_trace = False
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -831,8 +834,9 @@ class ProductMasterV2(ctk.CTk):
         self.editor_frame.grid_remove()
         self.dashboard_frame.grid(sticky="nsew")
         self.dashboard_frame.tkraise()
+        # reload_live_file already refreshes the dashboard.  Calling refresh a
+        # second time rebuilt every catalog card and vendor row unnecessarily.
         self.reload_live_file(silent=True)
-        self.refresh_dashboard()
         self.update_idletasks()
 
     def reload_live_file(self, silent: bool = False):
@@ -944,9 +948,34 @@ class ProductMasterV2(ctk.CTk):
         self.show_editor(target_key=incomplete[0])
 
     def open_style(self, key):
-        self.search_var.set("")
-        self.incomplete_only_var.set(False)
-        self.show_editor(target_key=key)
+        """Open the exact catalog record clicked, regardless of the prior queue filter."""
+        if key not in self.all_style_keys:
+            self.reload_live_file(silent=True)
+        if key not in self.all_style_keys:
+            messagebox.showwarning("Product Not Found", "That Product Master record is no longer available.", parent=self)
+            return
+
+        # A completed item cannot appear inside Needs Setup.  Reset both filter
+        # variables before building the editor list so target_key cannot fall
+        # back to the first incomplete record (historically American Flag).
+        self._suspend_editor_filter_trace = True
+        try:
+            self.search_var.set("")
+            self.catalog_filter_var.set("All Products")
+            self.incomplete_only_var.set(False)
+        finally:
+            self._suspend_editor_filter_trace = False
+
+        # All Products with no search is already represented by all_style_keys.
+        # Use that index directly instead of rescanning every style twice.
+        self.filtered_style_keys = list(self.all_style_keys)
+        self.style_position = self.filtered_style_keys.index(key)
+        self.dashboard_frame.grid_remove()
+        self.editor_frame.grid(sticky="nsew")
+        self.editor_frame.tkraise()
+        self._refresh_filter_button_styles()
+        self.show_current_style()
+        self.after_idle(self.refresh_progress)
 
     # ---------- editor ----------
     def build_editor(self):
@@ -959,7 +988,11 @@ class ProductMasterV2(ctk.CTk):
         self.build_content_area(frame)
         self.build_action_bar(frame)
         self.build_footer(frame)
-        self.search_var.trace_add("write", lambda *_: self.apply_filters(reset_position=True))
+        self.search_var.trace_add("write", self._on_editor_search_changed)
+
+    def _on_editor_search_changed(self, *_):
+        if not self._suspend_editor_filter_trace:
+            self.apply_filters(reset_position=True)
 
     def build_editor_header(self, parent):
         header = ctk.CTkFrame(parent, fg_color=CARD_BG, corner_radius=0, height=100)
@@ -1047,29 +1080,37 @@ class ProductMasterV2(ctk.CTk):
     def build_content_area(self, parent):
         content = ctk.CTkFrame(parent, fg_color="transparent")
         content.grid(row=4, column=0, sticky="nsew", padx=20, pady=8)
-        content.grid_columnconfigure(0, weight=0)
-        content.grid_columnconfigure(1, weight=1)
+        # Purchasing fields need more room than the original fixed 390-pixel
+        # rail, while the multi-column color table must remain comfortably wide.
+        # A 40/60 split balances both workflows at every supported window size.
+        content.grid_columnconfigure(0, weight=4, minsize=400, uniform="editor_panels")
+        content.grid_columnconfigure(1, weight=6, minsize=600, uniform="editor_panels")
         content.grid_rowconfigure(0, weight=1)
         self.build_left_panel(content)
         self.build_color_panel(content)
 
     def build_left_panel(self, parent):
-        left = ctk.CTkScrollableFrame(parent, fg_color="transparent", width=390, corner_radius=0)
-        left.grid(row=0, column=0, sticky="nsw", padx=(0, 10))
+        left = ctk.CTkScrollableFrame(parent, fg_color="transparent", corner_radius=0)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         left.grid_columnconfigure(0, weight=1)
         self.left_scroll = left
 
-        info = ctk.CTkFrame(left, fg_color=CARD_BG, border_width=1, border_color=PURPLE_BORDER, corner_radius=12, width=370)
+        info = ctk.CTkFrame(left, fg_color=CARD_BG, border_width=1, border_color=PURPLE_BORDER, corner_radius=12)
         info.grid(row=0, column=0, sticky="ew")
         info.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(info, text="① Purchasing Information", text_color=PURPLE, font=ctk.CTkFont(size=17, weight="bold"), anchor="w").grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 10))
+        info.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(info, text="① Purchasing Information", text_color=PURPLE, font=ctk.CTkFont(size=17, weight="bold"), anchor="w").grid(row=0, column=0, columnspan=2, sticky="ew", padx=20, pady=(16, 10))
 
-        self.add_labeled_entry(info, 1, "Product Number *", self.style_number_var, "Example: K500, 1062, ST660")
-        self.add_labeled_entry(info, 4, "Product Description *", self.product_name_var, "Permanent catalog description")
+        ctk.CTkLabel(info, text="Product Number *", text_color=TEXT_DARK, font=ctk.CTkFont(size=12, weight="bold"), anchor="w").grid(row=1, column=0, sticky="ew", padx=(20, 8), pady=(3, 4))
+        ctk.CTkLabel(info, text="Product Description *", text_color=TEXT_DARK, font=ctk.CTkFont(size=12, weight="bold"), anchor="w").grid(row=1, column=1, sticky="ew", padx=(8, 20), pady=(3, 4))
+        ctk.CTkEntry(info, textvariable=self.style_number_var, height=38, border_color=PURPLE_BORDER, fg_color="#FFFFFF", text_color=TEXT_DARK).grid(row=2, column=0, sticky="ew", padx=(20, 8))
+        ctk.CTkEntry(info, textvariable=self.product_name_var, height=38, border_color=PURPLE_BORDER, fg_color="#FFFFFF", text_color=TEXT_DARK).grid(row=2, column=1, sticky="ew", padx=(8, 20))
+        ctk.CTkLabel(info, text="Example: K500, 1062, ST660", text_color=TEXT_MUTED, font=ctk.CTkFont(size=10), anchor="w").grid(row=3, column=0, sticky="ew", padx=(20, 8), pady=(3, 8))
+        ctk.CTkLabel(info, text="Permanent catalog description", text_color=TEXT_MUTED, font=ctk.CTkFont(size=10), anchor="w").grid(row=3, column=1, sticky="ew", padx=(8, 20), pady=(3, 8))
 
-        ctk.CTkLabel(info, text="Purchase Vendor *", text_color=TEXT_DARK, font=ctk.CTkFont(size=12, weight="bold"), anchor="w").grid(row=7, column=0, sticky="ew", padx=20, pady=(4, 4))
+        ctk.CTkLabel(info, text="Purchase Vendor *", text_color=TEXT_DARK, font=ctk.CTkFont(size=12, weight="bold"), anchor="w").grid(row=4, column=0, columnspan=2, sticky="ew", padx=20, pady=(4, 4))
         vendor_row = ctk.CTkFrame(info, fg_color="transparent")
-        vendor_row.grid(row=8, column=0, sticky="ew", padx=20)
+        vendor_row.grid(row=5, column=0, columnspan=2, sticky="ew", padx=20)
         vendor_row.grid_columnconfigure(0, weight=1)
         self.vendor_combo = ctk.CTkComboBox(vendor_row, variable=self.vendor_var, values=self.vendor_options, height=38, border_color=PURPLE_BORDER, button_color="#EAE3F5", button_hover_color="#DED2EF", fg_color="#FFFFFF", text_color=TEXT_DARK, dropdown_fg_color="#FFFFFF", dropdown_text_color=TEXT_DARK)
         self.vendor_combo.grid(row=0, column=0, sticky="ew", padx=(0, 7))
@@ -1079,69 +1120,34 @@ class ProductMasterV2(ctk.CTk):
             border_width=1, border_color=PURPLE, text_color=PURPLE,
             font=ctk.CTkFont(size=11, weight="bold"),
         ).grid(row=0, column=1)
-        ctk.CTkLabel(info, text="Choose a saved vendor, type a name, or use Add Vendor. Saving this product keeps the vendor in future dropdowns.", text_color=TEXT_MUTED, font=ctk.CTkFont(size=10), anchor="w", wraplength=330).grid(row=9, column=0, sticky="ew", padx=20, pady=(3, 8))
+        ctk.CTkLabel(info, text="Choose a saved vendor, type a name, or use Add Vendor. Saving this product keeps the vendor in future dropdowns.", text_color=TEXT_MUTED, font=ctk.CTkFont(size=10), anchor="w", wraplength=520).grid(row=6, column=0, columnspan=2, sticky="ew", padx=20, pady=(3, 8))
 
-        ctk.CTkLabel(info, text="Product Category *", text_color=TEXT_DARK, font=ctk.CTkFont(size=12, weight="bold"), anchor="w").grid(row=10, column=0, sticky="ew", padx=20, pady=(4, 4))
+        ctk.CTkLabel(info, text="Product Category *", text_color=TEXT_DARK, font=ctk.CTkFont(size=12, weight="bold"), anchor="w").grid(row=7, column=0, columnspan=2, sticky="ew", padx=20, pady=(4, 4))
         self.category_combo = ctk.CTkComboBox(info, variable=self.category_var, values=CATEGORY_OPTIONS, height=38, command=self.on_category_selected, border_color=PURPLE_BORDER, button_color="#EAE3F5", button_hover_color="#DED2EF", fg_color="#FFFFFF", text_color=TEXT_DARK, dropdown_fg_color="#FFFFFF", dropdown_text_color=TEXT_DARK)
-        self.category_combo.grid(row=11, column=0, sticky="ew", padx=20)
-        ctk.CTkLabel(info, text="Category supplies sensible defaults for size, color, and decoration requirements.", text_color=TEXT_MUTED, font=ctk.CTkFont(size=10), anchor="w", wraplength=320).grid(row=12, column=0, sticky="ew", padx=20, pady=(3, 8))
-
-        ctk.CTkLabel(info, text="Decoration Type *", text_color=TEXT_DARK, font=ctk.CTkFont(size=12, weight="bold"), anchor="w").grid(row=13, column=0, sticky="ew", padx=20, pady=(4, 4))
-        self.decoration_combo = ctk.CTkComboBox(info, variable=self.decoration_type_var, values=DECORATION_TYPES, height=38, border_color=PURPLE_BORDER, button_color="#EAE3F5", button_hover_color="#DED2EF", fg_color="#FFFFFF", text_color=TEXT_DARK, dropdown_fg_color="#FFFFFF", dropdown_text_color=TEXT_DARK)
-        self.decoration_combo.grid(row=14, column=0, sticky="ew", padx=20, pady=(0, 8))
-        ctk.CTkLabel(info, text="Default Decoration Location *", text_color=TEXT_DARK, font=ctk.CTkFont(size=12, weight="bold"), anchor="w").grid(row=15, column=0, sticky="ew", padx=20, pady=(4, 4))
-        self.decoration_location_combo = ctk.CTkComboBox(
-            info, variable=self.decoration_location_var, values=DECORATION_LOCATIONS, height=38,
-            command=self.on_decoration_location_selected,
-            border_color=PURPLE_BORDER, button_color="#EAE3F5", button_hover_color="#DED2EF",
-            fg_color="#FFFFFF", text_color=TEXT_DARK, dropdown_fg_color="#FFFFFF", dropdown_text_color=TEXT_DARK,
-        )
-        self.decoration_location_combo.grid(row=16, column=0, sticky="ew", padx=20, pady=(0, 4))
-        ctk.CTkLabel(
-            info, text="Choose a standard route or Other / Custom. Every exact location is separated on the PO.",
-            text_color=TEXT_MUTED, font=ctk.CTkFont(size=10), anchor="w", wraplength=330,
-        ).grid(row=17, column=0, sticky="ew", padx=20, pady=(0, 8))
-        self.custom_location_label = ctk.CTkLabel(
-            info, text="Custom Location *", text_color=TEXT_DARK,
-            font=ctk.CTkFont(size=12, weight="bold"), anchor="w",
-        )
-        self.custom_location_label.grid(row=18, column=0, sticky="ew", padx=20, pady=(4, 4))
-        self.custom_location_entry = ctk.CTkEntry(
-            info, textvariable=self.custom_decoration_location_var, height=38,
-            placeholder_text="Example: Right Chest or Center Back",
-        )
-        self.custom_location_entry.grid(row=19, column=0, sticky="ew", padx=20, pady=(0, 8))
-        ctk.CTkLabel(
-            info, text="Placement Instructions (optional)", text_color=TEXT_DARK,
-            font=ctk.CTkFont(size=12, weight="bold"), anchor="w",
-        ).grid(row=20, column=0, sticky="ew", padx=20, pady=(4, 4))
-        self.placement_instructions_entry = ctk.CTkEntry(
-            info, textvariable=self.decoration_placement_instructions_var, height=38,
-            placeholder_text="Example: 2 inches below shoulder seam",
-        )
-        self.placement_instructions_entry.grid(row=21, column=0, sticky="ew", padx=20, pady=(0, 14))
-        self.on_decoration_location_selected(self.decoration_location_var.get())
+        self.category_combo.grid(row=8, column=0, columnspan=2, sticky="ew", padx=20)
+        ctk.CTkLabel(info, text="Category supplies sensible defaults for size, color, and decoration requirements.", text_color=TEXT_MUTED, font=ctk.CTkFont(size=10), anchor="w", wraplength=520).grid(row=9, column=0, columnspan=2, sticky="ew", padx=20, pady=(3, 14))
 
         rules = ctk.CTkFrame(left, fg_color=CARD_BG, border_width=1, border_color=PURPLE_BORDER, corner_radius=12)
         rules.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         rules.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(rules, text="② Purchase Requirements", text_color=PURPLE, font=ctk.CTkFont(size=17, weight="bold"), anchor="w").grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 6))
-        ctk.CTkLabel(rules, text="Orchid only flags information that is required for this product.", text_color=TEXT_MUTED, font=ctk.CTkFont(size=10), anchor="w", wraplength=320).grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 8))
+        rules.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(rules, text="② Purchase Requirements", text_color=PURPLE, font=ctk.CTkFont(size=17, weight="bold"), anchor="w").grid(row=0, column=0, columnspan=2, sticky="ew", padx=18, pady=(14, 6))
+        ctk.CTkLabel(rules, text="Orchid only flags information that is required for this product.", text_color=TEXT_MUTED, font=ctk.CTkFont(size=10), anchor="w", wraplength=520).grid(row=1, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 8))
         self.requires_size_switch = ctk.CTkSwitch(rules, text="Size is required", variable=self.requires_size_var, onvalue=True, offvalue=False, progress_color=PURPLE)
         self.requires_size_switch.grid(row=2, column=0, sticky="w", padx=18, pady=5)
         self.requires_color_switch = ctk.CTkSwitch(rules, text="Color is required", variable=self.requires_color_var, onvalue=True, offvalue=False, progress_color=PURPLE)
-        self.requires_color_switch.grid(row=3, column=0, sticky="w", padx=18, pady=5)
+        self.requires_color_switch.grid(row=2, column=1, sticky="w", padx=18, pady=5)
         self.requires_decoration_switch = ctk.CTkSwitch(rules, text="Decoration is required", variable=self.requires_decoration_var, onvalue=True, offvalue=False, progress_color=PURPLE, command=self.on_requires_decoration_changed)
-        self.requires_decoration_switch.grid(row=4, column=0, sticky="w", padx=18, pady=5)
+        self.requires_decoration_switch.grid(row=3, column=0, sticky="w", padx=18, pady=5)
         self.never_outsource_switch = ctk.CTkSwitch(
             rules, text="Never outsource — ship to Orchid", variable=self.never_outsource_var,
             onvalue=True, offvalue=False, progress_color=PURPLE,
         )
-        self.never_outsource_switch.grid(row=5, column=0, sticky="w", padx=18, pady=(5, 3))
+        self.never_outsource_switch.grid(row=3, column=1, sticky="w", padx=18, pady=(5, 3))
         ctk.CTkLabel(
             rules, text="Headwear defaults to Yes. Turn off only for a rare product that may be outsourced.",
-            text_color=TEXT_MUTED, font=ctk.CTkFont(size=10), anchor="w", wraplength=320,
-        ).grid(row=6, column=0, sticky="ew", padx=18, pady=(0, 14))
+            text_color=TEXT_MUTED, font=ctk.CTkFont(size=10), anchor="w", wraplength=520,
+        ).grid(row=4, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 14))
 
         self.advanced_button = ctk.CTkButton(left, text="Show Advanced Matching Fields", command=self.toggle_advanced_fields, height=36, fg_color="transparent", hover_color=PURPLE_LIGHT, border_width=1, border_color=PURPLE, text_color=PURPLE)
         self.advanced_button.grid(row=2, column=0, sticky="ew", pady=(12, 0))
@@ -1171,16 +1177,51 @@ class ProductMasterV2(ctk.CTk):
         panel = ctk.CTkFrame(parent, fg_color=CARD_BG, border_width=1, border_color=PURPLE_BORDER, corner_radius=12)
         panel.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
         panel.grid_columnconfigure(0, weight=1)
-        panel.grid_rowconfigure(3, weight=1)
+        panel.grid_rowconfigure(4, weight=1)
         title_row = ctk.CTkFrame(panel, fg_color="transparent")
         title_row.grid(row=0, column=0, sticky="ew", padx=22, pady=(16, 4))
         title_row.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(title_row, text="③ Purchasing Colors and Decoration", text_color=PURPLE, font=ctk.CTkFont(size=17, weight="bold"), anchor="w").grid(row=0, column=0, sticky="ew")
         ctk.CTkButton(title_row, text="+ Add Garment Color", command=self.add_color_row, width=150, height=34, fg_color="transparent", hover_color=PURPLE_LIGHT, border_width=1, border_color=PURPLE, text_color=PURPLE).grid(row=0, column=1)
-        ctk.CTkLabel(panel, text="Use the purchasing color sent to the vendor. Add vendor color codes and Shopify aliases when names differ. Thread/ink color is not required for Blank Garment (No Decoration).", text_color=TEXT_MUTED, font=ctk.CTkFont(size=12), anchor="w").grid(row=1, column=0, sticky="ew", padx=22, pady=(0, 10))
+        ctk.CTkLabel(panel, text="Set the permanent decoration route, then complete each purchasing color below.", text_color=TEXT_MUTED, font=ctk.CTkFont(size=12), anchor="w").grid(row=1, column=0, sticky="ew", padx=22, pady=(0, 8))
+
+        decoration_settings = ctk.CTkFrame(panel, fg_color=PURPLE_LIGHT, border_width=1, border_color=PURPLE_BORDER, corner_radius=10)
+        decoration_settings.grid(row=2, column=0, sticky="ew", padx=22, pady=(0, 10))
+        for column in range(3):
+            decoration_settings.grid_columnconfigure(column, weight=1)
+
+        ctk.CTkLabel(decoration_settings, text="Decoration Type *", text_color=TEXT_DARK, font=ctk.CTkFont(size=11, weight="bold"), anchor="w").grid(row=0, column=0, sticky="ew", padx=(14, 7), pady=(10, 4))
+        ctk.CTkLabel(decoration_settings, text="Default Location *", text_color=TEXT_DARK, font=ctk.CTkFont(size=11, weight="bold"), anchor="w").grid(row=0, column=1, sticky="ew", padx=7, pady=(10, 4))
+        self.custom_location_label = ctk.CTkLabel(decoration_settings, text="Custom Location *", text_color=TEXT_DARK, font=ctk.CTkFont(size=11, weight="bold"), anchor="w")
+        self.custom_location_label.grid(row=0, column=2, sticky="ew", padx=(7, 14), pady=(10, 4))
+
+        self.decoration_combo = ctk.CTkComboBox(decoration_settings, variable=self.decoration_type_var, values=DECORATION_TYPES, height=36, border_color=PURPLE_BORDER, button_color="#EAE3F5", button_hover_color="#DED2EF", fg_color="#FFFFFF", text_color=TEXT_DARK, dropdown_fg_color="#FFFFFF", dropdown_text_color=TEXT_DARK)
+        self.decoration_combo.grid(row=1, column=0, sticky="ew", padx=(14, 7))
+        self.decoration_location_combo = ctk.CTkComboBox(
+            decoration_settings, variable=self.decoration_location_var, values=DECORATION_LOCATIONS, height=36,
+            command=self.on_decoration_location_selected,
+            border_color=PURPLE_BORDER, button_color="#EAE3F5", button_hover_color="#DED2EF",
+            fg_color="#FFFFFF", text_color=TEXT_DARK, dropdown_fg_color="#FFFFFF", dropdown_text_color=TEXT_DARK,
+        )
+        self.decoration_location_combo.grid(row=1, column=1, sticky="ew", padx=7)
+        self.custom_location_entry = ctk.CTkEntry(
+            decoration_settings, textvariable=self.custom_decoration_location_var, height=36,
+            placeholder_text="Right Chest or Center Back",
+            border_color=PURPLE_BORDER, fg_color="#FFFFFF", text_color=TEXT_DARK,
+        )
+        self.custom_location_entry.grid(row=1, column=2, sticky="ew", padx=(7, 14))
+
+        ctk.CTkLabel(decoration_settings, text="Placement Instructions (optional)", text_color=TEXT_DARK, font=ctk.CTkFont(size=11, weight="bold"), anchor="w").grid(row=2, column=0, columnspan=3, sticky="ew", padx=14, pady=(9, 4))
+        self.placement_instructions_entry = ctk.CTkEntry(
+            decoration_settings, textvariable=self.decoration_placement_instructions_var, height=36,
+            placeholder_text="Example: 2 inches below shoulder seam",
+            border_color=PURPLE_BORDER, fg_color="#FFFFFF", text_color=TEXT_DARK,
+        )
+        self.placement_instructions_entry.grid(row=3, column=0, columnspan=3, sticky="ew", padx=14, pady=(0, 10))
+        self.on_decoration_location_selected(self.decoration_location_var.get())
 
         table_header = ctk.CTkFrame(panel, fg_color=PURPLE_LIGHT, border_width=1, border_color=PURPLE_BORDER, corner_radius=8, height=44)
-        table_header.grid(row=2, column=0, sticky="ew", padx=22)
+        table_header.grid(row=3, column=0, sticky="ew", padx=22)
         table_header.grid_columnconfigure(1, weight=2)
         table_header.grid_columnconfigure(2, weight=1)
         table_header.grid_columnconfigure(3, weight=2)
@@ -1194,7 +1235,7 @@ class ProductMasterV2(ctk.CTk):
         ctk.CTkLabel(table_header, text="Remove", text_color=PURPLE, font=ctk.CTkFont(size=12, weight="bold"), width=68).grid(row=0, column=5, padx=(4, 10), pady=10)
 
         self.colors_scroll = ctk.CTkScrollableFrame(panel, fg_color="#FFFFFF", corner_radius=8, border_width=1, border_color=PURPLE_BORDER)
-        self.colors_scroll.grid(row=3, column=0, sticky="nsew", padx=22, pady=(6, 18))
+        self.colors_scroll.grid(row=4, column=0, sticky="nsew", padx=22, pady=(6, 18))
         self.colors_scroll.grid_columnconfigure(0, weight=1)
 
     def build_action_bar(self, parent):
@@ -1449,7 +1490,7 @@ class ProductMasterV2(ctk.CTk):
         self.requires_color_var.set(defaults["requires_color"])
         self.requires_decoration_var.set(defaults["requires_decoration"])
         self.never_outsource_var.set(default_never_outsource(
-            self.product_name_var.get(), self.category_var.get(), self.style_number_var.get()
+            self.product_name_var.get(), selected_category, self.style_number_var.get()
         ))
         if not defaults["requires_decoration"]:
             self.decoration_type_var.set(BLANK_DECORATION_LABEL)
@@ -1627,11 +1668,31 @@ class ProductMasterV2(ctk.CTk):
 
     def ensure_session_backup(self):
         if self.session_backup_path or not PRODUCT_MASTER_PATH.exists():
-            return
-        backup_dir = PRODUCT_MASTER_PATH.parent / "backups"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        self.session_backup_path = backup_dir / f"product_master_before_pro_session_{datetime.now():%Y%m%d_%H%M%S}.csv"
-        shutil.copy2(PRODUCT_MASTER_PATH, self.session_backup_path)
+            return True
+        try:
+            backup_dir = PRODUCT_MASTER_PATH.parent / "backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = backup_dir / f"product_master_before_pro_session_{datetime.now():%Y%m%d_%H%M%S}.csv"
+            shutil.copy2(PRODUCT_MASTER_PATH, backup_path)
+            self.session_backup_path = backup_path
+            return True
+        except Exception as error:
+            # A cloud-synced Documents folder can temporarily refuse the optional
+            # session backup.  Do not silently abort the user's actual save.
+            self._write_save_diagnostic("session backup", error)
+            self.status_label.configure(text="Backup was unavailable; continuing with the Product Master save.")
+            return False
+
+    def _write_save_diagnostic(self, stage: str, error: Exception) -> Path | None:
+        """Write a useful diagnostic without allowing logging itself to block saving."""
+        try:
+            log_path = PRODUCT_MASTER_PATH.parent / "product_master_save_error.log"
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"\n[{datetime.now().isoformat(timespec='seconds')}] {stage}\n")
+                handle.write("".join(traceback.format_exception(type(error), error, error.__traceback__)))
+            return log_path
+        except Exception:
+            return None
 
     def _mark_catalog_updated(self, style_name: str = ""):
         try:
@@ -1670,10 +1731,38 @@ class ProductMasterV2(ctk.CTk):
         self._save_toast_after_id = self.after(1900, self.save_toast.place_forget)
 
     def save_current_style(self):
+        """Save from a button click and always give visible success or failure feedback."""
+        try:
+            return self._save_current_style_impl()
+        except Exception as error:
+            log_path = self._write_save_diagnostic("Product Master save", error)
+            details = f"\n\nDiagnostic saved to:\n{log_path}" if log_path else ""
+            try:
+                self.status_label.configure(text="Save failed — Orchid displayed the error so it can be corrected.")
+            except Exception:
+                pass
+            messagebox.showerror(
+                "Unable to Save Product",
+                f"Orchid could not save this Product Master record.\n\n{error}{details}",
+                parent=self,
+            )
+            return False
+
+    def _save_current_style_impl(self):
         if not self.current_style_key:
+            messagebox.showwarning(
+                "No Product Selected",
+                "Select a Product Master record before saving.",
+                parent=self,
+            )
             return False
         rows = self.get_style_rows(self.current_style_key)
         if rows.empty:
+            messagebox.showwarning(
+                "Product Record Unavailable",
+                "This Product Master record is no longer available. Return to Product Catalog and open it again.",
+                parent=self,
+            )
             return False
         self.ensure_session_backup()
 
@@ -1779,6 +1868,18 @@ class ProductMasterV2(ctk.CTk):
         except (ValueError, TypeError):
             global_position = -1
         if not self.save_current_style():
+            return
+        saved_key = self.current_style_key
+        saved_rows = self.get_style_rows(saved_key) if saved_key else pd.DataFrame(columns=COLUMNS)
+        remaining_issues = self.style_issues(saved_rows)
+        if remaining_issues:
+            messagebox.showwarning(
+                "Setup Still Required",
+                "This product was saved, but it still needs the following before Orchid can move to the next setup item:\n\n• "
+                + "\n• ".join(remaining_issues),
+                parent=self,
+            )
+            self.status_label.configure(text="Saved — complete the listed setup before moving to the next item.")
             return
         self.filtered_style_keys = self.get_matching_style_keys()
         if not self.filtered_style_keys:

@@ -1,7 +1,36 @@
-ORCHID PURCHASE MANAGER PROFESSIONAL 4.8.20 - TEST RESULTS
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.8.25 - TEST RESULTS
+
+PASS - Flame Resistant appears in the permanent Product Master category list.
+PASS - FR, fire-resistant, and flame-resistant descriptions infer Flame Resistant before shirt or outerwear categories.
+PASS - Flame Resistant defaults Decoration Required to No and Decoration Type to Blank Garment (No Decoration).
+PASS - Flame Resistant defaults Never Outsource to Yes when the field is blank.
+PASS - An explicitly saved Never Outsource = No remains No.
+
+PASS - Edit opens the exact completed PT88FN record selected in Product Catalog.
+PASS - A prior Needs Setup filter resets to All Products before completed-item editing.
+PASS - Direct Edit avoids the redundant full editor filter scan.
+PASS - Product Catalog return performs one refresh rather than two.
+
+PASS - Pants / Jeans / Shorts defaults Never Outsource to Yes when the field is blank.
+PASS - Selecting Pants / Jeans / Shorts immediately turns on the Product Master switch.
+PASS - An explicitly saved Never Outsource = No remains No.
+
+PASS - Product Master content area uses a responsive 40/60 purchasing-to-colors split.
+PASS - Purchasing Information expands horizontally instead of remaining a fixed 390-pixel rail.
+PASS - Product Number and Product Description render as a two-column row.
+PASS - Purchase Requirement switches render in two columns.
+PASS - Decoration Type, Location, Custom Location, and Placement Instructions are grouped with the color table.
+PASS - Garment-color table retains the full vendor code, alias, thread/ink, and remove columns.
+PASS - The v4.8.21 Product Master save repair remains present.
+
+PASS - Product Master Save continues when its optional session backup cannot be created.
+PASS - Unexpected Product Master save errors produce a visible dialog and diagnostic log.
+PASS - Setup Required = No survives Product Master cleaning and deduplication.
+PASS - Save & Next reports remaining setup requirements instead of silently reselecting the same product.
+PASS - NKFQ4794-style records retain vendor, decoration type, decoration color, and reviewed setup state after cleaning.
 
 PASS - All Python source modules compile successfully.
-PASS - Application, Product Master, VERSION files, builder, launcher, bootstrap, and Mac bundle report 4.8.20.
+PASS - Application, Product Master, VERSION files, builder, launcher, bootstrap, and Mac bundle report 4.8.25.
 PASS - Dashboard is constructed at startup; secondary pages are constructed once on first use.
 PASS - Repeated mission snapshots use one disk load until the workbook or PO override state changes.
 PASS - Snapshot cache invalidates when the workbook file signature changes.

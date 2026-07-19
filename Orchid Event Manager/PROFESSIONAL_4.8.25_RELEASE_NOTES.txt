@@ -1,0 +1,12 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.8.25
+
+FLAME RESISTANT PRODUCT CATEGORY
+
+- Adds Flame Resistant to the permanent Product Master category list.
+- Recognizes FR, FR-rated, flame-resistant, fire-resistant, flame-retardant,
+  and fire-retardant wording before broader shirt or outerwear categories.
+- Selecting Flame Resistant immediately defaults Decoration Type to
+  Blank Garment (No Decoration), turns Decoration Required off, and turns
+  Never Outsource on.
+- Preserves an explicitly saved manual Never Outsource exception.
+- Includes all prior navigation, performance, layout, and save repairs.
