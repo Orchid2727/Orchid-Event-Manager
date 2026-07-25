@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 import re
+import weakref
 
 import pandas as pd
 
@@ -14,7 +15,8 @@ from modules.blank_garment_rules import (
 )
 from modules.decoration_locations import normalize_decoration_location
 from modules.outsource_rules import (
-    NEVER_OUTSOURCE_COLUMN, apply_never_outsource_defaults, resolve_never_outsource,
+    NEVER_OUTSOURCE_COLUMN, apply_never_outsource_defaults, apply_never_outsource_overrides,
+    never_outsource_override_path, resolve_never_outsource, vendor_never_outsource,
 )
 from modules.purchase_rules import (
     RULE_COLUMNS,
@@ -24,8 +26,10 @@ from modules.purchase_rules import (
 )
 
 
-_MASTER_CACHE_KEY: tuple[str, int, int] | None = None
+_MASTER_CACHE_KEY: tuple[str, int, int, int, int] | None = None
 _MASTER_CACHE_FRAME: pd.DataFrame | None = None
+_LOOKUP_VERSION = 1
+_MASTER_LOOKUPS: dict[int, tuple[weakref.ReferenceType, dict]] = {}
 
 BASE_COLUMNS = [
     "Product Name",
@@ -97,24 +101,84 @@ def ensure_master_columns(frame: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def _prepare_master_lookup(frame: pd.DataFrame) -> pd.DataFrame:
+    """Build a read-only lookup index without adding columns or large attrs.
+
+    A weak-reference cache keeps the index tied to the exact in-memory DataFrame.
+    Temporary candidate DataFrames therefore stay small and fast to copy.
+    """
+    frame_id = id(frame)
+    cached = _MASTER_LOOKUPS.get(frame_id)
+    if cached is not None and cached[0]() is frame:
+        return frame
+
+    style_index: dict[str, list[object]] = {}
+    exact_product_index: dict[str, list[object]] = {}
+    product_terms_by_index: dict[object, tuple[str, ...]] = {}
+    for index, row in frame.iterrows():
+        style = normalize_style(row.get("Style Number", ""))
+        if style:
+            style_index.setdefault(style, []).append(index)
+        terms = tuple(dict.fromkeys(
+            normalized for normalized in (normalize_phrase(term) for term in _product_terms(row))
+            if normalized
+        ))
+        product_terms_by_index[index] = terms
+        for term in terms:
+            exact_product_index.setdefault(term, []).append(index)
+
+    lookup = {
+        "version": _LOOKUP_VERSION,
+        "style": style_index,
+        "exact_product": exact_product_index,
+        "product_terms": product_terms_by_index,
+    }
+
+    def _discard(_reference, key=frame_id):
+        _MASTER_LOOKUPS.pop(key, None)
+
+    _MASTER_LOOKUPS[frame_id] = (weakref.ref(frame, _discard), lookup)
+    return frame
+
+
+def _master_lookup(frame: pd.DataFrame) -> dict:
+    _prepare_master_lookup(frame)
+    cached = _MASTER_LOOKUPS.get(id(frame))
+    return cached[1] if cached is not None and cached[0]() is frame else {}
+
+
 def load_extended_master(path: Path) -> pd.DataFrame:
     global _MASTER_CACHE_KEY, _MASTER_CACHE_FRAME
     path = Path(path)
+    override_path = never_outsource_override_path(path)
     if path.exists():
         stat = path.stat()
-        cache_key = (str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size))
+        if override_path.exists():
+            override_stat = override_path.stat()
+            override_mtime = int(override_stat.st_mtime_ns)
+            override_size = int(override_stat.st_size)
+        else:
+            override_mtime = 0
+            override_size = 0
+        cache_key = (str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size), override_mtime, override_size)
     else:
-        cache_key = (str(path.resolve()), 0, 0)
+        cache_key = (str(path.resolve()), 0, 0, 0, 0)
     if cache_key == _MASTER_CACHE_KEY and _MASTER_CACHE_FRAME is not None:
-        return _MASTER_CACHE_FRAME.copy(deep=True)
+        returned = _MASTER_CACHE_FRAME.copy(deep=True)
+        _prepare_master_lookup(returned)
+        return returned
     try:
         frame = pd.read_csv(path, dtype=str).fillna("")
     except Exception:
         frame = pd.DataFrame(columns=MASTER_COLUMNS)
     result = ensure_master_columns(apply_purchase_rule_defaults(apply_blank_garment_defaults(frame)))
+    result = apply_never_outsource_overrides(result, path)
+    _prepare_master_lookup(result)
     _MASTER_CACHE_KEY = cache_key
     _MASTER_CACHE_FRAME = result.copy(deep=True)
-    return result
+    returned = result.copy(deep=True)
+    _prepare_master_lookup(returned)
+    return returned
 
 
 def _color_terms(row: pd.Series) -> list[str]:
@@ -199,6 +263,7 @@ class ResolveResult:
     product_id: str
     style: str
     product_name: str
+    product_aliases: str
     garment_color: str
     vendor: str
     decoration_type: str
@@ -220,6 +285,7 @@ class ResolveResult:
             "Master Product ID": self.product_id,
             "Master Style Number": self.style,
             "Master Product Name": self.product_name,
+            "Product Aliases": self.product_aliases,
             "Master Garment Color": self.master_color,
             "Master Vendor Color Code": self.vendor_color_code,
             "Product Category": self.product_category,
@@ -251,23 +317,29 @@ def resolve_product(
 
     candidates = pd.DataFrame(columns=frame.columns)
     base_match_type = ""
+    lookup = _master_lookup(frame)
     if style_key:
-        candidates = frame[frame["Style Number"].map(normalize_style).eq(style_key)].copy()
-        if not candidates.empty:
+        indexes = lookup.get("style", {}).get(style_key, [])
+        if indexes:
+            candidates = frame.loc[indexes].copy()
             base_match_type = "Style"
 
     if candidates.empty and product_key:
-        mask = frame.apply(lambda row: _exact_term_match(parsed_product, _product_terms(row)), axis=1)
-        candidates = frame[mask].copy()
-        if not candidates.empty:
+        indexes = lookup.get("exact_product", {}).get(product_key, [])
+        if indexes:
+            candidates = frame.loc[indexes].copy()
             base_match_type = "Product alias"
 
     if candidates.empty and product_key:
-        mask = frame.apply(lambda row: _contains_term_match(parsed_product, _product_terms(row)), axis=1)
-        candidates = frame[mask].copy()
-        if len(candidates) == 1:
+        padded = f" {product_key} "
+        indexes = [
+            index for index, terms in lookup.get("product_terms", {}).items()
+            if any(f" {term} " in padded for term in terms)
+        ]
+        if len(indexes) == 1:
+            candidates = frame.loc[indexes].copy()
             base_match_type = "Contained product alias"
-        elif len(candidates) > 1:
+        elif len(indexes) > 1:
             candidates = pd.DataFrame(columns=frame.columns)
 
     if candidates.empty:
@@ -277,7 +349,7 @@ def resolve_product(
             "Decoration Type": "",
         })
         return ResolveResult(
-            False, "No", "", style_key, clean(parsed_product), parsed_color_text,
+            False, "No", "", style_key, clean(parsed_product), "", parsed_color_text,
             "", "", "", "", "", "", "",
             inferred["Product Category"],
             normalize_bool(inferred["Requires Size"], True),
@@ -289,7 +361,9 @@ def resolve_product(
 
     color_row, color_match_type = _best_color_row(candidates, parsed_color_text)
     routing_source = color_row if color_row is not None else candidates.iloc[0]
-    setup_required = any(clean(value).casefold() in {"yes", "y", "true", "1"} for value in candidates.get("Setup Required", pd.Series(dtype=str)))
+    # Setup Required is color-row specific. A blank or unfinished unrelated color
+    # must not block a complete color that is actually present on the order.
+    setup_required = clean(routing_source.get("Setup Required", "")).casefold() in {"yes", "y", "true", "1"}
     rules = row_rules(routing_source)
     product_category = rules["Product Category"]
     requires_size = normalize_bool(rules["Requires Size"], True)
@@ -311,6 +385,7 @@ def resolve_product(
         deco_color = ""
 
     product_name = clean(routing_source.get("Product Name", "")) or clean(parsed_product)
+    product_aliases = clean(routing_source.get("Product Aliases", "")) or _consistent_value(candidates, "Product Aliases")
     master_style = clean(routing_source.get("Style Number", "")) or style_key
     product_id = clean(routing_source.get("Product ID", "")) or default_product_id(master_style, product_name)
     master_color = clean(routing_source.get("Garment Color", ""))
@@ -343,6 +418,7 @@ def resolve_product(
         product_id,
         master_style,
         product_name,
+        product_aliases,
         resolved_color,
         vendor,
         deco_type,
@@ -355,8 +431,11 @@ def resolve_product(
         requires_size,
         requires_color,
         requires_decoration,
-        resolve_never_outsource(
-            routing_source.get(NEVER_OUTSOURCE_COLUMN, ""), product_name, product_category, master_style
+        (
+            resolve_never_outsource(
+                routing_source.get(NEVER_OUTSOURCE_COLUMN, ""), product_name, product_category, master_style
+            )
+            or vendor_never_outsource(vendor)
         ),
         issue,
     )

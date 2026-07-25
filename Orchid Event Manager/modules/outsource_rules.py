@@ -8,8 +8,21 @@ import pandas as pd
 NEVER_OUTSOURCE_COLUMN = "Never Outsource"
 YES = "Yes"
 NO = "No"
+# Increment when a routing policy change requires existing Purchase Reviews to
+# be rebuilt before reports are generated.
+ROUTING_POLICY_VERSION = "3"
 
-NEVER_OUTSOURCE_VENDORS = {"vf"}
+# These vendors ship to Orchid for in-house handling rather than directly to an
+# outside decorator.  Include both the catalog name and its common short form
+# so imported data and Product Master selections receive the same default.
+NEVER_OUTSOURCE_VENDORS = {
+    "vf",
+    "big top tees",
+    "bigtop tees",
+    "edwards",
+    "berne",
+    "berne apparel",
+}
 
 
 def clean(value: Any) -> str:
@@ -89,7 +102,52 @@ def apply_never_outsource_defaults(frame: pd.DataFrame) -> pd.DataFrame:
         if current:
             result.at[index, NEVER_OUTSOURCE_COLUMN] = YES if normalize_bool(current) else NO
         else:
-            result.at[index, NEVER_OUTSOURCE_COLUMN] = YES if default_never_outsource(
-                row.get("Product Name", ""), row.get("Product Category", ""), row.get("Style Number", "")
+            result.at[index, NEVER_OUTSOURCE_COLUMN] = YES if (
+                vendor_never_outsource(row.get("Vendor", ""))
+                or default_never_outsource(
+                    row.get("Product Name", ""), row.get("Product Category", ""), row.get("Style Number", "")
+                )
             ) else NO
+    return result
+
+
+def never_outsource_override_path(product_master_path):
+    """Return the Product Master sidecar used by the editor for explicit overrides."""
+    from pathlib import Path
+    return Path(product_master_path).parent / "never_outsource_overrides.json"
+
+
+def load_never_outsource_overrides(product_master_path) -> dict[str, bool]:
+    import json
+    path = never_outsource_override_path(product_master_path)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {str(key).strip(): bool(value) for key, value in payload.items() if str(key).strip()}
+
+
+def apply_never_outsource_overrides(frame: pd.DataFrame, product_master_path) -> pd.DataFrame:
+    """Apply explicit editor sidecar values to the routing frame.
+
+    The sidecar exists so a deliberate Never Outsource selection survives color
+    row edits. It is part of the live routing source and must be honored by the
+    parser, not only displayed by the Product Master editor.
+    """
+    result = frame.copy()
+    overrides = load_never_outsource_overrides(product_master_path)
+    if not overrides or result.empty:
+        return result
+    if NEVER_OUTSOURCE_COLUMN not in result.columns:
+        result[NEVER_OUTSOURCE_COLUMN] = ""
+    for index, row in result.iterrows():
+        style = re.sub(r"\s+", "", clean(row.get("Style Number", ""))).upper()
+        product = re.sub(r"\s+", " ", clean(row.get("Product Name", "")).casefold()).strip()
+        key = f"style:{style}" if style else f"product:{product}"
+        if key in overrides:
+            result.at[index, NEVER_OUTSOURCE_COLUMN] = YES if overrides[key] else NO
     return result

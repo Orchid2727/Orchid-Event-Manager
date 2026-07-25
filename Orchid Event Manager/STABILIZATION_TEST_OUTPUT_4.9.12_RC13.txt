@@ -1,0 +1,30 @@
+ORCHID PURCHASE MANAGER 4.9.12 RC13 TEST OUTPUT
+
+PASS - Source app.py compiled.
+PASS - All Source modules compiled.
+PASS - Bundled app.py and bundled modules compiled.
+PASS - Source and bundled app.py are identical.
+PASS - Source and bundled Product Master editor are identical.
+PASS - PO-number handoff is scheduled after the reconciliation modal closes.
+PASS - Step 5 label distinguishes preparation from generation: Prepare & Assign PO Numbers.
+PASS - PO-number editor is explicitly raised and focused.
+PASS - Synthetic final-release verification accepted a valid output folder, PDF, and release manifest.
+PASS - Synthetic success flow persisted the report folder, cleared the dashboard cache, refreshed Purchase Orders, and displayed verified success.
+PASS - Protected core module hashes are unchanged from 4.9.11 RC12.
+
+Protected core SHA256:
+ebe95716561e9c1f5f417391fd4f1e85e7acac74dcebe2b43782e4279fcc8855  packet_lock.py
+80b5ac93349e7c58de11f706bbd802de685c8326d39d92bd609c67b12c15200b  source_identity.py
+f6ec6e77b882a0620d0408c75195f0814e4c490307f06039fd285210ed68ab8e  final_po_generator.py
+dc613de568f371b7b8a24952f6f262864183f88d0d85d0cc243cb0a221d02b41  purchase_order_generator.py
+709963c00c7caa8883ce4e2fdec9fa8b2b382880f4cea413290926c097a4f427  product_resolver.py
+07235c32993f9a1bcacba4e3129ecb2549a18dd79bc68b4c180f2f3cbd0e364a  outsource_rules.py
+b3c62c2423e75e1267462fdc255f0414a54059cb2e4a7bd861613b9debdd6ead  review_workbook.py
+20b000d362358d25c1520c5585ee2b7a75b67cd7d9aa50d95d9d5f567eeb312a  mission_control.py
+86518956dbd245cf99e505bed05111b239af4a933b915407a9098fb3ec8c2859  decoration_color_audit.py
+
+Runtime simulation:
+RC13_HANDOFF_AND_RELEASE_VERIFICATION_PASS
+
+LIMITATION
+Native macOS launch, modal z-order, and Finder opening were not available in this Linux environment. Confirm the PO-number assignment window appears in front on the user's Mac.

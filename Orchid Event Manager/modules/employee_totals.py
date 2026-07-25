@@ -34,6 +34,50 @@ def money(value: object) -> float:
         return 0.0
 
 
+def _order_key(value: object) -> str:
+    """Normalize Shopify order labels before comparing workbook records."""
+    return clean(value).lstrip("#").casefold()
+
+
+def _order_keys(value: object) -> set[str]:
+    """Read one or more comma-separated Shopify order labels."""
+    return {
+        key
+        for part in clean(value).split(",")
+        if (key := _order_key(part))
+    }
+
+
+def _included_merchandise_order_keys(workbook_path: Path) -> set[str] | None:
+    """Return final event orders that still contain included merchandise.
+
+    Employee Totals is an event billing report.  An order may be present in the
+    original Shopify export yet have no included merchandise after the Purchase
+    Review is finalized (for example, an excluded or service-only order).  Such
+    an order must not create an employee row or affect the event total.
+
+    ``None`` means the workbook could not be read using the normal review-line
+    loader, so callers retain the existing rows rather than risk hiding data
+    from an older or damaged workbook.
+    """
+    try:
+        from modules.xlsx_reader import load_review_lines
+
+        order_keys: set[str] = set()
+        for record in load_review_lines(Path(workbook_path)):
+            include = clean(record.get("Include", "Yes")).casefold()
+            if include not in {"yes", "y", "true", "1", "include"}:
+                continue
+            if money(record.get("Quantity", 0)) <= 0:
+                continue
+            order_key = _order_key(record.get("Order Number", ""))
+            if order_key:
+                order_keys.add(order_key)
+        return order_keys
+    except Exception:
+        return None
+
+
 def _find_header_row(sheet) -> tuple[int, dict[str, int]]:
     wanted = {header.casefold(): header for header in HEADERS}
     for row in range(1, min(sheet.max_row, 40) + 1):
@@ -51,6 +95,7 @@ def load_employee_totals(workbook_path: Path) -> list[dict[str, Any]]:
     path = Path(workbook_path)
     if not path.exists():
         return []
+    included_order_keys = _included_merchandise_order_keys(path)
     workbook = load_workbook(path, data_only=False, read_only=True)
     try:
         if SHEET_NAME not in workbook.sheetnames:
@@ -66,6 +111,14 @@ def load_employee_totals(workbook_path: Path) -> list[dict[str, Any]]:
             if label.casefold() == "grand total":
                 break
             if not any((employee, company, order_numbers)):
+                continue
+            # Do not carry an employee forward merely because their Shopify
+            # order was in the original CSV.  The order must have at least one
+            # included merchandise line in the final Purchase Review packet.
+            if (
+                included_order_keys is not None
+                and not (_order_keys(order_numbers) & included_order_keys)
+            ):
                 continue
             order_total = money(sheet.cell(row=row, column=columns["Order Total"]).value)
             discount = money(sheet.cell(row=row, column=columns["Discount"]).value)

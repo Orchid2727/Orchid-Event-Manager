@@ -11,14 +11,18 @@ import xlsxwriter
 from modules.blank_garment_rules import BLANK_DECORATION_LABEL, is_blank_decoration
 from modules.decoration_locations import (
     DECORATION_LOCATIONS,
+    LEFT_CHEST,
     normalize_decoration_location,
 )
 from modules.note_rules import (
+    alteration_note_only,
+    always_embroidery_rain_style,
     blanket_decoration_note_requires_review,
     combine_purchase_instructions,
     decision_note_requires_review,
     decision_note_targets_line,
     decision_target_styles,
+    decoration_note_changes_process,
     decoration_note_requires_review,
     decoration_note_targets_line,
     decoration_note_is_global,
@@ -28,6 +32,9 @@ from modules.note_rules import (
     note_requires_review,
     note_requires_review_for_line,
     screen_print_note_requires_review,
+    waterproof_apparel_requires_review,
+    waterproof_style_number,
+    waterproof_style_requires_review,
 )
 
 from modules.purchase_order_generator import (
@@ -45,14 +52,20 @@ from modules.product_resolver import load_extended_master, resolve_product
 from modules.purchase_rules import normalize_bool, row_rules
 from modules.internal_services import (
     HEMMING_ALTERATION_LABEL, SEW_ON_PATCH_LABEL,
-    is_in_house_decoration, is_in_house_service_product,
+    decoration_charge_label, is_in_house_decoration, is_in_house_service_product, is_internal_service_style,
 )
 from modules.report_modes import GENERAL_SALES_PERIOD, UNIFORM_SIZING_EVENT, normalize_report_mode
 from modules.decoration_fulfillment import (
     STANDARD_ORCHID_WORKFLOW, is_entire_order_outsourced, normalize_decoration_fulfillment,
 )
 from modules.master_sync import product_master_signature
-from modules.outsource_rules import vendor_never_outsource
+from modules.packet_lock import assert_live_product_master, create_packet_lock
+from modules.source_identity import manual_entry_correction_signature, strict_legacy_signature
+from modules.outsource_rules import (
+    ROUTING_POLICY_VERSION,
+    resolve_never_outsource,
+    vendor_never_outsource,
+)
 from modules.decoration_inference import (
     count_unique_decisions,
     infer_order_decorations,
@@ -212,6 +225,7 @@ ALL_COLUMNS = [
     "Review Status",
     "Review Reason",
     "Product Category",
+    "Product Aliases",
     "Requires Size",
     "Requires Color",
     "Requires Decoration",
@@ -225,6 +239,15 @@ ALL_COLUMNS = [
     "Shopify Line Notes",
     "Decoration Decision",
     "Mandatory Note Review",
+    "Source ID",
+    "Source Occurrence",
+    "Original Quantity",
+    "Original Order Number",
+    "Original Company",
+    "Original Employee Name",
+    "Original Order Date",
+    "Original Shopify SKU",
+    "Quantity Override Confirmed",
 ]
 
 
@@ -233,6 +256,7 @@ def _line_note_context(row: pd.Series) -> str:
         clean_text(row.get("Product Name", row.get("Description", ""))),
         clean_text(row.get("Original Line Item", row.get("Original Shopify Line", ""))),
         clean_text(row.get("Product Category", "")),
+        clean_text(row.get("Product Aliases", "")),
         clean_text(row.get("Style Number", row.get("Product #", ""))),
     ]))
 
@@ -247,6 +271,52 @@ def decoration_note_prompts_enabled(
         or is_entire_order_outsourced(decoration_fulfillment)
     )
 
+
+def waterproof_decoration_prompts_enabled(
+    report_mode: str = GENERAL_SALES_PERIOD,
+    decoration_fulfillment: str = STANDARD_ORCHID_WORKFLOW,
+) -> bool:
+    """Prompt whenever Product Master identifies waterproof or rainwear apparel.
+
+    Waterproof is a permanent product characteristic, not merely an order-note
+    condition. A saved Product Alias such as ``Waterproof`` or ``Rain Jacket``
+    therefore requires an explicit order-level decoration decision in every
+    workflow. Permanent always-embroidery exceptions remain excluded later.
+    """
+    return True
+
+
+
+def _row_permanently_stays_at_orchid(row: pd.Series) -> bool:
+    return resolve_never_outsource(
+        row.get("Never Outsource", ""),
+        row.get("Product Name", row.get("Description", "")),
+        row.get("Product Category", ""),
+        row.get("Style Number", row.get("Product #", "")),
+    )
+
+
+def _note_prompt_applicable_to_row(row: pd.Series, note: object, allow_decoration_prompts: bool) -> bool:
+    """Return whether a note creates a decision for this exact purchase line."""
+    if alteration_note_only(note):
+        return False
+    if decision_note_requires_review(note):
+        # A do-not-outsource instruction is already satisfied by a permanent
+        # in-house route and does not need the user to acknowledge it again.
+        lowered = clean_text(note).casefold()
+        if _row_permanently_stays_at_orchid(row) and any(term in lowered for term in (
+            "do not outsource", "don't outsource", "ship to orchid", "send to orchid",
+        )):
+            return False
+        return True
+    if not allow_decoration_prompts or not decoration_note_requires_review(note):
+        return False
+    # Operational logo/thread/personalization notes on products already routed
+    # to Orchid belong on the decoration report, not in Purchase Review. A real
+    # process change (screen print, no decoration, etc.) still requires review.
+    if _row_permanently_stays_at_orchid(row) and not decoration_note_changes_process(note):
+        return False
+    return True
 
 def _mandatory_note_review_flags(
     frame: pd.DataFrame,
@@ -272,9 +342,8 @@ def _mandatory_note_review_flags(
                 blanket_decoration_note_requires_review(line_note)
                 or screen_print_note_requires_review(line_note)
             )
-            if decision_note_requires_review(line_note) or standard_workflow_override or (
-                allow_decoration_prompts and decoration_note_requires_review(line_note)
-            ):
+            line_prompts_enabled = allow_decoration_prompts or standard_workflow_override
+            if _note_prompt_applicable_to_row(row, line_note, line_prompts_enabled):
                 flags.at[index] = True
 
         if decision_note_requires_review(order_note):
@@ -284,14 +353,14 @@ def _mandatory_note_review_flags(
                 matches = [
                     index for index, row in group.iterrows()
                     if decision_note_targets_line(order_note, _line_note_context(row))
+                    and _note_prompt_applicable_to_row(row, order_note, True)
                 ]
-                # If a referenced style is absent, show one consolidated decision
-                # rather than attaching the note to every unrelated order line.
-                if not matches:
-                    matches = indices[:1]
-                flags.loc[matches] = True
+                if matches:
+                    flags.loc[matches] = True
             else:
-                flags.loc[indices] = True
+                matches = [index for index, row in group.iterrows() if _note_prompt_applicable_to_row(row, order_note, True)]
+                if matches:
+                    flags.loc[matches] = True
             continue
 
         standard_workflow_override = (
@@ -311,16 +380,18 @@ def _mandatory_note_review_flags(
             matches = [
                 index for index, row in group.iterrows()
                 if decoration_note_targets_line(order_note, _line_note_context(row))
+                and _note_prompt_applicable_to_row(row, order_note, True)
             ]
         else:
-            # An unclear order-level note becomes one review decision instead of
-            # being duplicated on every product. The user can still see the full
-            # order note and correct the affected line without reviewing unrelated
-            # items repeatedly.
-            matches = indices[:1]
-        if not matches:
-            matches = indices[:1]
-        flags.loc[matches] = True
+            # One consolidated prompt is enough for an ambiguous note, but choose
+            # an outsource-eligible line. If every line already stays at Orchid,
+            # preserve the note on reports without creating an empty decision.
+            matches = [
+                index for index, row in group.iterrows()
+                if _note_prompt_applicable_to_row(row, order_note, True)
+            ][:1]
+        if matches:
+            flags.loc[matches] = True
     return flags
 
 
@@ -396,6 +467,8 @@ def _build_review_data(
         "Shopify Order Notes", "Shopify Line Notes", "Original Line Item", "Product Name",
         "Style Number", "Garment Color", "Size", "Needs Review",
         "Parser Source", "Parse Confidence", "Detected Vendor",
+        "Source ID", "Source Occurrence", "Original Quantity", "Original Order Number",
+        "Original Company", "Original Employee Name", "Original Order Date", "Original Shopify SKU",
     ]:
         if column not in parsed.columns:
             parsed[column] = ""
@@ -404,6 +477,27 @@ def _build_review_data(
     if "Quantity" not in parsed.columns:
         parsed["Quantity"] = 0
     parsed["Quantity"] = pd.to_numeric(parsed["Quantity"], errors="coerce").fillna(0).astype(int)
+    if "Original Quantity" not in parsed.columns:
+        parsed["Original Quantity"] = parsed["Quantity"]
+    parsed["Original Quantity"] = pd.to_numeric(parsed["Original Quantity"], errors="coerce").fillna(parsed["Quantity"]).astype(int)
+    if "Source Occurrence" not in parsed.columns:
+        parsed["Source Occurrence"] = 1
+    parsed["Source Occurrence"] = pd.to_numeric(parsed["Source Occurrence"], errors="coerce").fillna(1).astype(int)
+
+    # Defense in depth: service/charge rows must stay out of Purchase Review even
+    # when parsed_orders was supplied by a cached or older parser. Product 750 is
+    # Orchid's embroidery-charge code and is retained only in the raw/excluded data.
+    if not parsed.empty:
+        service_mask = parsed.apply(
+            lambda row: is_decoration_service(
+                row.get("Original Line Item", ""),
+                row.get("Style Number", ""),
+                row.get("Product Name", ""),
+                row.get("Garment Color", ""),
+            ),
+            axis=1,
+        )
+        parsed = parsed.loc[~service_mask].copy()
 
     resolved_records = []
     resolution_cache = {}
@@ -453,7 +547,7 @@ def _build_review_data(
         "Vendor", "Decoration Type", "Decoration Location", "Decoration Placement Instructions", "Decoration Color", "Product Name",
         "Style Number", "Garment Color", "Size", "Master Match",
         "Parser Source", "Parse Confidence", "Detected Vendor", "Resolver Issue",
-        "Product Category", "Requires Size", "Requires Color", "Requires Decoration", "Never Outsource",
+        "Product Category", "Product Aliases", "Requires Size", "Requires Color", "Requires Decoration", "Never Outsource",
         "Decoration Source",
     ]:
         if column not in merged.columns:
@@ -469,14 +563,67 @@ def _build_review_data(
         )
         corrected.columns = ["Garment Color", "Size"]
         merged[["Garment Color", "Size"]] = corrected
+        # Manual entries sometimes use the color field only as a vendor/size note,
+        # for example "Portwest Size 38". After extracting 38, do not retain the
+        # vendor name as a false garment color.
+        vendor_only = merged.apply(
+            lambda row: bool(
+                clean_text(row.get("Garment Color", ""))
+                and clean_text(row.get("Garment Color", "")).casefold()
+                in {
+                    clean_text(row.get("Vendor", "")).casefold(),
+                    clean_text(row.get("Detected Vendor", "")).casefold(),
+                }
+            ),
+            axis=1,
+        )
+        merged.loc[vendor_only, "Garment Color"] = ""
 
     # Decoration service lines are excluded from purchasing, but their quantities
     # are valuable routing data. Use them to classify product lines before asking
     # the user to make repetitive style-by-style decisions.
     merged = infer_order_decorations(merged, service_totals_from_raw(raw))
+
+    # These frequently ordered Carhartt Rain Defender styles are known, safe
+    # embroidery routes. Preserve any saved Product Master placement and fill a
+    # missing legacy placement with Left Chest. An explicit contradictory order
+    # note (for example, "Do not embroider CT100615") is still reviewed below.
+    always_embroidery_mask = merged["Style Number"].map(always_embroidery_rain_style)
+    if always_embroidery_mask.any():
+        merged.loc[always_embroidery_mask, "Decoration Type"] = "Embroidery"
+        missing_location = always_embroidery_mask & merged["Decoration Location"].map(lambda value: not clean_text(value))
+        merged.loc[missing_location, "Decoration Location"] = LEFT_CHEST
+        merged.loc[always_embroidery_mask, "Requires Decoration"] = "Yes"
+
     allow_decoration_prompts = decoration_note_prompts_enabled(report_mode, decoration_fulfillment)
     merged["_Mandatory Note Review"] = _mandatory_note_review_flags(
         merged, allow_decoration_prompts=allow_decoration_prompts
+    )
+    outsourced_sizing_event = waterproof_decoration_prompts_enabled(
+        report_mode, decoration_fulfillment
+    )
+    forced_waterproof_style_mask = merged["Style Number"].map(waterproof_style_requires_review)
+    if outsourced_sizing_event:
+        waterproof_context = merged.apply(
+            lambda row: " ".join(filter(None, [
+                clean_text(row.get("Product Name", "")),
+                clean_text(row.get("Original Line Item", "")),
+                clean_text(row.get("Product Category", "")),
+                clean_text(row.get("Product Aliases", "")),
+                clean_text(row.get("Style Number", "")),
+            ])),
+            axis=1,
+        )
+        merged["_Waterproof Decoration Review"] = (
+            forced_waterproof_style_mask
+            | (waterproof_context.map(waterproof_apparel_requires_review) & ~always_embroidery_mask)
+        )
+    else:
+        # These exact waterproof styles are always reviewed, even in Standard
+        # Orchid Workflow and general sales reports.
+        merged["_Waterproof Decoration Review"] = forced_waterproof_style_mask
+    merged["_Mandatory Note Review"] = (
+        merged["_Mandatory Note Review"] | merged["_Waterproof Decoration Review"]
     )
 
     rows = []
@@ -489,6 +636,9 @@ def _build_review_data(
         vendor = clean_text(row.get("Vendor", ""))
         deco_type = clean_text(row.get("Decoration Type", ""))
         deco_location_raw = clean_text(row.get("Decoration Location", ""))
+        if always_embroidery_rain_style(style):
+            deco_type = "Embroidery"
+            deco_location_raw = deco_location_raw or LEFT_CHEST
         placement_instructions = clean_text(row.get("Decoration Placement Instructions", ""))
         deco_color = clean_text(row.get("Decoration Color", ""))
         qty = int(row.get("Quantity", 0))
@@ -562,6 +712,18 @@ def _build_review_data(
         raw_note = clean_text(row.get("Shopify Order Notes", ""))
         line_note = clean_text(row.get("Shopify Line Notes", ""))
         purchase_instructions = combine_purchase_instructions(raw_note, line_note)
+        waterproof_decoration_review = bool(row.get("_Waterproof Decoration Review", False))
+        if waterproof_decoration_review:
+            forced_waterproof_style = waterproof_style_number(style)
+            waterproof_prompt = (
+                f"Waterproof style {forced_waterproof_style}: Confirm the decoration method before purchasing."
+                if forced_waterproof_style
+                else "Waterproof/rainwear item: Decoration Optional."
+            )
+            purchase_instructions = (
+                f"{purchase_instructions} | {waterproof_prompt}"
+                if purchase_instructions else waterproof_prompt
+            )
         note_action = note_action_label(purchase_instructions)
         mandatory_note_review = bool(row.get("_Mandatory Note Review", False))
         if mandatory_note_review:
@@ -573,9 +735,11 @@ def _build_review_data(
             "Line ID": f"L{len(rows)+1:05d}",
             "Include": "Yes",
             "Do Not Outsource": (
-                "Yes" if is_entire_order_outsourced(decoration_fulfillment)
-                and (
-                    normalize_bool(row.get("Never Outsource", ""), False)
+                "Yes" if (
+                    resolve_never_outsource(
+                        row.get("Never Outsource", ""), description,
+                        purchase_rules["Product Category"], style,
+                    )
                     or vendor_never_outsource(vendor)
                 ) else "No"
             ),
@@ -598,6 +762,7 @@ def _build_review_data(
             "Review Status": status,
             "Review Reason": reason,
             "Product Category": purchase_rules["Product Category"],
+            "Product Aliases": clean_text(row.get("Product Aliases", "")),
             "Requires Size": purchase_rules["Requires Size"],
             "Requires Color": purchase_rules["Requires Color"],
             "Requires Decoration": purchase_rules["Requires Decoration"],
@@ -611,6 +776,15 @@ def _build_review_data(
             "Shopify Line Notes": line_note,
             "Decoration Decision": "",
             "Mandatory Note Review": "Yes" if mandatory_note_review else "No",
+            "Source ID": clean_text(row.get("Source ID", "")),
+            "Source Occurrence": int(row.get("Source Occurrence", 1) or 1),
+            "Original Quantity": int(row.get("Original Quantity", qty) or qty),
+            "Original Order Number": clean_text(row.get("Original Order Number", row.get("Order Number", ""))),
+            "Original Company": clean_text(row.get("Original Company", row.get("Company", ""))),
+            "Original Employee Name": clean_text(row.get("Original Employee Name", row.get("Employee Name", ""))),
+            "Original Order Date": clean_text(row.get("Original Order Date", row.get("Order Date", ""))),
+            "Original Shopify SKU": clean_text(row.get("Original Shopify SKU", row.get("Shopify SKU", ""))),
+            "Quantity Override Confirmed": "No",
         })
 
     detail = pd.DataFrame(rows, columns=ALL_COLUMNS)
@@ -621,13 +795,18 @@ def _build_review_data(
     excluded_rows = []
     for _, row in raw.iterrows():
         item = clean_text(row.get("Lineitem name", ""))
-        if item and is_decoration_service(item):
+        variant_values = (
+            row.get("Variant Color", ""), row.get("Variant Size", ""),
+            row.get("Variant Option 1", ""), row.get("Variant Option 2", ""),
+            row.get("Variant Option 3", ""), row.get("Variant Title", ""),
+        )
+        if item and is_decoration_service(item, row.get("Lineitem sku", ""), *variant_values):
             qty = pd.to_numeric(row.get("Lineitem quantity", 0), errors="coerce")
             excluded_rows.append({
                 "Order Number": clean_text(row.get("Name", "")),
                 "Company": clean_text(row.get("Billing Company", "")),
                 "Employee Name": clean_text(row.get("Billing Name", "")),
-                "Service / Fee": item,
+                "Service / Fee": decoration_charge_label(*variant_values, item),
                 "Quantity": 0 if pd.isna(qty) else int(qty),
                 "Shopify Order Notes": clean_text(row.get("Notes", "")),
             })
@@ -638,7 +817,11 @@ def _build_review_data(
     return detail, review, excluded, raw
 
 
-def _revalidate_detail(detail: pd.DataFrame, allow_decoration_prompts: bool = True) -> pd.DataFrame:
+def _revalidate_detail(
+    detail: pd.DataFrame,
+    allow_decoration_prompts: bool = True,
+    allow_waterproof_prompts: bool = False,
+) -> pd.DataFrame:
     """Recalculate blockers after carried-forward Review & Edit corrections.
 
     Product Master changes remain authoritative, while user-entered order-specific
@@ -651,6 +834,37 @@ def _revalidate_detail(detail: pd.DataFrame, allow_decoration_prompts: bool = Tr
     scoped_note_flags = _mandatory_note_review_flags(
         result, allow_decoration_prompts=allow_decoration_prompts
     )
+    # Known waterproof styles always require an explicit decoration decision,
+    # regardless of workflow mode. This is an event-level confirmation and does
+    # not change the permanent Product Master decoration default.
+    waterproof_style_mask = result.apply(
+        lambda row: waterproof_style_requires_review(
+            row.get("Product #", row.get("Style Number", ""))
+        ),
+        axis=1,
+    )
+    scoped_note_flags = scoped_note_flags | waterproof_style_mask
+    if allow_waterproof_prompts:
+        waterproof_context = result.apply(
+            lambda row: " ".join(filter(None, [
+                clean_text(row.get("Description", row.get("Product Name", ""))),
+                clean_text(row.get("Original Shopify Line", row.get("Original Line Item", ""))),
+                clean_text(row.get("Product Category", "")),
+                clean_text(row.get("Product Aliases", "")),
+                clean_text(row.get("Product #", row.get("Style Number", ""))),
+            ])),
+            axis=1,
+        )
+        permanent_embroidery_mask = result.apply(
+            lambda row: always_embroidery_rain_style(
+                row.get("Product #", row.get("Style Number", ""))
+            ),
+            axis=1,
+        )
+        scoped_note_flags = scoped_note_flags | (
+            waterproof_context.map(waterproof_apparel_requires_review)
+            & ~permanent_embroidery_mask
+        )
     for index, row in result.iterrows():
         style = clean_text(row.get("Product #", ""))
         description = clean_text(row.get("Description", ""))
@@ -659,6 +873,9 @@ def _revalidate_detail(detail: pd.DataFrame, allow_decoration_prompts: bool = Tr
         vendor = clean_text(row.get("Purchase Vendor", ""))
         deco_type = clean_text(row.get("Decoration Type", ""))
         deco_location_raw = clean_text(row.get("Decoration Location", ""))
+        if always_embroidery_rain_style(style):
+            deco_type = "Embroidery"
+            deco_location_raw = deco_location_raw or LEFT_CHEST
         placement_instructions = clean_text(row.get("Decoration Placement Instructions", ""))
         deco_color = clean_text(row.get("Decoration Color", ""))
         try:
@@ -720,6 +937,30 @@ def _revalidate_detail(detail: pd.DataFrame, allow_decoration_prompts: bool = Tr
         raw_note = clean_text(row.get("Shopify Order Notes", ""))
         line_note = clean_text(row.get("Shopify Line Notes", ""))
         purchase_instructions = clean_text(row.get("Purchase Instructions", "")) or combine_purchase_instructions(raw_note, line_note)
+        forced_waterproof_style = waterproof_style_number(style)
+        waterproof_decoration_review = bool(
+            forced_waterproof_style
+            or (
+                allow_waterproof_prompts
+                and not always_embroidery_rain_style(style)
+                and waterproof_apparel_requires_review(" ".join(filter(None, [
+                    description, clean_text(row.get("Original Shopify Line", "")),
+                    clean_text(row.get("Product Category", "")),
+                    clean_text(row.get("Product Aliases", "")), style,
+                ])))
+            )
+        )
+        if forced_waterproof_style:
+            waterproof_prompt = (
+                f"Waterproof style {forced_waterproof_style}: Confirm the decoration method before purchasing."
+            )
+        else:
+            waterproof_prompt = "Waterproof/rainwear item: Decoration Optional."
+        if waterproof_decoration_review and waterproof_prompt.casefold() not in purchase_instructions.casefold():
+            purchase_instructions = (
+                f"{purchase_instructions} | {waterproof_prompt}"
+                if purchase_instructions else waterproof_prompt
+            )
         mandatory_note_review = bool(scoped_note_flags.at[index])
         if mandatory_note_review:
             reasons.append("Customer decision required")
@@ -754,14 +995,15 @@ def _apply_previous_review_edits(
     detail: pd.DataFrame,
     previous_review_path: Path | None,
     allow_decoration_prompts: bool = True,
+    allow_waterproof_prompts: bool = False,
 ) -> pd.DataFrame:
-    """Carry visible Review & Edit corrections into a regenerated workbook.
+    """Carry prior review choices only onto the exact same Shopify source line.
 
-    Completed order-specific decisions must stay completed after Product Master
-    changes trigger a regeneration.  A prior Ready status is preserved only when
-    the carried values satisfy every hard purchasing requirement.  The one manual
-    exception is ``Customer decision required``: saving that row is the user's
-    explicit confirmation, so it remains Ready across regeneration.
+    Professional 4.8.96 and later persist an immutable Source ID on every garment line.
+    Generated Line IDs are never used as the primary replay key.  Older packets
+    without Source IDs receive a conservative compatibility path: the original
+    order/customer/date/line/notes signature must be unique in both workbooks,
+    and identity-sensitive fields such as quantity and customer are not copied.
     """
     if detail.empty or not previous_review_path:
         return detail
@@ -771,53 +1013,153 @@ def _apply_previous_review_edits(
     try:
         from modules.xlsx_reader import read_table
         edits = read_table(previous, "Review & Edit", {"Line ID"})
+        previous_source_rows = read_table(previous, "All PO Lines", {"Line ID"})
     except Exception:
         return detail
     if not edits:
         return detail
 
     result = detail.copy()
-    index_by_line = {
-        clean_text(value): index
-        for index, value in result["Line ID"].items()
-        if clean_text(value)
+    previous_source_by_line = {
+        clean_text(row.get("Line ID", "")): row
+        for row in previous_source_rows
+        if clean_text(row.get("Line ID", ""))
     }
+
+    new_by_source_id: dict[str, list[object]] = {}
+    new_by_legacy_signature: dict[str, list[object]] = {}
+    new_by_manual_correction_signature: dict[str, list[object]] = {}
+    for index, row in result.iterrows():
+        source_id = clean_text(row.get("Source ID", ""))
+        if source_id:
+            new_by_source_id.setdefault(source_id, []).append(index)
+        legacy = strict_legacy_signature(row)
+        if legacy:
+            new_by_legacy_signature.setdefault(legacy, []).append(index)
+        correction = manual_entry_correction_signature(row)
+        if correction:
+            new_by_manual_correction_signature.setdefault(correction, []).append(index)
+
+    previous_legacy_counts: dict[str, int] = {}
+    previous_manual_correction_counts: dict[str, int] = {}
+    for row in previous_source_rows:
+        legacy = strict_legacy_signature(row)
+        if legacy:
+            previous_legacy_counts[legacy] = previous_legacy_counts.get(legacy, 0) + 1
+        correction = manual_entry_correction_signature(row)
+        if correction:
+            previous_manual_correction_counts[correction] = previous_manual_correction_counts.get(correction, 0) + 1
+
+    # Product Master routing is calculated before prior event edits are carried
+    # over. Keep that fresh result so an older hidden Do Not Outsource value
+    # cannot undo a newer Never Outsource setting.
+    current_do_not_outsource = result["Do Not Outsource"].copy()
     carry_fields = {
-        "Include", "Do Not Outsource", "Product #", "Description", "Garment Color", "Size", "Quantity",
+        "Include", "Product #", "Description", "Garment Color", "Size", "Quantity",
         "Company", "Employee Name", "Order Number", "Decoration Decision",
         "Decoration Location", "Decoration Placement Instructions",
+        "Quantity Override Confirmed",
     }
-    permanent_override_fields = {"Purchase Vendor", "Decoration Type", "Decoration Location", "Decoration Placement Instructions", "Decoration Color"}
-    previously_ready: set[str] = set()
+    permanent_override_fields = {
+        "Purchase Vendor", "Decoration Type", "Decoration Location",
+        "Decoration Placement Instructions", "Decoration Color",
+    }
+    identity_sensitive_fields = {
+        "Quantity", "Company", "Employee Name", "Order Number", "Quantity Override Confirmed",
+    }
+    # If the Shopify product title/style itself was corrected after a review,
+    # retain only order-specific choices. Product identity, catalog defaults,
+    # and routing must be rebuilt from the corrected source and live Master.
+    source_correction_fields = {
+        "Include", "Quantity", "Company", "Employee Name", "Order Number",
+        "Decoration Decision", "Decoration Location",
+        "Decoration Placement Instructions", "Quantity Override Confirmed",
+    }
+    # RC13 and earlier could parse ``3X TL`` as color ``TL`` and size ``3XL``.
+    # Do not replay those stale parser-owned color/size cells from an earlier
+    # Review & Edit sheet after the parser has recovered the explicit Tall size.
+    repaired_tall_indexes = {
+        index
+        for index, row in result.iterrows()
+        if re.search(r"\b[2-8]X(?:L)?\s+TL\b", clean_text(row.get("Original Shopify Line", "")), re.I)
+        and normalize_size(row.get("Size", "")).endswith("XLT")
+    }
+    previously_ready_indexes: set[object] = set()
+    explicit_do_not_outsource_indexes: set[object] = set()
+
     for edit in edits:
-        line_id = clean_text(edit.get("Line ID", ""))
-        index = index_by_line.get(line_id)
+        previous_line_id = clean_text(edit.get("Line ID", ""))
+        source_row = previous_source_by_line.get(previous_line_id, {})
+        old_source_id = clean_text(edit.get("Source ID", "")) or clean_text(source_row.get("Source ID", ""))
+        verified_source_id = False
+        corrected_source_match = False
+        index = None
+
+        if old_source_id:
+            candidates = new_by_source_id.get(old_source_id, [])
+            if len(candidates) == 1:
+                index = candidates[0]
+                verified_source_id = True
+        else:
+            legacy = strict_legacy_signature(source_row or edit)
+            candidates = new_by_legacy_signature.get(legacy, []) if legacy else []
+            # Never guess among duplicate legacy rows.  A packet without Source
+            # IDs can safely retain non-identity edits only when the match is
+            # unique on both sides.
+            if legacy and previous_legacy_counts.get(legacy, 0) == 1 and len(candidates) == 1:
+                index = candidates[0]
+
+        # A user can correct a manually entered Shopify style/title after a
+        # completed review. The new Source ID is rightly different, but a
+        # unique match on the remaining immutable order fields can retain the
+        # explicit order decision. Never copy old product identity through this
+        # path; the corrected source and Product Master remain authoritative.
+        if index is None:
+            correction = manual_entry_correction_signature(source_row or edit)
+            candidates = new_by_manual_correction_signature.get(correction, []) if correction else []
+            if (
+                correction
+                and previous_manual_correction_counts.get(correction, 0) == 1
+                and len(candidates) == 1
+            ):
+                index = candidates[0]
+                corrected_source_match = True
+
         if index is None:
             continue
+
         was_ready = clean_text(edit.get("Review Status", "")).casefold() == "ready"
         if was_ready:
-            old_source_signature = "|".join([
-                clean_text(edit.get("Original Shopify Line", "")),
-                clean_text(edit.get("Shopify Order Notes", "")),
-                clean_text(edit.get("Shopify Line Notes", "")),
-            ])
-            new_source_signature = "|".join([
-                clean_text(result.at[index, "Original Shopify Line"] if "Original Shopify Line" in result.columns else ""),
-                clean_text(result.at[index, "Shopify Order Notes"] if "Shopify Order Notes" in result.columns else ""),
-                clean_text(result.at[index, "Shopify Line Notes"] if "Shopify Line Notes" in result.columns else ""),
-            ])
-            if old_source_signature == new_source_signature:
-                previously_ready.add(line_id)
-            else:
-                was_ready = False
-        # Product Master remains authoritative while a decision is unresolved.
-        # Vendor/decoration values are carried only after the user deliberately
-        # completed the order-specific row and marked it Ready.
-        fields = set(carry_fields)
-        if was_ready:
+            previously_ready_indexes.add(index)
+
+        fields = set(source_correction_fields) if corrected_source_match else set(carry_fields)
+        if was_ready and not corrected_source_match:
             fields.update(permanent_override_fields)
+        if not verified_source_id and not corrected_source_match:
+            fields.difference_update(identity_sensitive_fields)
+
+        # ``clean_text`` intentionally turns typographic dashes into a normal
+        # hyphen for Excel/PDF safety. Compare the normalized value so a saved
+        # "Do Not Outsource — Ship to Orchid" decision survives regeneration.
+        if clean_text(edit.get("Decoration Decision", "")).casefold() == "do not outsource - ship to orchid":
+            explicit_do_not_outsource_indexes.add(index)
+
         for field in fields:
             if field not in edit:
+                continue
+            if index in repaired_tall_indexes and field in {"Garment Color", "Size"}:
+                continue
+            # A regenerated workbook must pick up a corrected Product Master
+            # description.  Review & Edit contains the original value for
+            # every displayed row, so replaying it blindly can freeze a stale
+            # catalog error forever.  Preserve Description only when the user
+            # actually changed it from the prior All PO Lines baseline.
+            if (
+                field == "Description"
+                and source_row
+                and clean_text(edit.get("Description", ""))
+                == clean_text(source_row.get("Description", ""))
+            ):
                 continue
             value = edit.get(field, "")
             if field == "Quantity":
@@ -825,18 +1167,23 @@ def _apply_previous_review_edits(
                     value = int(float(value or 0))
                 except (TypeError, ValueError):
                     value = 0
-            if field in {"Include", "Do Not Outsource", "Quantity"} or clean_text(value):
+            if field in {"Include", "Do Not Outsource", "Quantity", "Quantity Override Confirmed"} or clean_text(value):
                 result.at[index, field] = value
 
-    result = _revalidate_detail(result, allow_decoration_prompts=allow_decoration_prompts)
+    result["Do Not Outsource"] = current_do_not_outsource
+    for index in explicit_do_not_outsource_indexes:
+        result.at[index, "Do Not Outsource"] = "Yes"
+
+    result = _revalidate_detail(
+        result,
+        allow_decoration_prompts=allow_decoration_prompts,
+        allow_waterproof_prompts=allow_waterproof_prompts,
+    )
 
     # Revalidation intentionally recreates hard blockers. Preserve a user's
     # completed manual decision only when no hard blocker remains.
     manual_only_reason = "customer decision required"
-    for line_id in previously_ready:
-        index = index_by_line.get(line_id)
-        if index is None:
-            continue
+    for index in previously_ready_indexes:
         include = clean_text(result.at[index, "Include"]).casefold()
         if include not in {"yes", "y", "true", "1", "include"}:
             result.at[index, "Review Status"] = "Ready"
@@ -849,7 +1196,11 @@ def _apply_previous_review_edits(
         hard_reasons = [reason for reason in reasons if reason != manual_only_reason]
         mandatory_note = normalize_bool(result.at[index, "Mandatory Note Review"], False)
         decision = clean_text(result.at[index, "Decoration Decision"]).casefold()
-        valid_decisions = {"follow note as written", "keep product master default", "no decoration", "embroidery", "screen print", "sew on patch", "hemming / alteration", "do not outsource — ship to orchid"}
+        valid_decisions = {
+            "follow note as written", "keep product master default", "no decoration",
+            "embroidery", "screen print", "sew on patch", "hemming / alteration",
+            "do not outsource - ship to orchid",
+        }
         note_confirmed = not mandatory_note or decision in valid_decisions
         if not hard_reasons and note_confirmed:
             result.at[index, "Review Status"] = "Ready"
@@ -953,7 +1304,7 @@ def _write_dataframe_sheet(workbook, sheet_name, title, frame, formats, widths=N
         "Source": 18, "Parse Confidence": 16, "Master Match": 16,
         "Original Shopify Line": 45, "Order Date": 22,
         "Shopify Line Notes": 40, "Decoration Decision": 28, "Mandatory Note Review": 18,
-        "Product Category": 22, "Requires Size": 14, "Requires Color": 14, "Requires Decoration": 18,
+        "Product Category": 22, "Product Aliases": 28, "Requires Size": 14, "Requires Color": 14, "Requires Decoration": 18,
         "Vendor": 22, "Report": 24, "Total Pieces": 14, "PO Number": 22, "Action": 20,
         "Company / Department": 28, "Order Number(s)": 18, "Order Total": 16, "Discount": 14, "Total": 16,
     }
@@ -1007,7 +1358,14 @@ def _add_edit_controls(workbook, ws, row_count, settings_rows):
         "format": ready_format,
     })
 
-def _build_employee_totals(raw: pd.DataFrame) -> pd.DataFrame:
+def _employee_order_key(value: object) -> str:
+    return clean_text(value).lstrip("#").casefold()
+
+
+def _build_employee_totals(
+    raw: pd.DataFrame,
+    included_order_keys: set[str] | None = None,
+) -> pd.DataFrame:
     columns = ["Company / Department", "Employee Name", "Order Number(s)", "Order Total", "Discount", "Total"]
     if raw.empty or "Name" not in raw.columns:
         return pd.DataFrame(columns=columns)
@@ -1028,6 +1386,11 @@ def _build_employee_totals(raw: pd.DataFrame) -> pd.DataFrame:
     for order_number, group in source.groupby("Name", dropna=False, sort=False):
         order_number = clean_text(order_number)
         if not order_number:
+            continue
+        if (
+            included_order_keys is not None
+            and _employee_order_key(order_number) not in included_order_keys
+        ):
             continue
         company = clean_text(group["Billing Company"].iloc[0])
         employee = clean_text(group["Billing Name"].iloc[0])
@@ -1082,8 +1445,18 @@ def generate_review_workbook(
 ) -> dict:
     report_mode = normalize_report_mode(report_mode)
     decoration_fulfillment = normalize_decoration_fulfillment(decoration_fulfillment)
+    # A regeneration must keep the fulfillment route selected when the event was
+    # created. Older saved state files can omit this field and otherwise fall
+    # back to Standard Orchid Workflow, silently removing embroidery from an
+    # Entire Order Outsourced report. The previous workbook is authoritative.
+    if previous_review_path:
+        previous_path = Path(previous_review_path).expanduser()
+        if previous_path.exists():
+            from modules.xlsx_reader import load_decoration_fulfillment
+
+            decoration_fulfillment = load_decoration_fulfillment(previous_path)
     event_name = clean_text(event_name) if report_mode == UNIFORM_SIZING_EVENT else ""
-    product_master_path = Path(product_master_path).expanduser().resolve()
+    product_master_path = assert_live_product_master(Path(product_master_path).expanduser().resolve())
     master_signature = product_master_signature(product_master_path)
     # Always reload the active Product Master from disk immediately before building.
     detail, review, excluded, raw = _build_review_data(
@@ -1099,10 +1472,23 @@ def generate_review_workbook(
     output_path = output_dir / f"Orchid_Purchase_Review{event_part}__{stamp}.xlsx"
     regeneration_request_path = output_path.with_suffix(".orchidregen")
 
+    # Freeze the selected order CSV, live Product Master, Never Outsource
+    # overrides, and immutable Shopify source ledger before any prior review
+    # decisions are replayed. The final PDF stage must verify this exact bundle.
+    packet_lock = create_packet_lock(
+        source_csv_path=Path(shopify_csv_path),
+        product_master_path=product_master_path,
+        detail=detail,
+        report_mode=report_mode,
+        event_name=event_name,
+        decoration_fulfillment=decoration_fulfillment,
+    )
+
     detail = _apply_previous_review_edits(
         detail,
         previous_review_path,
         allow_decoration_prompts=decoration_note_prompts_enabled(report_mode, decoration_fulfillment),
+        allow_waterproof_prompts=waterproof_decoration_prompts_enabled(report_mode, decoration_fulfillment),
     )
 
     master = load_extended_master(Path(product_master_path))
@@ -1782,7 +2168,9 @@ def generate_review_workbook(
         "Purchase Instructions", "Note Action", "Original Product #", "Product #", "Description",
         "Garment Color", "Size", "Quantity", "Purchase Vendor", "Decoration Type", "Decoration Location", "Decoration Placement Instructions", "Decoration Color",
         "Employee Name", "Company", "Order Number", "Include", "Do Not Outsource", "Decision Key",
-        "Decoration Decision",
+        "Decoration Decision", "Source ID", "Source Occurrence", "Original Quantity",
+        "Original Order Number", "Original Company", "Original Employee Name", "Original Order Date",
+        "Original Shopify SKU", "Quantity Override Confirmed",
     ]
     if not detail.empty:
         review_edit = detail[exception_mask].copy()
@@ -1867,6 +2255,12 @@ def generate_review_workbook(
     review_ws.set_column(review_col["Do Not Outsource"], review_col["Do Not Outsource"], None, None, {"hidden": True})
     review_ws.set_column(review_col["Decision Key"], review_col["Decision Key"], None, None, {"hidden": True})
     review_ws.set_column(review_col["Decoration Decision"], review_col["Decoration Decision"], 28)
+    for technical_name in (
+        "Source ID", "Source Occurrence", "Original Quantity", "Original Order Number",
+        "Original Company", "Original Employee Name", "Original Order Date", "Original Shopify SKU",
+        "Quantity Override Confirmed",
+    ):
+        review_ws.set_column(review_col[technical_name], review_col[technical_name], None, None, {"hidden": True})
     review_ws.conditional_format(rstart, review_col["Review Status"], rend, review_col["Review Status"], {
         "type": "text", "criteria": "containing", "value": "Needs Review",
         "format": workbook.add_format({"bg_color": RED_PALE, "font_color": "#9C0006"}),
@@ -1967,7 +2361,14 @@ def generate_review_workbook(
     all_ws.hide()
 
     if report_mode == UNIFORM_SIZING_EVENT:
-        employee_totals = _build_employee_totals(raw)
+        included_employee_order_keys = {
+            _employee_order_key(row.get("Order Number", ""))
+            for _, row in detail.iterrows()
+            if clean_text(row.get("Include", "Yes")).casefold() in {"yes", "y", "true", "1", "include"}
+            and pd.to_numeric(row.get("Quantity", 0), errors="coerce") > 0
+            and _employee_order_key(row.get("Order Number", ""))
+        }
+        employee_totals = _build_employee_totals(raw, included_employee_order_keys)
         employee_ws = _write_dataframe_sheet(
             workbook,
             "Employee Totals",
@@ -2113,8 +2514,30 @@ def generate_review_workbook(
     system_info.write(3, 1, int(master_signature.get("records", 0)))
     system_info.write(4, 0, "Product Master Styles")
     system_info.write(4, 1, int(master_signature.get("styles", 0)))
-    system_info.write(5, 0, "Workbook Generated")
-    system_info.write(5, 1, now.strftime("%Y-%m-%d %I:%M:%S %p"))
+    system_info.write(5, 0, "Routing Policy Version")
+    system_info.write(5, 1, ROUTING_POLICY_VERSION)
+    system_info.write(6, 0, "Workbook Generated")
+    system_info.write(6, 1, now.strftime("%Y-%m-%d %I:%M:%S %p"))
+    system_info.write(7, 0, "Decoration Fulfillment")
+    system_info.write(7, 1, decoration_fulfillment)
+    system_info.write(8, 0, "Purchase Order Mode")
+    system_info.write(8, 1, report_mode)
+    system_info.write(9, 0, "Event Name")
+    system_info.write(9, 1, event_name)
+    system_info.write(10, 0, "Packet Lock ID")
+    system_info.write(10, 1, str(packet_lock.get("lock_id", "")))
+    system_info.write(11, 0, "Packet Lock Manifest Path")
+    system_info.write(11, 1, str(packet_lock.get("manifest_path", "")))
+    system_info.write(12, 0, "Packet Lock Manifest SHA256")
+    system_info.write(12, 1, str(packet_lock.get("manifest_sha256", "")))
+    system_info.write(13, 0, "Locked Source Lines")
+    system_info.write(13, 1, int(packet_lock.get("source_line_count", 0)))
+    system_info.write(14, 0, "Locked Source Quantity")
+    system_info.write(14, 1, int(packet_lock.get("source_quantity", 0)))
+    system_info.write(15, 0, "Product Master Routing SHA256")
+    system_info.write(15, 1, str(master_signature.get("routing_sha256", "")))
+    system_info.write(16, 0, "Never Outsource Override SHA256")
+    system_info.write(16, 1, str(master_signature.get("override_sha256", "")))
     system_info.hide()
 
     workbook.close()
@@ -2152,6 +2575,9 @@ def generate_review_workbook(
             if clean_text(value)
         )),
         "product_master_signature": master_signature,
+        "packet_lock_id": packet_lock.get("lock_id", ""),
+        "packet_lock_manifest": packet_lock.get("manifest_path", ""),
+        "packet_lock_manifest_sha256": packet_lock.get("manifest_sha256", ""),
         "report_mode": report_mode,
         "event_name": event_name,
         "decoration_fulfillment": decoration_fulfillment,

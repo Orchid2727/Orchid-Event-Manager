@@ -6,6 +6,7 @@ from modules.blank_garment_rules import is_blank_decoration
 from modules.internal_services import is_in_house_decoration
 
 LEFT_CHEST = "Left Chest"
+RIGHT_CHEST = "Right Chest"
 LEFT_SLEEVE = "Left Sleeve"
 LEFT_PANEL = "Left Panel"
 RIGHT_PANEL = "Right Panel"
@@ -21,6 +22,7 @@ NOT_APPLICABLE_IN_HOUSE = "Not Applicable — In-House Service"
 
 STANDARD_DECORATION_LOCATIONS = [
     LEFT_CHEST,
+    RIGHT_CHEST,
     LEFT_SLEEVE,
     LEFT_PANEL,
     RIGHT_PANEL,
@@ -37,6 +39,9 @@ _ALIASES = {
     "left chest": LEFT_CHEST,
     "chest": LEFT_CHEST,
     "lc": LEFT_CHEST,
+    "right chest": RIGHT_CHEST,
+    "right-chest": RIGHT_CHEST,
+    "rc": RIGHT_CHEST,
     "left sleeve": LEFT_SLEEVE,
     "sleeve": LEFT_SLEEVE,
     "ls": LEFT_SLEEVE,
@@ -186,6 +191,8 @@ def infer_decoration_location_from_note(value: object) -> str:
         return BEANIE
     if re.search(r"\bleft[ -]?sleeve\b|\bon (?:the )?left sleeve\b", text):
         return LEFT_SLEEVE
+    if re.search(r"\bright[ -]?chest\b|\bon (?:the )?right chest\b", text):
+        return RIGHT_CHEST
     if re.search(r"\bleft[ -]?chest\b|\bon (?:the )?left chest\b", text):
         return LEFT_CHEST
     if re.search(r"\bleft[ -]?panel\b", text):

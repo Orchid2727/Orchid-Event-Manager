@@ -310,16 +310,30 @@ def apply_routing_overrides(frame: pd.DataFrame) -> pd.DataFrame:
     if use_detected.any():
         result.loc[use_detected, "Vendor"] = detected_vendor[use_detected]
 
-    # Apply Orchid's preferred distributor rules. This deliberately overrides
-    # an S&S assignment for brands also carried by SanMar. Red Kap routes to VF.
+    # Apply Orchid's preferred distributor rules only when Product Master did
+    # not already provide an authoritative vendor. An exact Product Master
+    # style/product match with a nonblank saved vendor must survive every later
+    # brand inference step. This prevents products such as HJ51 and FRP07SWD
+    # from being changed from Berne Apparel to S&S Activewear during review
+    # creation merely because their descriptions contain a broadline brand.
     brand_routes = result.apply(_row_brand_routing, axis=1)
     if len(brand_routes):
         result["Detected Brand"] = [item[0] for item in brand_routes]
         preferred_vendors = pd.Series([item[1] for item in brand_routes], index=result.index)
-        brand_mask = preferred_vendors.map(_clean).ne("")
+        reliable_master_match = result["Master Match"].map(_clean).str.casefold().isin({
+            "style",
+            "style - exact style/color alias",
+            "style - single-row style inference",
+            "product alias",
+            "contained product alias",
+        })
+        saved_master_vendor = reliable_master_match & result["Vendor"].map(_clean).ne("")
+        brand_mask = preferred_vendors.map(_clean).ne("") & ~saved_master_vendor
         if brand_mask.any():
             result.loc[brand_mask, "Vendor"] = preferred_vendors[brand_mask]
             result.loc[brand_mask, "Vendor Routing Source"] = "Preferred brand vendor"
+        if saved_master_vendor.any():
+            result.loc[saved_master_vendor, "Vendor Routing Source"] = "Product Master vendor"
 
     # Style 1104 (Ascent) is a known Tru-Spec pant. Older builds repeatedly
     # treated it as a new product because the title does not contain the brand.

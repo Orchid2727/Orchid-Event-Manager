@@ -4,14 +4,18 @@ from datetime import datetime
 import json
 from pathlib import Path
 from typing import Any
+import re
 
 from modules.blank_garment_rules import BLANK_DECORATION_LABEL, is_blank_decoration
 from modules.decoration_locations import OTHER_CUSTOM, normalize_decoration_location
 from modules.report_modes import GENERAL_SALES_PERIOD, UNIFORM_SIZING_EVENT
-from modules.purchase_order_generator import normalize_size
+from modules.purchase_order_generator import normalize_size, split_embedded_size
 from modules.purchase_rules import normalize_bool, row_rules
+from modules.product_resolver import load_extended_master, resolve_product, normalize_style
 from modules.employee_totals import employee_totals_summary, load_employee_totals
-from modules.internal_services import is_in_house_decoration, is_in_house_service_product
+from modules.internal_services import (
+    is_in_house_decoration, is_in_house_service_product, is_internal_service_style,
+)
 from modules.xlsx_reader import (
     load_event_name,
     load_report_mode,
@@ -98,7 +102,147 @@ def save_po_overrides(
     return path
 
 
-def _review_queue(path: Path) -> tuple[list[dict[str, str]], set[str]]:
+def _record_is_service_only(record: dict[str, object]) -> bool:
+    product_number = clean(record.get("Product #", record.get("Style Number", "")))
+    description = clean(record.get("Description", record.get("Product Name", "")))
+    garment_color = clean(record.get("Garment Color", record.get("Color", "")))
+    decoration_type = clean(record.get("Decoration Type", ""))
+    return bool(
+        is_internal_service_style(product_number)
+        or is_in_house_service_product(
+            description,
+            record.get("Original Shopify Line", record.get("Original Line Item", "")),
+            decoration_type,
+            style_number=product_number,
+            garment_color=garment_color,
+        )
+    )
+
+
+
+def _split_issue_colors(value: object) -> list[str]:
+    text = clean(value)
+    if not text:
+        return []
+    return list(dict.fromkeys(
+        clean(part) for part in re.split(r"\s*[,;|]\s*", text) if clean(part)
+    ))
+
+
+def _product_master_issue_is_resolved(
+    issue: dict[str, object],
+    master_path: Path | None,
+    master=None,
+) -> bool:
+    """Return True when a workbook's permanent warning is stale.
+
+    Purchase Review workbooks are snapshots. Product Master may be corrected later,
+    so reopening an event must verify the exact ordered color against the live master
+    instead of blocking on old warning text or an unfinished unrelated color row.
+    """
+    if master_path is None:
+        return False
+    candidate_path = Path(master_path)
+    if not candidate_path.exists():
+        return False
+    try:
+        frame = master if master is not None else load_extended_master(candidate_path)
+    except Exception:
+        return False
+    style = clean(issue.get("product", issue.get("Product #", "")))
+    description = clean(issue.get("description", issue.get("Description", "")))
+    colors = _split_issue_colors(
+        issue.get("garment_colors", issue.get("Garment Color(s)", issue.get("Garment Color", "")))
+    ) or [""]
+    reason = clean(issue.get("reason", issue.get("Missing Information", ""))).casefold()
+
+    # A true unknown style remains permanent setup work.
+    if style:
+        style_rows = frame[frame["Style Number"].map(normalize_style).eq(normalize_style(style))]
+    else:
+        style_rows = frame.iloc[0:0]
+    if style and style_rows.empty:
+        return False
+
+    for color in colors:
+        result = resolve_product(style, description, color, frame, master_prepared=True)
+        if not result.matched:
+            return False
+        issue_text = clean(result.issue).casefold()
+        if "setup required" in issue_text:
+            return False
+        if not result.vendor:
+            return False
+        if result.requires_decoration:
+            if not result.decoration_type:
+                return False
+            if (
+                not is_blank_decoration(result.decoration_type)
+                and not is_in_house_decoration(result.decoration_type)
+                and not result.decoration_color
+            ):
+                return False
+            if normalize_decoration_location(
+                result.decoration_location,
+                result.decoration_type,
+                requires_decoration=True,
+                product_name=result.product_name,
+                category=result.product_category,
+            ) == OTHER_CUSTOM:
+                return False
+        if result.requires_color and color and not result.garment_color:
+            return False
+
+    # Only suppress a permanent queue item when the live master now satisfies it.
+    return bool(reason)
+
+
+def _filter_live_product_master_issues(
+    issues: list[dict[str, str]],
+    master_path: Path | None,
+) -> tuple[list[dict[str, str]], set[str]]:
+    if master_path is None:
+        return issues, set()
+    candidate_path = Path(master_path)
+    if not candidate_path.exists():
+        return issues, set()
+    try:
+        master = load_extended_master(candidate_path)
+    except Exception:
+        return issues, set()
+    kept: list[dict[str, str]] = []
+    resolved_line_ids: set[str] = set()
+    for issue in issues:
+        is_master = clean(issue.get("fix_in", issue.get("source", ""))).casefold() == "product master"
+        if is_master and _product_master_issue_is_resolved(issue, candidate_path, master=master):
+            for value in clean(issue.get("affected_line_ids", issue.get("line_id", ""))).split(","):
+                if clean(value):
+                    resolved_line_ids.add(clean(value))
+            continue
+        kept.append(issue)
+    return kept, resolved_line_ids
+
+
+def _effective_review_blockers(record: dict[str, object]) -> list[str]:
+    """Return live blockers without trusting an older row's stale reason text."""
+    candidate = dict(record)
+    candidate["Review Status"] = "Ready"
+    try:
+        blockers = _line_block_reasons(candidate)
+    except Exception:
+        return [clean(record.get("Review Reason", "")) or "Needs review"]
+    return [
+        "Customer decision required" if reason == "Customer instruction decision required" else reason
+        for reason in blockers
+    ]
+
+
+def _record_is_effectively_complete(record: dict[str, object]) -> bool:
+    """Recognize a saved decision even when an older build missed the status flag."""
+    return not _effective_review_blockers(record)
+
+
+def _review_queue(path: Path, review_rows: list[dict[str, object]] | None = None) -> tuple[list[dict[str, str]], set[str]]:
     """Read permanent and order-specific queues as separate decisions.
 
     The same order line can need both a reusable Product Master correction and an
@@ -138,37 +282,182 @@ def _review_queue(path: Path) -> tuple[list[dict[str, str]], set[str]]:
             "decision_key": decision_key,
         }
 
-    try:
-        rows = read_table(path, "Review & Edit", {"Line ID", "Review Status"})
-    except Exception:
-        rows = []
+    if review_rows is None:
+        try:
+            rows = read_table(path, "Review & Edit", {"Line ID", "Review Status"})
+        except Exception:
+            rows = []
+    else:
+        rows = review_rows
     for record in rows:
         line_id = clean(record.get("Line ID", ""))
         if not line_id:
             continue
+        if _record_is_service_only(record):
+            continue
         include = clean(record.get("Include", "Yes")).casefold()
         if include not in {"yes", "y", "true", "1", "include"}:
             continue
+        recovered_color, recovered_size = split_embedded_size(
+            clean(record.get("Garment Color", "")), clean(record.get("Size", ""))
+        )
+        if recovered_color != clean(record.get("Garment Color", "")) or recovered_size != normalize_size(record.get("Size", "")):
+            record = dict(record)
+            record["Garment Color"] = recovered_color
+            record["Size"] = recovered_size
         status = clean(record.get("Review Status", ""))
-        if status.casefold() == "ready":
+        resolution = clean(record.get("Resolution", "")).casefold()
+        completed_resolution = resolution == "completed in app" or resolution.startswith("instruction:")
+        live_blockers = _effective_review_blockers(record)
+        if status.casefold() == "ready" or completed_resolution or not live_blockers:
             continue
         unresolved_ids.add(line_id)
         decision_key = clean(record.get("Decision Key", "")) or f"line:{line_id}"
+        live_reason = "; ".join(live_blockers)
+        original_reason = clean(record.get("Review Reason", ""))
+        action_required = clean(record.get("Action Required", ""))
+        if original_reason.casefold() != live_reason.casefold():
+            action_required = f"Correct this order in Purchase Review: {live_reason}."
         issues_by_key[f"review:{decision_key}"] = {
             "line_id": line_id,
+            "source_id": clean(record.get("Source ID", "")),
             "order": clean(record.get("Order Number", "")),
             "employee": clean(record.get("Employee Name", "")),
             "product": clean(record.get("Product #", "")),
             "description": clean(record.get("Description", "")),
             "vendor": clean(record.get("Purchase Vendor", "")),
-            "reason": clean(record.get("Review Reason", "")) or "Needs review",
-            "instructions": clean(record.get("Action Required", "")) or clean(record.get("Purchase Instructions", "")),
+            "reason": live_reason or "Needs review",
+            "instructions": action_required or clean(record.get("Purchase Instructions", "")),
             "source": "Purchase Review",
             "fix_in": clean(record.get("Fix In", "")) or "Purchase Review",
             "decision_key": decision_key,
         }
 
     return list(issues_by_key.values()), unresolved_ids
+
+def load_purchase_review_snapshot(workbook_path: Path, product_master_path: Path | None = None) -> dict[str, Any]:
+    """Load the same authoritative review queue used by final PO preflight.
+
+    Earlier lightweight loading inspected only the visible ``Review & Edit``
+    worksheet.  A source line could therefore remain unresolved on hidden
+    ``All PO Lines`` while Purchase Review incorrectly displayed zero decisions.
+    This loader now takes its issue queue from the full mission-control
+    validator, then builds the editable value cache from both worksheets.  The
+    UI and final release gate therefore cannot disagree about required review.
+    """
+    path = Path(workbook_path)
+    snapshot: dict[str, Any] = {
+        "workbook": path,
+        "issues": [],
+        "routes": [],
+        "review_count": 0,
+        "purchase_review_count": 0,
+        "product_master_review_count": 0,
+        "blocked_route_count": 0,
+        "workflow_blocked": False,
+        "review_values": {},
+        "review_completed": 0,
+        "review_remaining": 0,
+        "updated": path.stat().st_mtime if path.exists() else 0,
+        "lightweight": True,
+    }
+    if not path.exists():
+        return snapshot
+
+    # The full validator is the single source of truth for unresolved decisions.
+    # This intentionally favors correctness over the former lightweight shortcut.
+    authoritative = load_mission_control_snapshot(path, None, product_master_path)
+    issues = [dict(issue) for issue in authoritative.get("issues", [])]
+
+    try:
+        review_rows = read_table(path, "Review & Edit", {"Line ID", "Review Status"})
+    except Exception:
+        review_rows = []
+    try:
+        all_rows = load_review_lines(path)
+    except Exception:
+        all_rows = []
+
+    review_source_ids = {
+        clean(record.get("Source ID", "")) for record in review_rows
+        if clean(record.get("Source ID", ""))
+    }
+    for issue in issues:
+        source_id = clean(issue.get("source_id", ""))
+        if (
+            source_id
+            and clean(issue.get("fix_in", issue.get("source", ""))).casefold() != "product master"
+            and source_id not in review_source_ids
+        ):
+            # The decision exists only in All PO Lines.  The app can still show
+            # and save it safely by updating the immutable source row directly.
+            issue["source_only"] = True
+
+    snapshot["issues"] = issues
+    product_issues = [
+        issue for issue in issues
+        if clean(issue.get("fix_in", issue.get("source", ""))).casefold() == "product master"
+    ]
+    review_issues = [
+        issue for issue in issues
+        if clean(issue.get("fix_in", issue.get("source", ""))).casefold() != "product master"
+    ]
+    snapshot["product_master_review_count"] = len(product_issues)
+    snapshot["review_count"] = len(review_issues)
+    snapshot["purchase_review_count"] = len(review_issues)
+    snapshot["blocked_route_count"] = int(authoritative.get("blocked_route_count", 0) or 0)
+    snapshot["workflow_blocked"] = bool(issues or snapshot["blocked_route_count"])
+
+    values_by_key: dict[str, dict[str, object]] = {}
+    included_decisions: dict[str, list[str]] = {}
+
+    # All PO Lines contains the immutable event source and therefore supplies
+    # values for source-only decisions.  Visible Review & Edit rows are applied
+    # afterward so any user-facing edits remain authoritative.
+    combined_rows = list(all_rows) + list(review_rows)
+    for row_number, record in enumerate(combined_rows, start=1):
+        line_id = clean(record.get("Line ID", ""))
+        source_id = clean(record.get("Source ID", ""))
+        decision_key = clean(record.get("Decision Key", "")) or (
+            f"line:{line_id}" if line_id else (f"source:{source_id}" if source_id else f"row:{row_number}")
+        )
+        if _record_is_service_only(record):
+            continue
+        include = clean(record.get("Include", "Yes")).casefold()
+        if include not in {"yes", "y", "true", "1", "include"}:
+            continue
+        values = dict(record)
+        recovered_color, recovered_size = split_embedded_size(
+            clean(values.get("Garment Color", "")), clean(values.get("Size", ""))
+        )
+        values["Garment Color"] = recovered_color
+        values["Size"] = recovered_size
+        values_by_key[decision_key] = values
+        if line_id:
+            values_by_key[line_id] = values
+        if source_id:
+            values_by_key[source_id] = values
+
+        status = clean(record.get("Review Status", "")).casefold()
+        resolution = clean(record.get("Resolution", "")).casefold()
+        if status != "ready" and (
+            resolution == "completed in app"
+            or resolution.startswith("instruction:")
+            or _record_is_effectively_complete(values)
+        ):
+            status = "ready"
+        included_decisions.setdefault(decision_key, []).append(status)
+
+    completed = sum(
+        1 for statuses in included_decisions.values()
+        if statuses and all(status == "ready" for status in statuses)
+    )
+    snapshot["review_values"] = values_by_key
+    snapshot["review_completed"] = completed
+    snapshot["review_remaining"] = len(review_issues)
+    return snapshot
+
+
 
 def _dashboard_po_numbers(path: Path) -> dict[tuple[str, str], str]:
     try:
@@ -217,8 +506,12 @@ def _line_block_reasons(record: dict[str, object]) -> list[str]:
     product_number = clean(record.get("Product #", ""))
     description = clean(record.get("Description", ""))
     garment_color = clean(record.get("Garment Color", record.get("Color", "")))
-    size = normalize_size(record.get("Size", ""))
+    garment_color, size = split_embedded_size(garment_color, record.get("Size", ""))
     quantity = _quantity(record.get("Quantity", 0))
+
+    # Product 750 and other registered service/charge rows are not products.
+    if _record_is_service_only(record):
+        return []
 
     rules = row_rules({
         "Product Name": description,
@@ -320,6 +613,8 @@ def _live_routes(
             # This rare line-level exception is purchased manually and appears
             # on the consolidated Non-Included Items internal document.
             continue
+        if _record_is_service_only(record):
+            continue
         vendor = clean(record.get("Purchase Vendor", ""))
         # Missing-vendor lines remain in the Review queue; they are not a fake
         # purchase-order route and therefore must not request a PO number.
@@ -392,7 +687,11 @@ def _live_routes(
     return routes
 
 
-def load_mission_control_snapshot(workbook_path: Path, data_root: Path | None = None) -> dict[str, Any]:
+def load_mission_control_snapshot(
+    workbook_path: Path,
+    data_root: Path | None = None,
+    product_master_path: Path | None = None,
+) -> dict[str, Any]:
     path = Path(workbook_path)
     snapshot: dict[str, Any] = {
         "workbook": path,
@@ -463,6 +762,7 @@ def load_mission_control_snapshot(workbook_path: Path, data_root: Path | None = 
             decision_key = f"product:{product_number or clean(record.get('Description', '')).casefold() or line_id}"
             issues_by_key.setdefault(f"master:{decision_key}", {
                 "line_id": line_id,
+                "source_id": clean(record.get("Source ID", "")),
                 "affected_line_ids": line_id,
                 "order": clean(record.get("Order Number", "")),
                 "employee": clean(record.get("Employee Name", "")),
@@ -495,6 +795,7 @@ def load_mission_control_snapshot(workbook_path: Path, data_root: Path | None = 
         decision_key = clean(record.get("Decision Key", "")) or f"line:{line_id or len(included_lines)}"
         issues_by_key.setdefault(f"validation:{decision_key}", {
             "line_id": line_id,
+            "source_id": clean(record.get("Source ID", "")),
             "order": clean(record.get("Order Number", "")),
             "employee": clean(record.get("Employee Name", "")),
             "product": clean(record.get("Product #", "")),
@@ -508,6 +809,8 @@ def load_mission_control_snapshot(workbook_path: Path, data_root: Path | None = 
         })
 
     issues = list(issues_by_key.values())
+    issues, resolved_master_lines = _filter_live_product_master_issues(issues, product_master_path)
+    blocked_line_ids.difference_update(resolved_master_lines)
     routes = _live_routes(path, snapshot["report_mode"], blocked_line_ids, data_root, lines=all_lines)
     blocked_routes = [route for route in routes if clean(route.get("status", "")).casefold() != "ready"]
     line_count = len(included_lines)

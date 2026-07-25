@@ -1,0 +1,22 @@
+ORCHID PURCHASE MANAGER 4.9.12 RC13 - GITHUB DEVELOPER NOTE
+
+GitHub Summary:
+Fix PO-number window handoff and verify released reports in v4.9.12 RC13
+
+FILES CHANGED
+- app.py
+- modules/product_master_editor.py (version label only)
+- VERSION.txt
+- README_FIRST.txt
+- PROFESSIONAL_4.9.12_RC13_RELEASE_NOTES.txt
+- STABILIZATION_TEST_OUTPUT_4.9.12_RC13.txt
+
+PRIMARY CHANGES
+- Delay PO-number editor creation until after the reconciliation modal has fully closed.
+- Bring the PO-number editor to the front on macOS.
+- Rename Step 5 action to Prepare & Assign PO Numbers.
+- Verify output directory, released PDF count, and final release manifest before reporting success.
+- Force Purchase Orders page refresh and show explicit verified success confirmation.
+
+PROTECTED CORE
+The report generator, packet lock, quantity logic, vendor routing, decision logic, and audit calculation modules are unchanged.

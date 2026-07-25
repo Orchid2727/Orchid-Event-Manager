@@ -12,7 +12,10 @@ from modules.decoration_locations import (
 )
 from modules.purchase_rules import bool_text, category_defaults, infer_category
 from modules.routing_rules import VF_STYLE_OVERRIDES, preferred_vendor_for_brand_text
-from modules.internal_services import infer_in_house_decoration, is_in_house_decoration, is_in_house_service_product
+from modules.internal_services import (
+    infer_in_house_decoration, is_in_house_decoration, is_in_house_service_product,
+    is_internal_service_style,
+)
 
 
 def clean(value: Any) -> str:
@@ -81,9 +84,11 @@ def apply_product_intelligence(frame: pd.DataFrame) -> pd.DataFrame:
         if column not in result.columns:
             result[column] = ""
 
-    replaceable_vendor_keys = {
-        "", "ss", "ssactivewear", "sand s", "sanmar", "vf",
-    }
+    # Product Master is the permanent user-controlled catalog. Vendor inference
+    # may fill a blank vendor, but it must never overwrite a vendor selected by
+    # the user. Earlier builds treated VF as replaceable, so a saved VF choice
+    # for styles such as 3339DN was silently changed back to S&S during cleanup.
+    replaceable_vendor_keys = {""}
 
     for index, row in result.iterrows():
         product_name = clean(row.get("Product Name", ""))
@@ -116,7 +121,7 @@ def apply_product_intelligence(frame: pd.DataFrame) -> pd.DataFrame:
         current_vendor = clean(row.get("Vendor", ""))
         if preferred_vendor:
             current_key = _vendor_key(current_vendor)
-            if not current_vendor or current_key in {"ss", "ssactivewear", "sanmar", "vf"}:
+            if current_key in replaceable_vendor_keys:
                 result.at[index, "Vendor"] = preferred_vendor
 
         # Exact Orchid style rules outrank catalog-brand inference. SP3A is a
@@ -132,12 +137,13 @@ def apply_product_intelligence(frame: pd.DataFrame) -> pd.DataFrame:
             result.at[index, "Product Category"] = category
 
         defaults = category_defaults(category, product_name, style_number)
+        internal_service_style = is_internal_service_style(style_number)
         inferred_service_type = infer_in_house_decoration(product_name, row.get("Original Line Item", ""))
-        if inferred_service_type:
+        if inferred_service_type or internal_service_style:
             defaults = {"requires_size": False, "requires_color": False, "requires_decoration": False}
-        if not clean(row.get("Requires Size", "")) or inferred_service_type:
+        if not clean(row.get("Requires Size", "")) or inferred_service_type or internal_service_style:
             result.at[index, "Requires Size"] = bool_text(defaults["requires_size"])
-        if not clean(row.get("Requires Color", "")) or inferred_service_type:
+        if not clean(row.get("Requires Color", "")) or inferred_service_type or internal_service_style:
             result.at[index, "Requires Color"] = bool_text(defaults["requires_color"])
 
         decoration = clean(row.get("Decoration Type", ""))
@@ -149,8 +155,13 @@ def apply_product_intelligence(frame: pd.DataFrame) -> pd.DataFrame:
                 result.at[index, "Decoration Type"] = decoration
 
         if decoration:
-            service_only = is_in_house_service_product(product_name, row.get("Original Line Item", ""), decoration)
-            requires_decoration = not is_blank_decoration(decoration) and not is_in_house_decoration(decoration)
+            service_only = internal_service_style or is_in_house_service_product(
+                product_name, row.get("Original Line Item", ""), decoration, style_number=style_number
+            )
+            requires_decoration = (
+                False if service_only
+                else not is_blank_decoration(decoration) and not is_in_house_decoration(decoration)
+            )
             if not clean(row.get("Requires Decoration", "")) or service_only or is_in_house_decoration(decoration):
                 result.at[index, "Requires Decoration"] = bool_text(requires_decoration)
 

@@ -43,8 +43,8 @@ GARMENT_WORDS = {
 
 SIZE_PATTERN = re.compile(
     r"(?i)(?:\bsize\s*)?(\d{2})\s*[x×/]\s*(\d{2})\b|"
-    r"\b(XXS|XS|S|M|L|XL|XXL|2XL|3XL|4XL|5XL|6XL|7XL|8XL|"
-    r"LT|XLT|2XLT|3XLT|OSFA|OSFM|ONE\s*SIZE|S/M|L/XL)\b"
+    r"\b((?:L|XL|[2-8]X(?:L)?)\s+(?:TALL|TL|T)|XXS|XS|S|M|L|XL|XXL|"
+    r"2XL|3XL|4XL|5XL|6XL|7XL|8XL|LT|XLT|[2-8]XLT|OSFA|OSFM|ONE\s*SIZE|S/M|L/XL)\b"
 )
 
 STYLE_TOKEN_PATTERN = re.compile(r"(?i)^[A-Z0-9][A-Z0-9/-]{1,17}$")
@@ -69,6 +69,10 @@ def normalize_size(value: object) -> str:
     }
     if re.fullmatch(r"\d{2}[X/]\d{2}", raw):
         return raw.replace("/", "x").replace("X", "x")
+    tall_match = re.fullmatch(r"(L|XL|[2-8]X(?:L)?)(?:TALL|TL|T)", raw)
+    if tall_match:
+        base = tall_match.group(1).replace("XL", "X")
+        return {"L": "LT", "X": "XLT", **{f"{value}X": f"{value}XLT" for value in range(2, 9)}}.get(base, raw)
     return aliases.get(raw, raw)
 
 

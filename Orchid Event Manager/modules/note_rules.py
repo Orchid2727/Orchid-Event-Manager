@@ -7,7 +7,7 @@ def clean_note(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
 
 
-_MONEY = r"\$?\s*-?\s*\d[\d,]*(?:\.\d{1,2})?"
+_MONEY = r"\$?\s*-?\s*(?:\d[\d,]*(?:\.\d{1,2})?|\.\d{1,2})"
 _FINANCIAL_PATTERNS = (
     rf"\b(?:employee\s+)?allowance\b\s*(?:is|of|:|=|-)?\s*{_MONEY}",
     rf"\b(?:employee\s+)?budget\b\s*(?:is|of|:|=|-)?\s*{_MONEY}",
@@ -72,6 +72,53 @@ _BLANKET_DECORATION_SCOPE = re.compile(
     r")"
 )
 
+# Waterproof and rainwear apparel needs an explicit decoration choice when an
+# entire Uniform Sizing Event is outsourced. The trigger intentionally uses
+# complete words so unrelated names such as "Rainbow" do not create prompts.
+_WATERPROOF_APPAREL_TRIGGER = re.compile(
+    r"(?i)(?:"
+    r"\brain(?:wear|coat|coats| jacket| jackets| gear| suit| suits| shell| shells)?\b|"
+    r"\bwater[- ]?proof\b|\bwater[- ]?resistant\b|"
+    r"\bweather[- ]?proof\b|\bwet[- ]?weather\b|"
+    r"\bstormwear\b|\bstorm\s+(?:jacket|coat|shell|parka)s?\b"
+    r")"
+)
+
+
+
+
+_ALWAYS_EMBROIDER_RAIN_STYLES = {"CT100614", "CT100615", "CT100617"}
+
+# These known waterproof styles always require an order-specific decoration
+# confirmation. The numeric boundaries allow common color/size suffixes such as
+# 5302-BLK or 5328XL without accidentally matching a different longer style.
+_WATERPROOF_DECORATION_REVIEW_STYLES = {"5302", "5335", "5326", "5328", "9675", "9783"}
+_WATERPROOF_DECORATION_REVIEW_PATTERN = re.compile(
+    r"(?<!\d)(?:" + "|".join(sorted(_WATERPROOF_DECORATION_REVIEW_STYLES)) + r")(?!\d)",
+    re.IGNORECASE,
+)
+
+
+def waterproof_style_requires_review(value: object) -> bool:
+    """Return True for waterproof styles that always need a decoration choice."""
+    return bool(_WATERPROOF_DECORATION_REVIEW_PATTERN.search(str(value or "")))
+
+
+def waterproof_style_number(value: object) -> str:
+    """Return the matched base waterproof style for clear Purchase Review text."""
+    match = _WATERPROOF_DECORATION_REVIEW_PATTERN.search(str(value or ""))
+    return match.group(0) if match else ""
+
+
+def always_embroidery_rain_style(value: object) -> bool:
+    """Styles Orchid always embroiders despite Rain Defender/rainwear wording."""
+    key = re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+    return key in _ALWAYS_EMBROIDER_RAIN_STYLES
+
+def waterproof_apparel_requires_review(value: object) -> bool:
+    """Return True when product wording identifies waterproof or rain apparel."""
+    return bool(_WATERPROOF_APPAREL_TRIGGER.search(clean_note(value)))
+
 # These instructions matter to purchasing or decoration. Decoration instructions
 # are blocking; the remaining terms are visible context unless a decision term is
 # also present.
@@ -97,7 +144,9 @@ _TARGET_FAMILIES: dict[str, tuple[str, ...]] = {
     "hat": ("hat", "hats", "cap", "caps", "beanie", "beanies", "boonie", "boonies", "headwear", "visor", "visors"),
     "shirt": ("shirt", "shirts", "tee", "tees", "t-shirt", "t-shirts", "t shirt", "t shirts"),
     "polo": ("polo", "polos"),
-    "pant": ("pant", "pants", "jean", "jeans", "trouser", "trousers", "bib", "bibs", "overall", "overalls"),
+    "pant": ("pant", "pants", "trouser", "trousers", "slack", "slacks"),
+    "jean": ("jean", "jeans"),
+    "bib_overall": ("bib", "bibs", "bib overall", "bib overalls", "overall", "overalls"),
     "short": ("short", "shorts"),
     "vest": ("vest", "vests"),
     "bag": ("bag", "bags", "backpack", "backpacks", "duffel", "duffels", "tote", "totes"),
@@ -152,9 +201,50 @@ def combine_purchase_instructions(order_note: object, line_note: object = "") ->
     return " | ".join(parts)
 
 
+_PERSONALIZATION_MARKER = re.compile(
+    r"(?i)(?:"
+    r"\b(?:EMB|embroider(?:y|ed|ing)?)\s+(?:the\s+)?(?:employee\s+)?name\b|"
+    r"\b(?:employee\s+)?name\s+(?:embroidery|embroidered|to\s+be\s+embroidered)\b|"
+    r"\badd\s+(?:the\s+)?(?:employee\s+)?name\b|"
+    r"\bname\s+on\b|"
+    r"\bpersonaliz(?:e|ed|es|ing|ation)\b"
+    r")"
+)
+
+_PERSONALIZATION_PROCESS_OVERRIDE = re.compile(
+    r"(?i)(?:"
+    r"\bscreen[- ]?print(?:ed|ing)?\b|\b(?:logo|logos|seal|patch)\b|"
+    r"\b(?:left|right)\s+chest\b|\b(?:front|back|sleeve|sleeves)\b|"
+    r"\b(?:ink|thread)\s*(?:color|colour)?\b|\bheat\s*press\b|\bvinyl\b|"
+    r"\b(?:no|do\s+not|don't)\s+(?:emb|embroider|embroidery|decorate)\b|"
+    r"\bno\s+decoration\b|\bblank\s+garment\b|"
+    r"\b(?:change|switch|convert|replace|instead\s+of)\b|"
+    r"\b(?:EMB|embroider(?:y|ed|ing)?)\s+(?:everything|all(?:\s+(?:items?|garments?|products?))?)\b|"
+    r"\b(?:everything|all(?:\s+(?:items?|garments?|products?))?)\s+(?:is\s+|are\s+|to\s+be\s+)?(?:embroider(?:ed|y)?)\b"
+    r")"
+)
+
+
+def personalization_note_only(value: object) -> bool:
+    """Return True for name/personalization instructions that belong on reports.
+
+    Employee-name embroidery is operational work Orchid performs after purchasing.
+    It must remain visible on decoration reports without creating a Purchase Review
+    decision merely because the note contains EMB or embroidery wording.
+    """
+    note = extract_purchase_instructions(value)
+    return bool(
+        note
+        and _PERSONALIZATION_MARKER.search(note)
+        and not _PERSONALIZATION_PROCESS_OVERRIDE.search(note)
+    )
+
+
 def decoration_note_requires_review(value: object) -> bool:
     note = extract_purchase_instructions(value)
-    return bool(note and (_DECORATION_TRIGGER.search(note) or _DECORATION_INSTRUCTION_TRIGGER.search(note)))
+    if not note or personalization_note_only(note):
+        return False
+    return bool(_DECORATION_TRIGGER.search(note) or _DECORATION_INSTRUCTION_TRIGGER.search(note))
 
 
 def decision_note_requires_review(value: object) -> bool:
@@ -223,6 +313,7 @@ def decoration_target_styles(value: object) -> set[str]:
     patterns = (
         r"(?i)\b(?:style|item|product|sku)\s*#?\s*([A-Z0-9][A-Z0-9-]{1,19})\b",
         r"(?i)\b(?:name|logo|embroider|embroidery|emb|patch)\s+on\s+([A-Z0-9][A-Z0-9-]{1,19})\b",
+        r"(?i)\b(?:emb(?:roidery)?\s+notes?|notes?)\s+([A-Z]{1,8}\d[A-Z0-9-]{1,18}|\d{3,6})\b",
         r"(?i)\bon\s+([A-Z]{1,8}\d[A-Z0-9-]{1,18}|\d{3,6})\b",
     )
     for pattern in patterns:
@@ -320,6 +411,43 @@ def decoration_note_targets_line(value: object, line_text: object) -> bool:
         return True
     return _families_target_line(families, line_text)
 
+
+
+_ALTERATION_ONLY_TRIGGER = re.compile(r"(?i)\b(?:hem(?:med|ming)?|inseam|alter(?:ed|ing|ation|ations)?)\b")
+_PROCESS_CHANGE_TRIGGER = re.compile(
+    r"(?i)(?:\bscreen[- ]?print(?:ed|ing)?\b|"
+    r"\b(?:no|do\s+not|don't)\s+(?:emb|embroider|embroidery|decorate)\b|"
+    r"\bno\s+decoration\b|\bblank\s+garment\b|"
+    r"\b(?:change|switch|convert)\s+(?:the\s+)?(?:decoration|logo|item)?\s*(?:to|from)\b|"
+    r"\bembroider(?:ed|ing)?\s+(?:everything|all\s+(?:items?|garments?|products?))\b)"
+)
+
+
+def alteration_note_only(value: object) -> bool:
+    """True when a note is only a hemming/inseam operational instruction.
+
+    These notes belong on receiving and decoration reports, but they do not change
+    purchasing, decoration type, placement, or outsourcing and therefore never
+    require a Purchase Review decision.
+    """
+    note = extract_purchase_instructions(value)
+    if not note or not _ALTERATION_ONLY_TRIGGER.search(note):
+        return False
+    scrubbed = _ALTERATION_ONLY_TRIGGER.sub(" ", note)
+    scrubbed = re.sub(r"(?i)\b(?:jeans?|pants?|trousers?|shorts?|bibs?|overalls?|to|at|inch|inches)\b", " ", scrubbed)
+    scrubbed = re.sub(r"[0-9\"'xX\-.,:/ ]+", " ", scrubbed)
+    return not decoration_note_requires_review(scrubbed) and not decision_note_requires_review(scrubbed)
+
+
+def decoration_note_changes_process(value: object) -> bool:
+    """Return True only when wording changes the saved decoration process.
+
+    Logo names, thread colors, personalization, and placement notes are operational
+    instructions. They can flow to the decoration report without a Purchase Review
+    prompt when the item is already permanently routed to Orchid.
+    """
+    note = extract_purchase_instructions(value)
+    return bool(note and _PROCESS_CHANGE_TRIGGER.search(note))
 
 def note_requires_review(value: object) -> bool:
     note = extract_purchase_instructions(value)

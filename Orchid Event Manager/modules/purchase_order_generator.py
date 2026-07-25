@@ -12,6 +12,7 @@ from modules.purchase_rules import apply_purchase_rule_defaults, normalize_bool,
 
 from modules.shopify_parser import parse_shopify_orders
 from modules.routing_rules import apply_routing_overrides
+from modules.pdf_page_numbers import PageNumberCanvas
 
 try:
     from reportlab.lib import colors
@@ -82,7 +83,18 @@ SIZE_ORDER = [
 def clean_text(value) -> str:
     if pd.isna(value):
         return ""
-    return str(value).strip()
+    text = str(value)
+    # Normalize punctuation that may arrive from legacy Shopify/Excel exports
+    # as Windows-1252 control characters. ReportLab's default fonts cannot
+    # render those bytes and otherwise show a black replacement square.
+    replacements = {
+        "\x91": "'", "\x92": "'", "‘": "'", "’": "'",
+        "\x93": '"', "\x94": '"', "“": '"', "”": '"',
+        "–": "-", "—": "-", "…": "...", "\xa0": " ",
+    }
+    for source, replacement in replacements.items():
+        text = text.replace(source, replacement)
+    return text.strip()
 
 
 def normalize_style(value) -> str:
@@ -109,9 +121,14 @@ def identity_key(style, product, color) -> str:
 
 
 def normalize_size(value) -> str:
-    size = clean_text(value).upper().replace(" ", "")
+    raw = clean_text(value).upper()
+    size = re.sub(r"\s+", "", raw)
     if re.fullmatch(r"\d{2}[X/]\d{2}", size):
         return size.replace("/", "x").replace("X", "x")
+    tall_match = re.fullmatch(r"(L|XL|2X|2XL|3X|3XL|4X|4XL|5X|5XL|6X|6XL)(?:TALL|TL|T)", size)
+    if tall_match:
+        base = tall_match.group(1).replace("XL", "X")
+        return {"L": "LT", "X": "XLT", "2X": "2XLT", "3X": "3XLT", "4X": "4XLT", "5X": "5XLT", "6X": "6XLT"}.get(base, size)
     aliases = {
         "2X": "2XL",
         "XXL": "2XL",
@@ -120,7 +137,6 @@ def normalize_size(value) -> str:
         "4X": "4XL",
         "5X": "5XL",
         "6X": "6XL",
-        "ONE SIZE": "OSFA",
         "ONESIZE": "OSFA",
     }
     return aliases.get(size, size)
@@ -136,7 +152,13 @@ def size_sort_key(value) -> tuple[int, str]:
 
 
 def split_embedded_size(garment_color: str, size: str) -> tuple[str, str]:
-    """Recover sizes that were embedded at the start of the garment color."""
+    """Recover a clear size embedded in a manually entered color field.
+
+    Existing Size values remain authoritative. Recognized examples include
+    ``Portwest Size 38``, ``Black 2X Tall``, ``Navy XL``, and ``Khaki 38x32``.
+    Numeric values without a size label are accepted only as waist/inseam pairs,
+    preventing prices, quantities, and style numbers from being guessed as sizes.
+    """
     color = clean_text(garment_color)
     current_size = normalize_size(size)
     if current_size or not color:
@@ -149,11 +171,46 @@ def split_embedded_size(garment_color: str, size: str) -> tuple[str, str]:
         "XXL": "2XL", "3XL": "3XL", "3X": "3XL", "4XL": "4XL",
         "4X": "4XL", "5XL": "5XL", "5X": "5XL", "6XL": "6XL",
         "6X": "6XL", "OSFA": "OSFA", "ONE SIZE": "OSFA",
+        "LT": "LT", "L TALL": "LT", "L T": "LT",
+        "XLT": "XLT", "XL TALL": "XLT", "XL T": "XLT",
+        "2XLT": "2XLT", "2XL TALL": "2XLT", "2X TALL": "2XLT", "2XL T": "2XLT", "2X TL": "2XLT",
+        "3XLT": "3XLT", "3XL TALL": "3XLT", "3X TALL": "3XLT", "3XL T": "3XLT", "3X TL": "3XLT",
+        "4XLT": "4XLT", "4XL TALL": "4XLT", "4X TALL": "4XLT", "4XL T": "4XLT", "4X TL": "4XLT",
     }
-    upper = color.upper()
+
+    size_value = (
+        r"(?:\d{2}\s*[xX/]\s*\d{2}|\d{1,3}|XXS|XS|S|SMALL|M|MEDIUM|L|LARGE|"
+        r"XL|X-LARGE|2XL|2X|XXL|3XL|3X|XXXL|4XL|4X|5XL|5X|6XL|6X|"
+        r"LT|L\s+(?:TALL|TL|T)|XLT|XL\s+(?:TALL|TL|T)|2XLT|2XL?\s+(?:TALL|TL|T)|"
+        r"3XLT|3XL?\s+(?:TALL|TL|T)|4XLT|4XL?\s+(?:TALL|TL|T)|OSFA|ONE\s+SIZE)"
+    )
+    labelled = re.search(
+        rf"(?i)(?<![A-Za-z0-9])(?:SIZE|SZ)\s*[:#-]?\s*(?P<size>{size_value})(?![A-Za-z0-9])",
+        color,
+    )
+    if labelled:
+        normalized = normalize_size(labelled.group("size"))
+        remaining = (color[:labelled.start()] + " " + color[labelled.end():]).strip()
+        remaining = re.sub(r"\s{2,}", " ", remaining).strip(" -/:,|")
+        return remaining, normalized
+
+    # A waist/inseam pair is unambiguous even when it trails the color.
+    waist = re.search(r"(?i)(?<!\d)(?P<size>\d{2}\s*[xX/]\s*\d{2})(?!\d)\s*$", color)
+    if waist:
+        remaining = color[:waist.start()].strip(" -/:,|")
+        return remaining, normalize_size(waist.group("size"))
+
+    # Text sizes are safe at either edge. Sort longest first so "2X Tall" is
+    # captured before "2X".
     for token in sorted(token_map, key=len, reverse=True):
-        if upper == token or upper.startswith(token + " "):
-            remaining = color[len(token):].strip(" -/")
+        escaped = re.escape(token).replace(r"\ ", r"\s+")
+        leading = re.match(rf"(?i)^({escaped})(?:\s+|$)", color)
+        if leading:
+            remaining = color[leading.end():].strip(" -/:,|")
+            return remaining, token_map[token]
+        trailing = re.search(rf"(?i)(?:^|\s)({escaped})$", color)
+        if trailing:
+            remaining = color[:trailing.start()].strip(" -/:,|")
             return remaining, token_map[token]
     return color, current_size
 
@@ -215,6 +272,15 @@ def build_purchase_order_data(
     )
     corrected.columns = ["Garment Color", "Size"]
     merged[["Garment Color", "Size"]] = corrected
+    vendor_only = merged.apply(
+        lambda row: bool(
+            clean_text(row.get("Garment Color", ""))
+            and clean_text(row.get("Garment Color", "")).casefold()
+            == clean_text(row.get("Vendor", "")).casefold()
+        ),
+        axis=1,
+    )
+    merged.loc[vendor_only, "Garment Color"] = ""
     merged["Quantity"] = pd.to_numeric(
         merged["Quantity"], errors="coerce"
     ).fillna(0).astype(int)
@@ -606,15 +672,19 @@ def _build_pdf(
     ]))
     story.append(notes)
 
-    def add_page_number(canvas, doc_obj):
+    def add_page_footer(canvas, doc_obj):
         canvas.saveState()
         canvas.setFont("Helvetica", 7.5)
         canvas.setFillColor(MUTED)
         canvas.drawString(0.45 * inch, 0.22 * inch, f"Orchid Uniforms & Apparel - {po_number}")
-        canvas.drawRightString(10.55 * inch, 0.22 * inch, f"Page {doc_obj.page}")
         canvas.restoreState()
 
-    doc.build(story, onFirstPage=add_page_number, onLaterPages=add_page_number)
+    doc.build(
+        story,
+        onFirstPage=add_page_footer,
+        onLaterPages=add_page_footer,
+        canvasmaker=PageNumberCanvas,
+    )
 
 
 def generate_purchase_orders(

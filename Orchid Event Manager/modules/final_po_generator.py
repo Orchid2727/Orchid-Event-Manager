@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
+import json
+import shutil
 import sys
 
 import pandas as pd
+from PIL import Image as PILImage
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import landscape, letter
@@ -17,7 +21,7 @@ from reportlab.platypus import (
 )
 from reportlab.graphics.shapes import Drawing, Rect
 
-from modules.purchase_order_generator import clean_text, normalize_size, safe_filename, size_sort_key
+from modules.purchase_order_generator import clean_text, normalize_size, safe_filename, size_sort_key, split_embedded_size
 from modules.blank_garment_rules import BLANK_DECORATION_LABEL, is_blank_decoration
 from modules.decoration_locations import (
     LEFT_CHEST,
@@ -38,10 +42,15 @@ from modules.note_rules import (
 )
 from modules.employee_totals import load_employee_totals, employee_totals_summary
 from modules.internal_services import (
-    is_in_house_decoration, is_in_house_service_product, vendor_po_decoration_type,
+    is_in_house_decoration, is_in_house_service_product, is_internal_service_style,
+    vendor_po_decoration_type,
 )
 from modules.decoration_fulfillment import is_entire_order_outsourced, is_outsourced_decoration
 from modules.outsource_rules import vendor_never_outsource
+from modules.product_resolver import resolve_product
+from modules.pdf_page_numbers import PageNumberCanvas
+from modules.job_logo_image import remove_outer_near_white_background
+from modules.packet_lock import copy_lock_bundle, sha256_file, verify_packet_lock
 
 PURPLE = colors.HexColor("#5B2AA8")
 PURPLE_DARK = colors.HexColor("#3D176F")
@@ -75,6 +84,76 @@ def _official_logo_flowable(max_width: float = 1.45 * inch, max_height: float = 
     except Exception:
         return Spacer(1, 1)
 
+
+def _job_logo_flowable(path: Path, max_width: float, max_height: float):
+    """Return a PDF logo with blank source-canvas padding removed when safe.
+
+    Customer artwork commonly arrives as a logo centered in a much larger white
+    or transparent canvas.  The source file must remain untouched, but using
+    that empty canvas for PDF sizing makes the visible mark look too small.
+    This prepares an in-memory PNG only for the report and falls back to the
+    original image if Pillow cannot safely process it.
+    """
+    source_path = Path(path)
+    try:
+        with PILImage.open(source_path) as source:
+            image = source.convert("RGBA")
+            image, _removed_white_canvas = remove_outer_near_white_background(image)
+            width, height = image.size
+            full_area = max(width * height, 1)
+            boxes = []
+
+            # Transparent outer padding is the most reliable crop boundary.
+            alpha_box = image.getchannel("A").getbbox()
+            if alpha_box:
+                alpha_area = max((alpha_box[2] - alpha_box[0]) * (alpha_box[3] - alpha_box[1]), 0)
+                if alpha_area < full_area * 0.98:
+                    boxes.append(alpha_box)
+
+            # Also support opaque files with a white (or nearly white) canvas.
+            # The threshold leaves light logo colors alone while ignoring the
+            # white export margin around a typical embroidery or screen-print
+            # design file.
+            white_background = PILImage.new("RGBA", image.size, (255, 255, 255, 255))
+            flattened = PILImage.alpha_composite(white_background, image).convert("L")
+            ink_mask = flattened.point(lambda value: 255 if value < 245 else 0)
+            ink_box = ink_mask.getbbox()
+            if ink_box:
+                ink_area = max((ink_box[2] - ink_box[0]) * (ink_box[3] - ink_box[1]), 0)
+                if ink_area < full_area * 0.98:
+                    boxes.append(ink_box)
+
+            if boxes:
+                left = min(box[0] for box in boxes)
+                top = min(box[1] for box in boxes)
+                right = max(box[2] for box in boxes)
+                bottom = max(box[3] for box in boxes)
+                padding = max(2, round(max(width, height) * 0.035))
+                crop_box = (
+                    max(0, left - padding), max(0, top - padding),
+                    min(width, right + padding), min(height, bottom + padding),
+                )
+                crop_area = max((crop_box[2] - crop_box[0]) * (crop_box[3] - crop_box[1]), 0)
+                if crop_area < full_area * 0.98:
+                    image = image.crop(crop_box)
+
+            buffer = BytesIO()
+            image.save(buffer, format="PNG")
+            buffer.seek(0)
+            logo = Image(buffer)
+            # ReportLab reads the stream later while building the document.
+            # Retain it on the flowable for that entire build.
+            logo._orchid_job_logo_buffer = buffer
+    except Exception:
+        logo = Image(str(source_path))
+
+    width, height = float(logo.imageWidth), float(logo.imageHeight)
+    scale = min(max_width / width, max_height / height)
+    logo.drawWidth = width * scale
+    logo.drawHeight = height * scale
+    logo.hAlign = "CENTER"
+    return logo
+
 def _event_logo_path(workbook_path: Path, event_name: str = "") -> Path | None:
     """Find an event-specific outsourced job logo stored beside the workbook."""
     stem = Path(workbook_path).stem
@@ -90,6 +169,8 @@ def _event_logo_path(workbook_path: Path, event_name: str = "") -> Path | None:
     return None
 
 DETAIL_COLUMNS = [
+    "Source ID", "Line ID", "Original Quantity", "Original Order Number", "Original Company",
+    "Original Employee Name", "Quantity Override Confirmed",
     "Vendor", "Decoration Type", "Decoration Location", "Decoration Placement Instructions", "Decoration Color", "Style Number",
     "Product Name", "Garment Color", "Size", "Quantity", "Company",
     "Employee Name", "Order Number", "Purchase Instructions",
@@ -164,8 +245,45 @@ def _do_not_outsource(value: object) -> bool:
     return clean_text(value).casefold() in {"yes", "y", "true", "1"}
 
 
+def _master_requires_never_outsource(
+    master: pd.DataFrame | None,
+    style: object,
+    product: object,
+    garment_color: object,
+) -> bool:
+    """Return the live Product Master routing decision for one garment.
+
+    A reopened archive keeps its historical review workbook so users can add a
+    logo or regenerate reports without rebuilding the order.  The workbook's
+    saved routing value can therefore be older than the Product Master.  Final
+    reports must still honor a current *Never Outsource* selection, so consult
+    the live Master at report-generation time without modifying the archive.
+    """
+    if master is None or master.empty:
+        return False
+    try:
+        resolution = resolve_product(
+            style,
+            product,
+            garment_color,
+            master,
+            master_prepared=True,
+        )
+    except Exception:
+        # A malformed or unavailable live Master must not prevent a user from
+        # opening an older archive; retain its saved routing in that rare case.
+        return False
+    return bool(resolution.matched and resolution.never_outsource)
+
+
 def _prepare_lines(workbook_path: Path, decoration_fulfillment: str = ""):
     records = load_review_lines(workbook_path)
+    # Final reports must be reproducible from the reviewed workbook. Never
+    # silently reread a different live Product Master here: doing so can reroute
+    # a completed order after Purchase Review. Active events already regenerate
+    # the review when Product Master changes; archived packets retain their
+    # frozen, reviewed Do Not Outsource decisions.
+    live_master = pd.DataFrame()
     ready_rows = []
     review_rows = []
     non_included_rows = []
@@ -174,10 +292,6 @@ def _prepare_lines(workbook_path: Path, decoration_fulfillment: str = ""):
         if not _yes(record.get("Include", "")):
             continue
         vendor = clean_text(record.get("Purchase Vendor", ""))
-        do_not_outsource = (
-            _do_not_outsource(record.get("Do Not Outsource", "No"))
-            or (is_entire_order_outsourced(decoration_fulfillment) and vendor_never_outsource(vendor))
-        )
         original_deco_type = clean_text(record.get("Decoration Type", ""))
         original_deco_location = clean_text(record.get("Decoration Location", ""))
         original_placement = clean_text(record.get("Decoration Placement Instructions", ""))
@@ -189,7 +303,20 @@ def _prepare_lines(workbook_path: Path, decoration_fulfillment: str = ""):
         style = clean_text(record.get("Product #", ""))
         product = clean_text(record.get("Description", ""))
         original_line = clean_text(record.get("Original Shopify Line", ""))
-        if is_in_house_service_product(product, original_line, deco_type):
+        garment_color = clean_text(record.get("Garment Color", record.get("Color", "")))
+        do_not_outsource = (
+            _do_not_outsource(record.get("Do Not Outsource", "No"))
+            # Product-level routing in the live Master overrides a stale value
+            # saved inside an archived review workbook.
+            or _master_requires_never_outsource(live_master, style, product, garment_color)
+            # Vendor-level Never Outsource defaults are meaningful in both
+            # workflows. A Berne screen-print line, for example, must stay at
+            # Orchid even when the event otherwise uses standard routing.
+            or vendor_never_outsource(vendor)
+        )
+        if is_internal_service_style(style) or is_in_house_service_product(
+            product, original_line, deco_type, style_number=style, garment_color=garment_color
+        ):
             # Service-only fees are internal Orchid work and never belong on a
             # garment vendor purchase order or manual garment purchase list.
             continue
@@ -200,8 +327,7 @@ def _prepare_lines(workbook_path: Path, decoration_fulfillment: str = ""):
             deco_location_raw = ""
             placement_instructions = ""
             deco_color = ""
-        garment_color = clean_text(record.get("Garment Color", record.get("Color", "")))
-        size = normalize_size(record.get("Size", ""))
+        garment_color, size = split_embedded_size(garment_color, record.get("Size", ""))
         qty = _quantity(record.get("Quantity", 0))
         rules = row_rules({
             "Product Name": product,
@@ -241,6 +367,13 @@ def _prepare_lines(workbook_path: Path, decoration_fulfillment: str = ""):
             reasons.append("Quantity must be greater than zero")
 
         row = {
+            "Source ID": clean_text(record.get("Source ID", "")),
+            "Line ID": clean_text(record.get("Line ID", "")),
+            "Original Quantity": _quantity(record.get("Original Quantity", record.get("Quantity", 0))),
+            "Original Order Number": clean_text(record.get("Original Order Number", record.get("Order Number", ""))),
+            "Original Company": clean_text(record.get("Original Company", record.get("Company", ""))),
+            "Original Employee Name": clean_text(record.get("Original Employee Name", record.get("Employee Name", ""))),
+            "Quantity Override Confirmed": clean_text(record.get("Quantity Override Confirmed", "No")) or "No",
             "Vendor": vendor,
             "Decoration Type": deco_type,
             "Decoration Location": deco_location,
@@ -303,6 +436,119 @@ def _prepare_lines(workbook_path: Path, decoration_fulfillment: str = ""):
 
 
 
+def _output_identity(row: dict | pd.Series) -> str:
+    source_id = clean_text(row.get("Source ID", ""))
+    if source_id:
+        return source_id
+    line_id = clean_text(row.get("Line ID", ""))
+    return f"LEGACY-LINE:{line_id}" if line_id else ""
+
+
+def _validate_final_output_integrity(
+    records: list[dict[str, object]],
+    ready: pd.DataFrame,
+    review: pd.DataFrame,
+    non_included: pd.DataFrame,
+) -> dict[str, int]:
+    """Block report generation when a garment cannot be traced exactly once.
+
+    This guard runs before any vendor or Non-Included PDF is written.  It proves
+    that every included garment source line appears in exactly one output route,
+    that Source IDs are unique, and that quantity/customer identity was not
+    silently changed. A deliberate quantity edit is allowed only when the app
+    recorded Quantity Override Confirmed.
+    """
+    expected: dict[str, dict[str, object]] = {}
+    errors: list[str] = []
+    for record in records:
+        if not _yes(record.get("Include", "")):
+            continue
+        style = clean_text(record.get("Product #", ""))
+        product = clean_text(record.get("Description", ""))
+        original_line = clean_text(record.get("Original Shopify Line", ""))
+        deco_type = clean_text(record.get("Decoration Type", ""))
+        garment_color = clean_text(record.get("Garment Color", ""))
+        if is_internal_service_style(style) or is_in_house_service_product(
+            product, original_line, deco_type, style_number=style, garment_color=garment_color
+        ):
+            continue
+        identity = _output_identity(record)
+        if not identity:
+            errors.append(f"A garment line has no Source ID or Line ID: {style or product or 'unknown product'}")
+            continue
+        if identity in expected:
+            errors.append(f"Duplicate source identity in Purchase Review: {identity}")
+            continue
+        expected[identity] = record
+
+        source_id = clean_text(record.get("Source ID", ""))
+        if source_id:
+            comparisons = (
+                ("order number", record.get("Original Order Number", ""), record.get("Order Number", "")),
+                ("company", record.get("Original Company", ""), record.get("Company", "")),
+                ("employee", record.get("Original Employee Name", ""), record.get("Employee Name", "")),
+            )
+            for label, original, current in comparisons:
+                original_text = clean_text(original)
+                current_text = clean_text(current)
+                if original_text and original_text != current_text:
+                    errors.append(f"{identity}: {label} no longer matches its imported Shopify source.")
+            original_qty = _quantity(record.get("Original Quantity", 0))
+            current_qty = _quantity(record.get("Quantity", 0))
+            confirmed = _yes(record.get("Quantity Override Confirmed", "No"))
+            if original_qty > 0 and current_qty != original_qty and not confirmed:
+                errors.append(
+                    f"{identity}: quantity changed from {original_qty} to {current_qty} without an explicit override."
+                )
+
+    routed: dict[str, str] = {}
+    routed_qty: dict[str, int] = {}
+    for route_name, frame in (("Vendor Purchase Order", ready), ("Purchase Review", review), ("Non-Included", non_included)):
+        if frame.empty:
+            continue
+        for _, row in frame.iterrows():
+            identity = _output_identity(row)
+            if not identity:
+                errors.append(f"{route_name} contains a line without a source identity.")
+                continue
+            if identity in routed:
+                errors.append(f"{identity} appears in both {routed[identity]} and {route_name}.")
+                continue
+            routed[identity] = route_name
+            routed_qty[identity] = _quantity(row.get("Quantity", 0))
+
+    missing = sorted(set(expected) - set(routed))
+    unexpected = sorted(set(routed) - set(expected))
+    if missing:
+        errors.append(f"{len(missing)} included garment line(s) are missing from every purchasing output.")
+    if unexpected:
+        errors.append(f"{len(unexpected)} purchasing output line(s) do not belong to an included garment source.")
+    for identity in sorted(set(expected) & set(routed)):
+        current_qty = _quantity(expected[identity].get("Quantity", 0))
+        if routed_qty.get(identity, 0) != current_qty:
+            errors.append(
+                f"{identity}: output quantity {routed_qty.get(identity, 0)} does not match review quantity {current_qty}."
+            )
+
+    if errors:
+        preview = "\n".join(f"- {message}" for message in errors[:12])
+        if len(errors) > 12:
+            preview += f"\n- Plus {len(errors) - 12} additional integrity error(s)."
+        raise RuntimeError(
+            "Purchase-order integrity check failed. No PDFs were created.\n\n" + preview
+        )
+
+
+    return {
+        "source_lines": len(expected),
+        "vendor_lines": len(ready),
+        "review_lines": len(review),
+        "non_included_lines": len(non_included),
+        "vendor_quantity": int(ready["Quantity"].sum()) if not ready.empty else 0,
+        "non_included_quantity": int(non_included["Quantity"].sum()) if not non_included.empty else 0,
+    }
+
+
 def _money(value: object) -> float:
     try:
         if value is None or value == "":
@@ -358,10 +604,82 @@ def _build_employee_totals_pdf(records: list[dict], pdf_path: Path, event_name: 
         ("SPAN", (0,-1), (3,-1)),
     ]))
     story.append(table)
-    doc.build(story)
+    doc.build(story, canvasmaker=PageNumberCanvas)
 
 
-def _build_event_summary_pdf(records: list[dict], ready: pd.DataFrame, pdf_path: Path, event_name: str) -> None:
+def _event_summary_vendor_counts(
+    group: pd.DataFrame,
+    decoration_fulfillment: str,
+) -> tuple[int, int, int, int]:
+    """Return mutually exclusive physical-garment counts for Event Summary.
+
+    Every garment belongs in exactly one operational category: Blank / No
+    Decoration, Embroidery In House, Outsourced Embroidery, or Outsourced
+    Screen Printing.  The two outsourced categories use the same final
+    per-line routing rule as the Outsourced Decoration Job Report, including
+    Product Master Never Outsource exceptions.
+    """
+    blank_garments = 0
+    embroidery_in_house = 0
+    outsourced_embroidery = 0
+    outsourced_screen_printing = 0
+
+    for _, row in group.iterrows():
+        decoration_type = (
+            clean_text(row.get("Operational Decoration Type", ""))
+            or clean_text(row.get("Decoration Type", ""))
+        )
+        decoration_key = decoration_type.casefold()
+        quantity = _quantity(row.get("Quantity", 0))
+        if quantity <= 0:
+            continue
+        if not decoration_key or is_blank_decoration(decoration_type):
+            blank_garments += quantity
+            continue
+
+        # Product Master uses the normal label "Embroidery".  Match the shared
+        # "embroid" root so that label and variations such as "Embroidered"
+        # are all classified consistently.
+        is_embroidery = "embroid" in decoration_key
+        is_screen_printing = "screen" in decoration_key
+        outsourced = is_outsourced_decoration(
+            decoration_type,
+            decoration_fulfillment,
+            do_not_outsource=_do_not_outsource(row.get("Do Not Outsource", "No")),
+        )
+        if is_embroidery:
+            if outsourced:
+                outsourced_embroidery += quantity
+            else:
+                embroidery_in_house += quantity
+        elif is_screen_printing:
+            if outsourced:
+                outsourced_screen_printing += quantity
+            else:
+                # A rare screen-printing line marked Never Outsource does not
+                # create work for the outside decorator.  Keep the summary
+                # concise by treating it as Blank / No Decoration for this
+                # scheduling view, as requested by Orchid.
+                blank_garments += quantity
+        else:
+            # A non-embroidery/non-screen service does not require an outside
+            # decoration schedule, so it belongs in Blank / No Decoration.
+            blank_garments += quantity
+    return (
+        blank_garments,
+        embroidery_in_house,
+        outsourced_embroidery,
+        outsourced_screen_printing,
+    )
+
+
+def _build_event_summary_pdf(
+    records: list[dict],
+    ready: pd.DataFrame,
+    pdf_path: Path,
+    event_name: str,
+    decoration_fulfillment: str = "",
+) -> None:
     summary = employee_totals_summary(records)
     doc = SimpleDocTemplate(
         str(pdf_path), pagesize=letter, rightMargin=0.55*inch, leftMargin=0.55*inch,
@@ -373,12 +691,31 @@ def _build_event_summary_pdf(records: list[dict], ready: pd.DataFrame, pdf_path:
     section = ParagraphStyle("EvtSection", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=12, leading=14, textColor=PURPLE_DARK)
     body = ParagraphStyle("EvtBody", parent=styles["Normal"], fontSize=9, leading=11, textColor=TEXT)
     body_right = ParagraphStyle("EvtRight", parent=body, alignment=TA_RIGHT)
-    header = ParagraphStyle("EvtHeader", parent=body, fontName="Helvetica-Bold", textColor=colors.white)
+    header = ParagraphStyle("EvtHeader", parent=body, fontName="Helvetica-Bold", fontSize=7.6, leading=8.8, textColor=colors.white)
+    column_header = ParagraphStyle(
+        "EvtColumnHeader", parent=header, fontSize=7.25, leading=8.5, alignment=TA_CENTER,
+    )
+    overview_header = ParagraphStyle(
+        "EvtOverviewHeader", parent=header, fontSize=8.6, leading=10,
+        alignment=TA_CENTER,
+    )
+    overview_value = ParagraphStyle(
+        "EvtOverviewValue", parent=body, fontName="Helvetica-Bold", fontSize=19,
+        leading=22, textColor=PURPLE_DARK, alignment=TA_CENTER,
+    )
+    schedule_note = ParagraphStyle(
+        "EvtScheduleNote", parent=body, fontSize=8.4, leading=10, textColor=MUTED, alignment=TA_CENTER,
+    )
     story = [_paragraph("EVENT SUMMARY", title), _paragraph(event_name or "Uniform Sizing Event", body), Spacer(1, 10)]
     overview = Table([
-        [_paragraph("NUMBER OF EMPLOYEES", header), _paragraph("FINAL TOTAL AFTER DISCOUNTS", header)],
-        [_paragraph(str(int(summary["employee_count"])), ParagraphStyle("BigCount", parent=body, fontName="Helvetica-Bold", fontSize=17, alignment=TA_RIGHT, textColor=PURPLE_DARK)),
-         _paragraph(f"${float(summary['grand_total']):,.2f}", ParagraphStyle("BigMoney", parent=body, fontName="Helvetica-Bold", fontSize=17, alignment=TA_RIGHT, textColor=PURPLE_DARK))],
+        [
+            _paragraph("NUMBER OF EMPLOYEES", overview_header),
+            _paragraph("FINAL TOTAL AFTER DISCOUNTS", overview_header),
+        ],
+        [
+            _paragraph(str(int(summary["employee_count"])), overview_value),
+            _paragraph(f"${float(summary['grand_total']):,.2f}", overview_value),
+        ],
     ], colWidths=[3.2*inch, 3.7*inch])
     overview.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), PURPLE), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
@@ -386,26 +723,104 @@ def _build_event_summary_pdf(records: list[dict], ready: pd.DataFrame, pdf_path:
         ("INNERGRID", (0,0), (-1,-1), 0.4, BORDER), ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
         ("ALIGN", (0,0), (-1,-1), "CENTER"), ("TOPPADDING", (0,0), (-1,-1), 8), ("BOTTOMPADDING", (0,0), (-1,-1), 8),
     ]))
-    story += [overview, Spacer(1, 14), _paragraph("Vendor Summary & Decoration Workload", section), Spacer(1, 5)]
-    vendor_rows = [[_paragraph("Vendor", header), _paragraph("Total Garments", header), _paragraph("Embroidery", header), _paragraph("Screen Printing", header)]]
+    if ready.empty:
+        outsourced_embroidery_total = 0
+        outsourced_screen_printing_total = 0
+    else:
+        outsourced_embroidery_total = 0
+        outsourced_screen_printing_total = 0
+        for _, group in ready.groupby("Vendor", sort=False):
+            _, _, outsourced_embroidery, outsourced_screen_printing = _event_summary_vendor_counts(
+                group, decoration_fulfillment
+            )
+            outsourced_embroidery_total += outsourced_embroidery
+            outsourced_screen_printing_total += outsourced_screen_printing
+    total_outsourced = outsourced_embroidery_total + outsourced_screen_printing_total
+    outsourced_header = ParagraphStyle(
+        "EvtOutsourcedHeader", parent=body, fontName="Helvetica-Bold", fontSize=8.6,
+        leading=10, textColor=colors.white, alignment=TA_CENTER,
+    )
+    outsourced_value = ParagraphStyle(
+        "EvtOutsourcedValue", parent=body, fontName="Helvetica-Bold", fontSize=19,
+        leading=22, textColor=PURPLE_DARK, alignment=TA_CENTER,
+    )
+    outsourced_table = Table([
+        [
+            _paragraph("OUTSOURCED EMBROIDERY PIECES", outsourced_header),
+            _paragraph("OUTSOURCED SCREEN-PRINTING PIECES", outsourced_header),
+            _paragraph("TOTAL OUTSOURCED PIECES", outsourced_header),
+        ],
+        [
+            _paragraph(str(outsourced_embroidery_total), outsourced_value),
+            _paragraph(str(outsourced_screen_printing_total), outsourced_value),
+            _paragraph(str(total_outsourced), outsourced_value),
+        ],
+    ], colWidths=[2.3 * inch, 2.3 * inch, 2.3 * inch])
+    outsourced_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), PURPLE),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("BACKGROUND", (0, 1), (-1, 1), PURPLE_LIGHT),
+        ("BOX", (0, 0), (-1, -1), 0.8, BORDER),
+        ("INNERGRID", (0, 0), (-1, -1), 0.4, BORDER),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story += [
+        overview,
+        Spacer(1, 13),
+        _paragraph("OUTSOURCED DECORATION - SCHEDULING TOTALS", section),
+        Spacer(1, 2),
+        _paragraph("Give these two quantities to your outside decorator before purchase orders are placed.", schedule_note),
+        Spacer(1, 6),
+        outsourced_table,
+        Spacer(1, 6),
+        _paragraph(
+            "These counts match the Outsourced Decoration Job Report. Product Master Never Outsource items are excluded.", schedule_note,
+        ),
+        Spacer(1, 12),
+        _paragraph("VENDOR GARMENT BREAKDOWN", section),
+        Spacer(1, 5),
+    ]
+    vendor_rows = [[
+        _paragraph("Vendor", column_header),
+        _paragraph("Total Garments", column_header),
+        _paragraph("Embroidery In House", column_header),
+        _paragraph("Blank / No Decoration", column_header),
+        _paragraph("Outsourced Screen Printing", column_header),
+        _paragraph("Outsourced Embroidery", column_header),
+    ]]
     if ready.empty:
         grouped=[]
     else:
         grouped=[]
         for vendor, group in ready.groupby("Vendor", sort=True):
-            embroidery = int(group.loc[group["Decoration Type"].map(clean_text).str.casefold().eq("embroidery"), "Quantity"].sum())
-            screen = int(group.loc[group["Decoration Type"].map(clean_text).str.casefold().str.contains("screen"), "Quantity"].sum())
+            blank, embroidery_in_house, outsourced_embroidery, outsourced_screen_printing = _event_summary_vendor_counts(
+                group, decoration_fulfillment
+            )
             total = int(group["Quantity"].sum())
-            grouped.append((clean_text(vendor), total, embroidery, screen))
-    for vendor, total, embroidery, screen in grouped:
-        vendor_rows.append([_paragraph(vendor, body), _paragraph(str(total), body_right), _paragraph(str(embroidery), body_right), _paragraph(str(screen), body_right)])
+            grouped.append((
+                clean_text(vendor), total, embroidery_in_house, blank,
+                outsourced_screen_printing, outsourced_embroidery,
+            ))
+    for vendor, total, embroidery_in_house, blank, outsourced_screen_printing, outsourced_embroidery in grouped:
+        vendor_rows.append([
+            _paragraph(vendor, body),
+            _paragraph(str(total), body_right),
+            _paragraph(str(embroidery_in_house), body_right),
+            _paragraph(str(blank), body_right),
+            _paragraph(str(outsourced_screen_printing), body_right),
+            _paragraph(str(outsourced_embroidery), body_right),
+        ])
     vendor_rows.append([
         _paragraph("TOTAL", header),
         _paragraph(str(sum(row[1] for row in grouped)), ParagraphStyle("Tot1", parent=header, alignment=TA_RIGHT)),
         _paragraph(str(sum(row[2] for row in grouped)), ParagraphStyle("Tot2", parent=header, alignment=TA_RIGHT)),
         _paragraph(str(sum(row[3] for row in grouped)), ParagraphStyle("Tot3", parent=header, alignment=TA_RIGHT)),
+        _paragraph(str(sum(row[4] for row in grouped)), ParagraphStyle("Tot4", parent=header, alignment=TA_RIGHT)),
+        _paragraph(str(sum(row[5] for row in grouped)), ParagraphStyle("Tot5", parent=header, alignment=TA_RIGHT)),
     ])
-    table = Table(vendor_rows, colWidths=[2.7*inch, 1.35*inch, 1.35*inch, 1.5*inch], repeatRows=1)
+    table = Table(vendor_rows, colWidths=[2.10*inch, 0.75*inch, 0.95*inch, 1.00*inch, 1.20*inch, 1.15*inch], repeatRows=1)
     table.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), PURPLE), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
         ("ROWBACKGROUNDS", (0,1), (-1,-2), [colors.white, ROW_ALT]),
@@ -413,11 +828,20 @@ def _build_event_summary_pdf(records: list[dict], ready: pd.DataFrame, pdf_path:
         ("BOX", (0,0), (-1,-1), 0.7, BORDER), ("INNERGRID", (0,0), (-1,-1), 0.3, BORDER),
         ("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("ALIGN", (1,1), (-1,-1), "RIGHT"),
         ("LEFTPADDING", (0,0), (-1,-1), 6), ("RIGHTPADDING", (0,0), (-1,-1), 6),
-        ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+        ("TOPPADDING", (0,0), (-1,0), 7), ("BOTTOMPADDING", (0,0), (-1,0), 7),
+        ("TOPPADDING", (0,1), (-1,-1), 5), ("BOTTOMPADDING", (0,1), (-1,-1), 5),
     ]))
     story.append(table)
-    story += [Spacer(1, 10), _paragraph("Blank garments are included in vendor purchase orders but intentionally excluded from the decoration workload counts.", body)]
-    doc.build(story)
+    story += [
+        Spacer(1, 7),
+        _paragraph(
+            "Every garment is counted exactly once: Total Garments = Embroidery In House + Blank / No Decoration + "
+            "Outsourced Screen Printing + Outsourced Embroidery. The two outsourced columns match the Outsourced "
+            "Decoration Job Report.",
+            body,
+        ),
+    ]
+    doc.build(story, canvasmaker=PageNumberCanvas)
 
 def _paragraph(value, style):
     text = clean_text(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -669,7 +1093,7 @@ def _build_pdf(
         canvas.setFont("Helvetica", 7.5)
         canvas.setFillColor(MUTED)
         canvas.drawString(left_margin, 0.20 * inch, f"Orchid Uniforms & Apparel  |  {vendor}  |  {section_label}")
-        canvas.drawRightString(page_width - right_margin, 0.20 * inch, f"PO {po_number}  |  Page {doc_obj.page}")
+        canvas.drawRightString(page_width - right_margin, 0.20 * inch, f"PO {po_number}")
         canvas.restoreState()
 
     doc = BaseDocTemplate(
@@ -782,7 +1206,7 @@ def _build_pdf(
     ]))
     story.append(summary)
 
-    doc.build(story)
+    doc.build(story, canvasmaker=PageNumberCanvas)
 
 
 def _build_non_included_items_pdf(detail: pd.DataFrame, pdf_path: Path, event_name: str) -> None:
@@ -852,7 +1276,7 @@ def _build_non_included_items_pdf(detail: pd.DataFrame, pdf_path: Path, event_na
         story.append(vendor_total)
         story.append(Spacer(1, 10))
 
-    doc.build(story)
+    doc.build(story, canvasmaker=PageNumberCanvas)
 
 
 
@@ -962,6 +1386,7 @@ def _line_context(row: pd.Series) -> str:
     return " ".join(filter(None, [
         clean_text(row.get("Style Number", "")),
         clean_text(row.get("Product Name", "")),
+        clean_text(row.get("Product Aliases", "")),
         clean_text(row.get("Garment Color", "")),
         clean_text(row.get("Size", "")),
     ]))
@@ -1234,7 +1659,7 @@ def _build_in_house_receiving_report(
         story.append(table)
         story.append(Spacer(1, 9))
 
-    doc.build(story)
+    doc.build(story, canvasmaker=PageNumberCanvas)
 
 
 def _build_outsourced_decoration_report(
@@ -1243,6 +1668,7 @@ def _build_outsourced_decoration_report(
     event_name: str,
     fulfillment_mode: str,
     job_logo_path: Path | None = None,
+    outsourced_job_name: str = "",
 ) -> None:
     doc = SimpleDocTemplate(
         str(pdf_path), pagesize=landscape(letter), rightMargin=0.34 * inch,
@@ -1251,13 +1677,22 @@ def _build_outsourced_decoration_report(
         author="Orchid Uniforms & Apparel",
     )
     styles = getSampleStyleSheet()
-    title = ParagraphStyle(
-        "OutTitle", parent=styles["Title"], fontName="Helvetica-Bold",
-        fontSize=19, leading=22, textColor=PURPLE_DARK, alignment=TA_CENTER,
+    # The outsourced decoration report is a production packet. Keep Orchid's
+    # own identity compact in the left corner, reserve the middle for the job
+    # name and customer/job logo, and keep the outside-decorator destination
+    # directly under Orchid's logo.
+    job_name_style = ParagraphStyle(
+        "OutJobName", parent=styles["Title"], fontName="Helvetica-Bold",
+        fontSize=22, leading=25, textColor=PURPLE_DARK, alignment=TA_CENTER,
+        spaceAfter=2,
     )
-    subtitle = ParagraphStyle(
-        "OutSub", parent=styles["Normal"], fontName="Helvetica-Bold",
-        fontSize=9.4, leading=11.6, textColor=PURPLE, alignment=TA_CENTER,
+    outsource_label_style = ParagraphStyle(
+        "OutsourceLabel", parent=styles["Normal"], fontName="Helvetica-Bold",
+        fontSize=8.6, leading=10.5, textColor=MUTED, alignment=TA_LEFT,
+    )
+    outsource_vendor_style = ParagraphStyle(
+        "OutsourceVendor", parent=styles["Normal"], fontName="Helvetica-Bold",
+        fontSize=11.5, leading=13.9, textColor=PURPLE_DARK, alignment=TA_LEFT,
     )
     note = ParagraphStyle(
         "OutNote", parent=styles["Normal"], fontSize=8.0, leading=9.8,
@@ -1279,22 +1714,50 @@ def _build_outsourced_decoration_report(
         "OutQty", parent=body_style, fontName="Helvetica-Bold", alignment=TA_CENTER,
     )
 
-    context = event_name or "Current Purchase Packet"
-    story = [
-        _official_logo_flowable(), Spacer(1, 3),
-        _paragraph("OUTSOURCED DECORATION JOB REPORT", title),
-        _paragraph("Outsourced to Stitch N Print", subtitle),
-        _paragraph(context, subtitle),
+    # The manually entered job/logo name is the production name recognized by
+    # the outside decorator (for example, “Utilities Department”).  Keep the
+    # event/order name as a sensible fallback for older packets.
+    context = clean_text(outsourced_job_name) or event_name or "Current Purchase Packet"
+    # Enlarge the compact Orchid routing block by 20% while retaining its
+    # supporting role at the left edge of the production header.
+    orchid_logo = _official_logo_flowable(max_width=1.39 * inch, max_height=0.60 * inch)
+    try:
+        orchid_logo.hAlign = "LEFT"
+    except Exception:
+        pass
+    left_header = [
+        orchid_logo,
+        Spacer(1, 5),
+        _paragraph("OUTSOURCED TO:", outsource_label_style),
+        _paragraph("Stitch N Print", outsource_vendor_style),
+    ]
+    center_header = [
+        _paragraph(context, job_name_style),
+        Spacer(1, 11),
     ]
     if job_logo_path and Path(job_logo_path).exists():
         try:
-            logo = Image(str(job_logo_path))
-            w, h = float(logo.imageWidth), float(logo.imageHeight)
-            scale = min((2.0*inch)/w, (0.9*inch)/h)
-            logo.drawWidth, logo.drawHeight, logo.hAlign = w*scale, h*scale, "CENTER"
-            story.extend([Spacer(1, 4), logo])
+            # Crop empty transparent/white export canvas in memory first, then
+            # use the existing large header bounds for the visible artwork.
+            logo = _job_logo_flowable(Path(job_logo_path), 4.76 * inch, 2.03 * inch)
+            center_header.append(logo)
         except Exception:
             pass
+    header = Table(
+        [[left_header, center_header, Spacer(1, 1)]],
+        colWidths=[1.65 * inch, 7.02 * inch, 1.65 * inch],
+        hAlign="LEFT",
+    )
+    header.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ALIGN", (0, 0), (0, 0), "LEFT"),
+        ("ALIGN", (1, 0), (1, 0), "CENTER"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    story = [header]
     story.append(Spacer(1, 8))
 
     detail = detail.copy()
@@ -1434,7 +1897,7 @@ def _build_outsourced_decoration_report(
     ]))
     story.append(totals_table)
 
-    doc.build(story)
+    doc.build(story, canvasmaker=PageNumberCanvas)
 
 def generate_employee_totals_pdf(review_workbook_path: Path, output_path: Path | None = None) -> Path:
     """Generate the current Employee Totals PDF without completing Purchase Review."""
@@ -1449,12 +1912,34 @@ def generate_employee_totals_pdf(review_workbook_path: Path, output_path: Path |
     return output_path
 
 
-def generate_final_purchase_orders(review_workbook_path: Path, reports_root: Path, po_number_overrides: dict[tuple[str, str], str] | None = None) -> dict:
+def generate_final_purchase_orders(
+    review_workbook_path: Path,
+    reports_root: Path,
+    po_number_overrides: dict[tuple[str, str], str] | None = None,
+    job_logo_path: Path | None = None,
+    outsourced_job_name: str = "",
+    allow_historical_lock: bool = False,
+) -> dict:
     workbook_path = Path(review_workbook_path)
     report_mode = normalize_report_mode(load_report_mode(workbook_path))
     event_name = clean_text(load_event_name(workbook_path))
     decoration_fulfillment = load_decoration_fulfillment(workbook_path)
+    selected_job_logo = Path(job_logo_path) if job_logo_path and Path(job_logo_path).exists() else _event_logo_path(workbook_path, event_name)
+
+    # Protected 4.9.0 preflight: verify the locked source CSV, live Product
+    # Master snapshot, Never Outsource overrides, and immutable source ledger
+    # before any report directory or PDF is created. Archived report-only
+    # reopens may use their historical lock; active events must still match the
+    # current live routing files exactly.
+    review_records = load_review_lines(workbook_path)
+    packet_lock_summary = verify_packet_lock(
+        workbook_path, review_records,
+        require_current_live_inputs=not bool(allow_historical_lock),
+    )
     ready, review, non_included = _prepare_lines(workbook_path, decoration_fulfillment)
+    integrity_summary = _validate_final_output_integrity(
+        review_records, ready, review, non_included
+    )
     po_numbers = load_po_numbers(workbook_path)
     if po_number_overrides:
         for key, value in po_number_overrides.items():
@@ -1464,10 +1949,31 @@ def generate_final_purchase_orders(review_workbook_path: Path, reports_root: Pat
     now = datetime.now()
     stamp = now.strftime("%Y%m%d_%H%M%S_%f")
     visible_name = safe_filename(event_name) if event_name else f"General Sales Period {now.strftime('%Y-%m-%d')}"
-    output_dir = Path(reports_root) / "Purchase Orders" / f"{visible_name} - Purchase Orders__{stamp}"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    purchase_orders_root = Path(reports_root) / "Purchase Orders"
+    purchase_orders_root.mkdir(parents=True, exist_ok=True)
+    final_output_dir = purchase_orders_root / f"{visible_name} - Purchase Orders__{stamp}"
+    # Build into a hidden staging folder. A folder with the final visible name
+    # appears only after every PDF and release-manifest hash has succeeded.
+    output_dir = purchase_orders_root / f".building-{stamp}"
+    output_dir.mkdir(parents=True, exist_ok=False)
 
-    created_files = []
+    integrity_path = output_dir / "PROTECTED_ORDER_RELEASE_CHECK.txt"
+    integrity_path.write_text(
+        "PROTECTED PURCHASE ORDER RELEASE CHECK - PASS\n"
+        f"Packet Lock ID: {packet_lock_summary['lock_id']}\n"
+        f"Packet Lock SHA256: {packet_lock_summary['manifest_sha256']}\n"
+        f"Locked source lines: {packet_lock_summary['source_lines']}\n"
+        f"Locked source quantity: {packet_lock_summary['source_quantity']}\n"
+        f"Source garment lines: {integrity_summary['source_lines']}\n"
+        f"Vendor purchase lines: {integrity_summary['vendor_lines']}\n"
+        f"Vendor purchase quantity: {integrity_summary['vendor_quantity']}\n"
+        f"Non-Included source lines: {integrity_summary['non_included_lines']}\n"
+        f"Non-Included quantity: {integrity_summary['non_included_quantity']}\n"
+        f"Purchase Review blocked lines: {integrity_summary['review_lines']}\n"
+        "Every included garment was traced to exactly one purchasing route.\n",
+        encoding="utf-8",
+    )
+    created_files = [integrity_path]
     pdf_files = []
     summary_rows = []
     non_included_pdf = None
@@ -1571,7 +2077,8 @@ def generate_final_purchase_orders(review_workbook_path: Path, reports_root: Pat
             outsourced_decoration_pdf = output_dir / "Outsourced_Decoration_Job_Report.pdf"
             _build_outsourced_decoration_report(
                 outsourced_detail, outsourced_decoration_pdf, event_name, decoration_fulfillment,
-                job_logo_path=_event_logo_path(workbook_path, event_name),
+                job_logo_path=selected_job_logo,
+                outsourced_job_name=outsourced_job_name,
             )
             created_files.append(outsourced_decoration_pdf)
 
@@ -1585,11 +2092,80 @@ def generate_final_purchase_orders(review_workbook_path: Path, reports_root: Pat
         event_summary_pdf = output_dir / f"{safe_filename(event_name or 'Event')}__Event_Summary.pdf"
         _build_employee_totals_pdf(employee_records, employee_totals_pdf, event_name)
         event_ready = pd.concat([ready, non_included], ignore_index=True) if not non_included.empty else ready
-        _build_event_summary_pdf(employee_records, event_ready, event_summary_pdf, event_name)
+        _build_event_summary_pdf(
+            employee_records,
+            event_ready,
+            event_summary_pdf,
+            event_name,
+            decoration_fulfillment,
+        )
         created_files.extend([employee_totals_pdf, event_summary_pdf])
 
     summary = pd.DataFrame(summary_rows)
+
+    # Include the exact locked inputs with the released reports, then hash every
+    # output file. This makes the completed ordering folder self-auditing and
+    # prevents reports from being silently mixed with a different source or
+    # Product Master later.
+    copied_lock_manifest = copy_lock_bundle(packet_lock_summary["manifest_path"], output_dir)
+    created_files.append(copied_lock_manifest)
+    release_manifest_path = output_dir / "FINAL_RELEASE_MANIFEST.json"
+    release_files = []
+    for path in sorted((item for item in output_dir.rglob("*") if item.is_file()), key=lambda value: str(value)):
+        release_files.append({
+            "path": str(path.relative_to(output_dir)),
+            "sha256": sha256_file(path),
+            "size": path.stat().st_size,
+        })
+    release_manifest = {
+        "release_status": "PASS",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "event_name": event_name,
+        "report_mode": report_mode,
+        "decoration_fulfillment": decoration_fulfillment,
+        "packet_lock_id": packet_lock_summary["lock_id"],
+        "packet_lock_manifest_sha256": packet_lock_summary["manifest_sha256"],
+        "source_lines": integrity_summary["source_lines"],
+        "vendor_quantity": integrity_summary["vendor_quantity"],
+        "non_included_quantity": integrity_summary["non_included_quantity"],
+        "blocked_review_lines": integrity_summary["review_lines"],
+        "files": release_files,
+    }
+    release_manifest_path.write_text(
+        json.dumps(release_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    created_files.append(release_manifest_path)
+
+    if final_output_dir.exists():
+        raise RuntimeError(f"Final report folder already exists: {final_output_dir}")
+    output_dir.rename(final_output_dir)
+
+    def released(path):
+        if not path:
+            return None
+        path = Path(path)
+        try:
+            relative = path.relative_to(output_dir)
+        except ValueError:
+            return path
+        return final_output_dir / relative
+
+    integrity_path = released(integrity_path)
+    pdf_files = [released(path) for path in pdf_files]
+    created_files = [released(path) for path in created_files]
+    non_included_pdf = released(non_included_pdf)
+    in_house_receiving_pdf = released(in_house_receiving_pdf)
+    outsourced_decoration_pdf = released(outsourced_decoration_pdf)
+    employee_totals_pdf = released(employee_totals_pdf)
+    event_summary_pdf = released(event_summary_pdf)
+    release_manifest_path = released(release_manifest_path)
+    output_dir = final_output_dir
+
     return {
+        "integrity_summary": integrity_summary,
+        "packet_lock_summary": packet_lock_summary,
+        "release_manifest_path": release_manifest_path,
+        "integrity_path": integrity_path,
         "output_dir": output_dir,
         "report_mode": report_mode,
         "event_name": event_name,

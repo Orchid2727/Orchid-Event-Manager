@@ -11,6 +11,8 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from modules.pdf_page_numbers import PageNumberCanvas
+
 PURPLE = colors.HexColor('#6827BD')
 PURPLE_DARK = colors.HexColor('#2E125F')
 LIGHT_PURPLE = colors.HexColor('#F5F0FB')
@@ -150,5 +152,5 @@ def generate_quote_pdf(
             subtitle_style,
         ),
     ])
-    doc.build(story)
+    doc.build(story, canvasmaker=PageNumberCanvas)
     return output_path

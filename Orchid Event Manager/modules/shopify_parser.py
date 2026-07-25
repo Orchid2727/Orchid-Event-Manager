@@ -6,7 +6,8 @@ import pandas as pd
 
 from modules.routing_rules import apply_parsed_product_overrides
 from modules.smart_parser import load_master_index, parse_manual_custom_item
-from modules.internal_services import infer_in_house_decoration
+from modules.internal_services import infer_in_house_decoration, is_decoration_charge, is_internal_service_style
+from modules.source_identity import build_source_id, source_base_signature
 
 SIZE_ALIASES = {
     "XXS": "XXS", "XS": "XS", "XSMALL": "XS", "EXTRA SMALL": "XS",
@@ -16,9 +17,14 @@ SIZE_ALIASES = {
     "3XL": "3XL", "3X": "3XL", "4XL": "4XL", "4X": "4XL",
     "5XL": "5XL", "5X": "5XL", "6XL": "6XL", "6X": "6XL",
     "7XL": "7XL", "7X": "7XL", "8XL": "8XL", "8X": "8XL",
-    "LT": "LT", "L TALL": "LT", "XLT": "XLT", "XL TALL": "XLT",
-    "2XLT": "2XLT", "2XL TALL": "2XLT", "3XLT": "3XLT",
-    "3XL TALL": "3XLT", "OSFA": "OSFA", "OSFM": "OSFM",
+    "LT": "LT", "L TALL": "LT", "L T": "LT",
+    "XLT": "XLT", "XL TALL": "XLT", "XL T": "XLT",
+    "2XLT": "2XLT", "2XTL": "2XLT", "2XL TALL": "2XLT", "2XL T": "2XLT", "2XLTL": "2XLT",
+    "3XLT": "3XLT", "3XTL": "3XLT", "3XL TALL": "3XLT", "3XL T": "3XLT", "3XLTL": "3XLT",
+    "4XLT": "4XLT", "4XTL": "4XLT", "4XL TALL": "4XLT", "4XL T": "4XLT", "4XLTL": "4XLT",
+    "5XLT": "5XLT", "5XTL": "5XLT", "5XL TALL": "5XLT", "5XL T": "5XLT", "5XLTL": "5XLT",
+    "6XLT": "6XLT", "6XTL": "6XLT", "6XL TALL": "6XLT", "6XL T": "6XLT", "6XLTL": "6XLT",
+    "OSFA": "OSFA", "OSFM": "OSFM",
     "ONE SIZE": "OSFA", "ONESIZE": "OSFA", "S/M": "S/M",
     "SM": "S/M", "M/L": "M/L", "L/XL": "L/XL", "UH": "UH",
 }
@@ -106,6 +112,10 @@ def normalize_size(value) -> str:
     raw = clean(value)
     upper = raw.upper()
     compact = re.sub(r"\s+", "", upper)
+    tall_match = re.fullmatch(r"(L|XL|[2-8]X(?:L)?)(?:\s*(?:TALL|TL|T))", upper)
+    if tall_match:
+        base = tall_match.group(1).replace("XL", "X")
+        return {"L": "LT", "X": "XLT", **{f"{number}X": f"{number}XLT" for number in range(2, 9)}}.get(base, compact)
     if upper in SIZE_ALIASES:
         return SIZE_ALIASES[upper]
     if compact in SIZE_ALIASES:
@@ -158,9 +168,27 @@ def explicit_style_segment(value: object, *, has_product_context: bool = False) 
     return bool(has_product_context and re.fullmatch(r"\d{3,6}", raw))
 
 
-def is_decoration_service(lineitem_name) -> bool:
+def _lineitem_has_internal_service_style(lineitem_name: object) -> bool:
+    text = clean(lineitem_name).upper()
+    if not text:
+        return False
+    # Product 750 is Orchid's embroidery-charge code. Require a standalone token
+    # so a garment style such as 7500 is not accidentally removed.
+    return any(
+        re.search(rf"(?<![A-Z0-9]){re.escape(code)}(?![A-Z0-9])", text)
+        for code in {"750"}
+    )
+
+
+def is_decoration_service(lineitem_name, style_number: object = "", *variant_values: object) -> bool:
     name = clean(lineitem_name).lower()
-    return any(term in name for term in SERVICE_TERMS) or bool(infer_in_house_decoration(name))
+    return (
+        is_internal_service_style(style_number)
+        or _lineitem_has_internal_service_style(lineitem_name)
+        or is_decoration_charge(lineitem_name, *variant_values)
+        or any(term in name for term in SERVICE_TERMS)
+        or bool(infer_in_house_decoration(name))
+    )
 
 
 def split_spaced_slashes(text: str) -> list[str]:
@@ -219,7 +247,8 @@ def compact_style_size_color(text: str):
 def split_trailing_size(value: str) -> tuple[str, str]:
     text = clean(value)
     size_pattern = (
-        r"(?:One\s*Size|XXS|XS|XXL|[2-8]XL|XLT|2XLT|3XLT|OSFA|OSFM|"
+        r"(?:One\s*Size|XXS|XS|XXL|[2-8]XL|(?:L|XL|[2-8]X(?:L)?)\s+(?:Tall|TL|T)|"
+        r"XLT|[2-8]XLT|OSFA|OSFM|"
         r"S/M|M/L|L/XL|Small|Medium|Large|S|M|L|XL|"
         r"\d{2}\s*[xX]\s*\d{2}|\d{4}|\d{2}/UH)"
     )
@@ -703,9 +732,17 @@ def parse_shopify_orders(csv_path, product_master_path=None, normalized_orders: 
             )
 
     rows = []
+    source_occurrences: dict[str, int] = {}
     for _, row in orders.iterrows():
         lineitem_name = clean_text(row.get("Lineitem name", ""))
-        if not lineitem_name or is_decoration_service(lineitem_name):
+        variant_values = (
+            row.get("Variant Color", ""), row.get("Variant Size", ""),
+            row.get("Variant Option 1", ""), row.get("Variant Option 2", ""),
+            row.get("Variant Option 3", ""), row.get("Variant Title", ""),
+        )
+        if not lineitem_name or is_decoration_service(
+            lineitem_name, row.get("Lineitem sku", ""), *variant_values
+        ):
             continue
 
         parsed = parse_lineitem_name(lineitem_name)
@@ -753,7 +790,43 @@ def parse_shopify_orders(csv_path, product_master_path=None, normalized_orders: 
         quantity = 0 if pd.isna(quantity) else int(quantity)
         if quantity <= 0:
             continue
+        immutable_source = {
+            "Name": clean_text(row.get("Name", "")),
+            "Created at": clean_text(row.get("Created at", "")),
+            "Billing Company": clean_text(row.get("Billing Company", "")),
+            "Billing Name": clean_text(row.get("Billing Name", "")),
+            "Notes": clean_text(row.get("Notes", "")),
+            "Line Notes": clean_text(row.get("Line Notes", "")),
+            "Lineitem name": lineitem_name,
+            "Lineitem quantity": quantity,
+            "Lineitem sku": clean_text(row.get("Lineitem sku", "")),
+            "Variant Title": clean_text(row.get("Variant Title", "")),
+            "Variant Option 1": clean_text(row.get("Variant Option 1", "")),
+            "Variant Option 2": clean_text(row.get("Variant Option 2", "")),
+            "Variant Option 3": clean_text(row.get("Variant Option 3", "")),
+            "Variant Color": clean_text(row.get("Variant Color", "")),
+            "Variant Size": clean_text(row.get("Variant Size", "")),
+        }
+        base_signature = source_base_signature(immutable_source)
+        source_occurrence = source_occurrences.get(base_signature, 0) + 1
+        source_occurrences[base_signature] = source_occurrence
+        source_id = build_source_id(immutable_source, source_occurrence)
+
         parsed_record = apply_parsed_product_overrides({
+            "Source ID": source_id,
+            "Source Occurrence": source_occurrence,
+            "Original Quantity": quantity,
+            "Original Order Number": clean_text(row.get("Name", "")),
+            "Original Order Date": clean_text(row.get("Created at", "")),
+            "Original Company": clean_text(row.get("Billing Company", "")),
+            "Original Employee Name": clean_text(row.get("Billing Name", "")),
+            "Original Shopify SKU": clean_text(row.get("Lineitem sku", "")),
+            "Original Variant Title": clean_text(row.get("Variant Title", "")),
+            "Original Variant Option 1": clean_text(row.get("Variant Option 1", "")),
+            "Original Variant Option 2": clean_text(row.get("Variant Option 2", "")),
+            "Original Variant Option 3": clean_text(row.get("Variant Option 3", "")),
+            "Original Variant Color": clean_text(row.get("Variant Color", "")),
+            "Original Variant Size": clean_text(row.get("Variant Size", "")),
             "Order Number": clean_text(row.get("Name", "")),
             "Order Date": clean_text(row.get("Created at", "")),
             "Company": clean_text(row.get("Billing Company", "")),

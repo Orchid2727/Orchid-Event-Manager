@@ -159,18 +159,28 @@ def load_review_lines(xlsx_path: Path) -> list[dict[str, object]]:
         "Product #", "Description", "Garment Color", "Size", "Quantity",
         "Company", "Employee Name", "Order Number", "Shopify Order Notes",
         "Purchase Instructions", "Review Status", "Review Reason", "Resolution",
-        "Decoration Decision",
+        "Decoration Decision", "Quantity Override Confirmed",
     }
     by_id = {
         str(record.get("Line ID", "") or "").strip(): record
         for record in records
         if str(record.get("Line ID", "") or "").strip()
     }
+    by_source_id: dict[str, list[dict[str, object]]] = {}
+    for record in records:
+        source_id = str(record.get("Source ID", "") or "").strip()
+        if source_id:
+            by_source_id.setdefault(source_id, []).append(record)
 
     def apply_edits(edits: list[dict[str, object]], *, blank_values_are_authoritative: bool) -> None:
         for edit in edits:
-            line_id = str(edit.get("Line ID", "") or "").strip()
-            target = by_id.get(line_id)
+            source_id = str(edit.get("Source ID", "") or "").strip()
+            if source_id:
+                candidates = by_source_id.get(source_id, [])
+                target = candidates[0] if len(candidates) == 1 else None
+            else:
+                line_id = str(edit.get("Line ID", "") or "").strip()
+                target = by_id.get(line_id)
             if target is None:
                 continue
             for field in editable_fields:
@@ -231,19 +241,50 @@ def load_report_mode(xlsx_path: Path) -> str:
 
 
 
+def load_system_info_value(xlsx_path: Path, label: str) -> str:
+    """Read one hidden System Info value without requiring openpyxl."""
+    try:
+        rows = read_sheet_rows(xlsx_path, "System Info")
+    except (ValueError, KeyError, zipfile.BadZipFile):
+        return ""
+    wanted = str(label or "").strip().casefold()
+    for row in rows:
+        if row and str(row[0] or "").strip().casefold() == wanted:
+            return str(row[1] or "").strip() if len(row) > 1 else ""
+    return ""
+
+
 def load_decoration_fulfillment(xlsx_path: Path) -> str:
     from modules.decoration_fulfillment import STANDARD_ORCHID_WORKFLOW, normalize_decoration_fulfillment
 
+    settings_value = ""
     try:
         rows = read_sheet_rows(xlsx_path, "Settings")
     except (ValueError, KeyError, zipfile.BadZipFile):
-        return STANDARD_ORCHID_WORKFLOW
+        rows = []
 
     for row_index, row in enumerate(rows):
         for column_index, value in enumerate(row):
             if str(value or "").strip().casefold() == "decoration fulfillment":
                 if row_index + 1 < len(rows) and column_index < len(rows[row_index + 1]):
-                    return normalize_decoration_fulfillment(rows[row_index + 1][column_index])
+                    settings_value = str(rows[row_index + 1][column_index] or "").strip()
+                    break
+        if settings_value:
+            break
+
+    recorded_value = load_system_info_value(xlsx_path, "Decoration Fulfillment")
+    settings_mode = normalize_decoration_fulfillment(settings_value) if settings_value else ""
+    recorded_mode = normalize_decoration_fulfillment(recorded_value) if recorded_value else ""
+    if settings_mode and recorded_mode and settings_mode != recorded_mode:
+        raise ValueError(
+            "Decoration fulfillment mismatch: the visible Settings route does not match "
+            "the event route recorded when this Purchase Review was created. Regenerate "
+            "the review before creating purchase orders."
+        )
+    if settings_mode:
+        return settings_mode
+    if recorded_mode:
+        return recorded_mode
     return STANDARD_ORCHID_WORKFLOW
 
 def load_event_name(xlsx_path: Path) -> str:

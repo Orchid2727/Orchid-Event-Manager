@@ -10,7 +10,9 @@ from modules.blank_garment_rules import (
     is_blank_decoration,
     is_blank_garment_product,
 )
-from modules.internal_services import is_in_house_decoration, is_in_house_service_product
+from modules.internal_services import (
+    is_in_house_decoration, is_in_house_service_product, is_internal_service_style,
+)
 
 RULE_COLUMNS = [
     "Product Category",
@@ -43,6 +45,7 @@ NO = "No"
 # Tru-Spec pant and therefore never requires decoration.
 ONE_SIZE_HEADWEAR_STYLES = {"6572"}
 KNOWN_PANT_STYLES = {"1104", "CT102804"}
+KNOWN_COLOR_OPTIONAL_BLANK_STYLES = {"966"}
 
 
 def clean(value: Any) -> str:
@@ -102,7 +105,9 @@ def infer_category(product_name: Any, style_number: Any = "") -> str:
 
 
 def category_defaults(category: Any, product_name: Any = "", style_number: Any = "") -> dict[str, bool]:
-    if is_in_house_service_product(product_name, decoration_type=""):
+    if is_internal_service_style(style_number) or is_in_house_service_product(
+        product_name, decoration_type="", style_number=style_number
+    ):
         return {"requires_size": False, "requires_color": False, "requires_decoration": False}
     category_text = clean(category) or infer_category(product_name, style_number)
     if category_text == "Pants / Jeans / Shorts":
@@ -120,8 +125,8 @@ def category_defaults(category: Any, product_name: Any = "", style_number: Any =
 
 def row_rules(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
     get = row.get
-    product_name = clean(get("Product Name", ""))
-    style_number = clean(get("Style Number", ""))
+    product_name = clean(get("Product Name", "") or get("Description", ""))
+    style_number = clean(get("Style Number", "") or get("Product #", ""))
     style_key = re.sub(r"\s+", "", style_number).upper()
 
     # These two long-running exceptions are business facts, not suggestions.
@@ -142,12 +147,22 @@ def row_rules(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
             "Requires Color": YES,
             "Requires Decoration": NO,
         }
+    if style_key in KNOWN_COLOR_OPTIONAL_BLANK_STYLES:
+        category = "Pants / Jeans / Shorts"
+        return {
+            "Product Category": category,
+            "Requires Size": YES,
+            "Requires Color": NO,
+            "Requires Decoration": NO,
+        }
 
     category = clean(get("Product Category", "")) or infer_category(product_name, style_number)
     defaults = category_defaults(category, product_name, style_number)
 
     decoration_type = clean(get("Decoration Type", ""))
-    service_only = is_in_house_service_product(product_name, get("Original Line Item", ""), decoration_type)
+    service_only = is_internal_service_style(style_number) or is_in_house_service_product(
+        product_name, get("Original Line Item", ""), decoration_type, style_number=style_number
+    )
     if service_only:
         return {
             "Product Category": category,
