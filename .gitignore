@@ -1,0 +1,8 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.log
+build/
+dist/
+.professional_build_venv/
+reports/
