@@ -1,0 +1,8 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.76
+
+Decoration Color Audit Source-ID recovery
+
+- A saved Purchase Review decision with a missing immutable Source ID is now treated as historical, even when its older broad product key happens to match a different current line.
+- This removes the false “1 to Review” state that appeared with zero event combinations.
+- Matching current Source IDs still replay normally; this update never applies an old decision to a different event line.
+- No current-event row, Product Master record, size, vendor, or report is rewritten to recover the audit display.

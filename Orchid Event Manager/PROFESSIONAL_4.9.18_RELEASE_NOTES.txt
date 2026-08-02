@@ -1,0 +1,10 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.18
+
+- Splits the prior combined Outsourced Decoration Job Report into two department-specific PDFs:
+  - Outsourced Embroidery Job Report
+  - Outsourced Screen-Printing Job Report
+- Adds Embroidery and Screen Printing tabs to the Logo page.
+- Each tab shows only that department's decoration locations and thread/ink colors.
+- Artwork uploaded on the Embroidery tab prints only on the embroidery cover; artwork uploaded on the Screen Printing tab prints only on the screen-printing cover.
+- Keeps job name and special notes with the event and includes them on both department covers.
+- Adds direct management-dashboard links for each outsourced department report.

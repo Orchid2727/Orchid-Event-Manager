@@ -1,0 +1,6 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.21
+
+- Makes outsourced-report decoration locations production-clear: each location has its own total-piece row.
+- Centers each thread/ink color name directly above the matching artwork reference.
+- Automatically creates a clean transparent PNG copy of uploaded cover artwork, removing a detectable outer white or colored background without changing the original file.
+- Keeps Embroidery and Screen Printing reports, their artwork, vendor purchase orders, and color-total report footers separate and unchanged.

@@ -1,0 +1,25 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.87
+
+GENERAL-SALES SUPPLIER PO CORRECTION
+
+- General Sales / Standard Orchid workflow now creates the normal separate
+  vendor purchase order for every supplier, including Never Outsource boots.
+- The condensed Non-Included Items Purchase Order is now limited to Uniform
+  Sizing Events and Entire Order Outsourced exceptions.
+
+COLOR-SPECIFIC PURCHASING STYLE NUMBERS
+
+- Product Master now includes Purchase As Style # (optional) on every color
+  row.  Use it when Shopify sells one product page with color choices but the
+  vendor assigns each color a different orderable style number.
+- Shopify Color Alias identifies the selected color; Purchase As Style # tells
+  Orchid exactly which vendor product number to print for that color.
+- The purchase-style number is carried into Purchase Review and every vendor
+  PO.  It remains separate from the customer-facing Shopify style.
+
+REGRESSION COVERAGE
+
+- General Sales Never Outsource boot -> vendor PO, not Non-Included sheet.
+- Uniform Sizing Event Never Outsource boot -> condensed Non-Included sheet.
+- Two aliases on one shared Shopify style -> distinct vendor purchasing style
+  numbers on the final PO.

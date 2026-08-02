@@ -1,0 +1,9 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.53
+
+CURRENT EVENT BUTTON-LAYOUT REPAIR
+- Replace CSV is now a full-width button on its own row, so its label remains
+  fully readable at compact laptop widths.
+- Regenerate Purchase Review also has its own full-width row directly below.
+- Add Orders CSV, Purchase Review, purchase-order regeneration, saved PO
+  numbers, report layouts, Tru-Spec product numbers, and packet storage are
+  unchanged.

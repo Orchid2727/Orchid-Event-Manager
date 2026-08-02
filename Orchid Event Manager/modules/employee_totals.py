@@ -7,6 +7,8 @@ from typing import Any
 
 from openpyxl import load_workbook
 
+from modules.internal_services import is_final_sale_accounting_product
+
 
 SHEET_NAME = "Employee Totals"
 HEADERS = [
@@ -48,6 +50,39 @@ def _order_keys(value: object) -> set[str]:
     }
 
 
+def _final_sale_accounting_order_keys(workbook) -> set[str]:
+    """Return Final Sale Boot orders retained only for event billing.
+
+    These clearance boots are already on hand, so they correctly have no
+    purchase-review detail line.  The hidden Excluded Services sheet preserves
+    their order number and lets Employee Totals retain the $50 sale after the
+    workbook is reopened.
+    """
+    if "Excluded Services" not in workbook.sheetnames:
+        return set()
+    sheet = workbook["Excluded Services"]
+    headers: dict[str, int] = {}
+    for row in range(1, min(sheet.max_row, 40) + 1):
+        candidates = {
+            clean(sheet.cell(row=row, column=column).value).casefold(): column
+            for column in range(1, min(sheet.max_column, 20) + 1)
+        }
+        if "order number" in candidates and "service / fee" in candidates:
+            headers = candidates
+            header_row = row
+            break
+    else:
+        return set()
+
+    keys: set[str] = set()
+    for row in range(header_row + 1, sheet.max_row + 1):
+        label = clean(sheet.cell(row=row, column=headers["service / fee"]).value)
+        order_key = _order_key(sheet.cell(row=row, column=headers["order number"]).value)
+        if order_key and is_final_sale_accounting_product(label):
+            keys.add(order_key)
+    return keys
+
+
 def _included_merchandise_order_keys(workbook_path: Path) -> set[str] | None:
     """Return final event orders that still contain included merchandise.
 
@@ -73,6 +108,11 @@ def _included_merchandise_order_keys(workbook_path: Path) -> set[str] | None:
             order_key = _order_key(record.get("Order Number", ""))
             if order_key:
                 order_keys.add(order_key)
+        workbook = load_workbook(Path(workbook_path), data_only=True, read_only=True)
+        try:
+            order_keys.update(_final_sale_accounting_order_keys(workbook))
+        finally:
+            workbook.close()
         return order_keys
     except Exception:
         return None

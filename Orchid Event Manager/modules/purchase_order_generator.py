@@ -121,7 +121,22 @@ def identity_key(style, product, color) -> str:
 
 
 def normalize_size(value) -> str:
-    raw = clean_text(value).upper()
+    original = clean_text(value)
+    footwear = re.fullmatch(
+        r"(?P<size>(?:[4-9]|1[0-6])(?:\.5)?)\s*(?:/|-)\s*"
+        r"(?P<width>regular|reg|medium|m|narrow|n|wide|w|x-?wide|extra wide|ee|eee)",
+        original,
+        re.I,
+    )
+    if footwear:
+        width = footwear.group("width").upper().replace("-", " ")
+        width = {
+            "REGULAR": "Medium", "REG": "Medium", "MEDIUM": "Medium", "M": "Medium",
+            "NARROW": "Narrow", "N": "Narrow", "WIDE": "Wide", "W": "Wide",
+            "XWIDE": "Extra Wide", "EXTRA WIDE": "Extra Wide", "EE": "EE", "EEE": "EEE",
+        }.get(width, width.title())
+        return f"{footwear.group('size')} / {width}"
+    raw = original.upper()
     size = re.sub(r"\s+", "", raw)
     if re.fullmatch(r"\d{2}[X/]\d{2}", size):
         return size.replace("/", "x").replace("X", "x")
@@ -144,6 +159,11 @@ def normalize_size(value) -> str:
 
 def size_sort_key(value) -> tuple[int, str]:
     size = normalize_size(value)
+    footwear = re.fullmatch(
+        r"(?P<size>(?:[4-9]|1[0-6])(?:\.5)?)\s*/\s*(?P<width>.+)", size, re.I
+    )
+    if footwear:
+        return (len(SIZE_ORDER) + int(float(footwear.group("size")) * 10), footwear.group("width").casefold())
     try:
         return (SIZE_ORDER.index(size), size)
     except ValueError:

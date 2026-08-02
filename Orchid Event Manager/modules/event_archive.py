@@ -91,10 +91,30 @@ def archive_completed_event(
         f"{review_workbook.stem}__Outsourced_Job_Logo_Metadata",
     ):
         metadata_candidates.append(review_workbook.parent / f"{stem}.json")
+    copied_metadata = None
     for candidate in metadata_candidates:
         if candidate.exists():
             shutil.copy2(candidate, archive_dir / candidate.name)
+            copied_metadata = candidate
             break
+
+    # Per-color cover artwork is stored beside the event workbook and listed
+    # in the same metadata file. Copy only those named entries, never every
+    # image in the working directory, so an archived cover remains complete
+    # and self-contained when it is reopened later.
+    if copied_metadata:
+        try:
+            artwork = json.loads(copied_metadata.read_text(encoding="utf-8")).get("artwork", {})
+        except (OSError, ValueError, TypeError, AttributeError):
+            artwork = {}
+        if isinstance(artwork, dict):
+            for entry in artwork.values():
+                filename = str(entry.get("filename", "")).strip() if isinstance(entry, dict) else ""
+                if not filename or Path(filename).name != filename:
+                    continue
+                candidate = review_workbook.parent / filename
+                if candidate.is_file():
+                    shutil.copy2(candidate, archive_dir / filename)
 
     po_target = archive_dir / "Purchase Orders"
     po_target.mkdir(parents=True, exist_ok=True)

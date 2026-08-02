@@ -1,0 +1,11 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.59
+
+Final Sale Boot accounting-line repair
+
+- Recognizes the Shopify product Final Sale Boot, including a selected shoe size
+  appended by Report Toaster (for example, Final Sale Boot - 12).
+- Keeps the $50 sale in Employee Totals for a Uniform Sizing Event.
+- Excludes the line from Product Master, Purchase Review, purchase orders,
+  Receiving & Decoration, and outsourced decoration reports.
+- Prevents the incorrect Do Not Outsource exception warning for this no-purchase
+  stock-sale item.

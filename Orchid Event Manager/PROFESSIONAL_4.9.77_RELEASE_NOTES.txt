@@ -1,0 +1,8 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.77
+
+NON-INCLUDED ITEMS PURCHASE ORDER RELIABILITY REPAIR
+
+- Combines identical Vendor Product #, Style Number, Product Name, Garment Color, and Size into one purchasing line per vendor.
+- Totals the quantity for the combined line.
+- Preserves the related employee and Shopify order trace in the final column.
+- Does not modify Product Master, Purchase Review, the imported CSV, or saved event data.

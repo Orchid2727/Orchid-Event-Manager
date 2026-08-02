@@ -28,6 +28,7 @@ from modules.catalog_manager import (
     save_product_candidate_list,
 )
 from modules.purchase_order_generator import safe_filename, split_embedded_size
+from modules.purchase_order_files import is_final_purchase_order_pdf
 from modules.paths import (
     data_dir,
     legacy_data_dir,
@@ -40,11 +41,17 @@ from modules.paths import (
 from modules.master_sync import (
     live_product_master_path,
     product_master_signature,
-    review_uses_current_product_master,
+)
+from modules.packet_lock import review_routing_status
+from modules.active_packet import (
+    active_workbook_matches_state,
+    bind_active_workbook,
+    new_active_packet_state,
 )
 from modules.report_modes import GENERAL_SALES_PERIOD, UNIFORM_SIZING_EVENT
 from modules.decoration_fulfillment import (
-    STANDARD_ORCHID_WORKFLOW, ENTIRE_ORDER_OUTSOURCED, normalize_decoration_fulfillment,
+    STANDARD_ORCHID_WORKFLOW, ENTIRE_ORDER_OUTSOURCED, is_outsourced_decoration,
+    normalize_decoration_fulfillment,
 )
 from modules.purchase_rules import apply_purchase_rule_defaults, normalize_bool, row_rules
 from modules.routing_rules import enforce_permanent_vendor_overrides
@@ -62,13 +69,14 @@ from modules.decoration_locations import (
     normalize_decoration_location,
     resolve_location_choice,
 )
-from modules.event_archive import archive_completed_event, validate_release_packet
+from modules.event_archive import validate_release_packet
 from modules.employee_totals import save_employee_discounts
 from modules.xlsx_reader import (
     load_decoration_fulfillment,
     load_event_name,
     load_report_mode,
     load_review_lines,
+    load_system_info_value,
 )
 from modules.note_rules import decoration_note_requires_review, decoration_instruction_recommendation
 from modules.internal_services import (
@@ -76,9 +84,11 @@ from modules.internal_services import (
     is_in_house_decoration, is_in_house_service_product,
 )
 from modules.product_candidate_sync import sync_review_product_candidates, sync_shopify_catalog_enrichment
+from modules.process_identity import process_is_running, product_master_process_matches
+from modules.product_master_launch import product_master_launch_command
 from modules.scroll_support import install_native_scroll_support, register_scrollable
 from modules.thread_ink_colors import load_thread_ink_colors
-from modules.job_logo_image import remove_outer_near_white_background
+from modules.job_logo_image import prepare_artwork_for_preview, prepare_artwork_for_report
 from modules.decoration_color_audit import (
     apply_product_master_decoration_colors,
     audit_group_key,
@@ -217,7 +227,10 @@ def _product_master_health() -> dict[str, int]:
         if not _clean(rules.get("Product Category", "")):
             issues.append("category")
         service_only = is_in_house_service_product(
-            first.get("Product Name", ""), first.get("Original Line Item", ""), first.get("Decoration Type", "")
+            first.get("Product Name", ""),
+            first.get("Original Line Item", ""),
+            first.get("Decoration Type", ""),
+            style_number=first.get("Style Number", ""),
         )
         if not service_only and rows.get("Vendor", pd.Series(dtype=str)).astype(str).str.strip().eq("").any():
             issues.append("vendor")
@@ -251,20 +264,19 @@ def _product_master_health() -> dict[str, int]:
 class OrchidPurchaseManager(ctk.CTk):
     PAGE_TITLES = {
         "dashboard": ("Dashboard", "Move the current purchase packet through the five purchasing stages."),
-        "import": ("Current Event", "Import, replace, clear, regenerate, and manage the active purchase packet."),
+        "import": ("Current Event", "Start, add orders to, finish, and manage the active purchase packet."),
         "master": ("Product Master", "Search and maintain permanent vendor, category, color, and decoration rules."),
         "review": ("Purchase Review", "Complete only the order-specific decisions that remain after Product Master setup."),
         "audit": ("Decoration Color Audit", "Verify thread and ink colors for the products included in the current event."),
         "purchase": ("Purchase Orders", "Create final vendor purchase orders from the completed review."),
         "employees": ("Employee Totals", "View employee order totals, enter discounts, and save final event totals."),
-        "archive": ("Event Archive", "Open completed events with their order export, review workbook, and final PDFs."),
         "settings": ("Settings", "Diagnostics, catalog maintenance, backups, and storage locations."),
     }
 
     def __init__(self):
         super().__init__()
         ctk.set_appearance_mode("light")
-        self.title("Orchid Purchase Manager Professional 4.9.12 RC13")
+        self.title("Orchid Purchase Manager Professional 4.9.104")
         self.geometry("1400x900")
         self.minsize(1180, 760)
         self.configure(fg_color=BG)
@@ -312,6 +324,8 @@ class OrchidPurchaseManager(ctk.CTk):
         self._logo_pulse_after_ids = []
         self._outsourced_logo_dialog_pending = False
         self._mission_snapshot_cache_key = None
+        self._routing_status_cache_key = None
+        self._routing_status_cache: dict = {"current": True, "reason": "", "changes": []}
         self._decoration_audit_status_cache_key = None
         self._decoration_audit_status_cache_value = None
         self._mission_snapshot_cache: dict = {}
@@ -567,66 +581,80 @@ class OrchidPurchaseManager(ctk.CTk):
             pass
 
     def discover_existing_work(self):
-        """Find the most recent saved work unless the user intentionally started a new packet."""
-        reset_time = 0.0
-        try:
-            if ACTIVE_PACKET_RESET_FILE.exists():
-                reset_time = float(json.loads(ACTIVE_PACKET_RESET_FILE.read_text(encoding="utf-8")).get("reset_time", 0.0))
-        except Exception:
-            reset_time = 0.0
+        """Restore only the workbook explicitly bound to the active CSV packet.
 
-        review_files = []
-        for folder in (REPORTS / "Review Workbooks", REPORTS / "review_workbooks"):
-            if folder.exists():
-                review_files.extend(
-                    item for item in folder.glob("*.xlsx")
-                    if item.stat().st_mtime > reset_time
+        Previous versions selected the newest Review Workbook and PO folder by
+        modification time.  That allowed an old event to reappear after Replace
+        CSV. Saved PDFs remain on the computer for records, but they are never
+        candidates for the active event.
+        """
+        state = self._load_review_state()
+        workbook_text = _clean(state.get("active_review_workbook", ""))
+        source_text = _clean(state.get("source_csv", ""))
+        source_csv = Path(source_text).expanduser() if source_text else None
+
+        if state and source_csv and source_csv.is_file() and not _clean(state.get("active_packet_id", "")):
+            upgraded = new_active_packet_state(source_csv)
+            active_packet_id = upgraded["active_packet_id"]
+            upgraded.update(state)
+            upgraded["active_packet_id"] = active_packet_id
+            state = upgraded
+
+        # One safe upgrade path for a packet created before active-workbook
+        # identity existed: locate only a workbook whose protected lock records
+        # the exact saved CSV hash.  No timestamp-only selection is permitted.
+        if state and not workbook_text and source_csv and source_csv.is_file() and state.get("source_signature"):
+            candidates = []
+            for folder in (REPORTS / "Review Workbooks", REPORTS / "review_workbooks"):
+                if folder.is_dir():
+                    candidates.extend(folder.glob("*.xlsx"))
+            for candidate in sorted(candidates, key=lambda item: item.stat().st_mtime_ns, reverse=True):
+                try:
+                    migrated = bind_active_workbook(state, candidate)
+                except (OSError, ValueError):
+                    continue
+                state = migrated
+                self._write_review_state_atomic(state)
+                workbook_text = _clean(state.get("active_review_workbook", ""))
+                break
+
+        workbook = Path(workbook_text).expanduser() if workbook_text else None
+        valid, reason = active_workbook_matches_state(state, workbook)
+        if not valid:
+            # v4.9.82 added a packet ID to the Review itself. Keep a valid
+            # v4.9.81 state visible solely long enough to regenerate it; never
+            # let that older workbook open reports in the meantime.
+            if (
+                workbook
+                and workbook.is_file()
+                and source_csv
+                and source_csv.is_file()
+                and "missing its protected packet identity" in reason.casefold()
+            ):
+                self.last_review_workbook = workbook
+                self.selected_csv = source_csv
+                self.current_event_name = _clean(state.get("event_name", ""))
+                self.current_mode = _clean(state.get("report_mode", ""))
+                self.current_decoration_fulfillment = normalize_decoration_fulfillment(
+                    state.get("decoration_fulfillment", STANDARD_ORCHID_WORKFLOW)
                 )
-        if review_files:
-            self.last_review_workbook = max(review_files, key=lambda item: item.stat().st_mtime)
-
-        purchase_root = REPORTS / "Purchase Orders"
-        if purchase_root.exists():
-            folders = [
-                item for item in purchase_root.iterdir()
-                if item.is_dir() and item.stat().st_mtime > reset_time
-            ]
-            pdfs = [item for item in purchase_root.glob("*.pdf") if item.stat().st_mtime > reset_time]
-            if folders:
-                self.last_purchase_order_dir = max(folders, key=lambda item: item.stat().st_mtime)
-            elif pdfs:
-                self.last_purchase_order_dir = purchase_root
-
-        # Keep the most recently completed packet available until the user
-        # explicitly chooses Start New Event or Remove CSV / Clear Event. This is
-        # required for late sales: a sizing event completed last week can be
-        # resumed, receive another CSV, and regenerate only the affected work.
-        # Generated purchase orders remain visible until an added-order import
-        # marks them for regeneration.
-
-        # Restore the saved source CSV and event identity for an unfinished
-        # review so Current Event and the launch choice describe the packet
-        # correctly after reopening a newer app version.
-        if self.last_review_workbook and self.last_review_workbook.exists() and REVIEW_STATE_FILE.exists():
-            try:
-                saved_state = json.loads(REVIEW_STATE_FILE.read_text(encoding="utf-8"))
-                source_csv_text = _clean(saved_state.get("source_csv", ""))
-                # Path("") is the current directory (".") on macOS. A
-                # report-only archive legitimately has no source CSV, so never
-                # turn its blank saved value into a directory masquerading as a
-                # selected CSV.
-                source_csv = Path(source_csv_text).expanduser() if source_csv_text else None
-                if source_csv and source_csv.is_file():
-                    self.selected_csv = source_csv
-                saved_output_text = _clean(saved_state.get("last_purchase_order_dir", ""))
-                saved_output = Path(saved_output_text).expanduser() if saved_output_text else None
-                if saved_output and saved_output.is_dir():
-                    self.last_purchase_order_dir = saved_output
-                self.current_event_name = _clean(saved_state.get("event_name", ""))
-                self.current_mode = _clean(saved_state.get("report_mode", ""))
-                self.current_decoration_fulfillment = normalize_decoration_fulfillment(saved_state.get("decoration_fulfillment", STANDARD_ORCHID_WORKFLOW))
-            except Exception:
-                pass
+                state["packet_identity_upgrade_required"] = True
+                self._write_review_state_atomic(state)
+            return
+        self.last_review_workbook = workbook
+        self.selected_csv = source_csv
+        self.current_event_name = _clean(state.get("event_name", ""))
+        self.current_mode = _clean(state.get("report_mode", ""))
+        self.current_decoration_fulfillment = normalize_decoration_fulfillment(
+            state.get("decoration_fulfillment", STANDARD_ORCHID_WORKFLOW)
+        )
+        saved_output_text = _clean(state.get("active_purchase_order_dir", ""))
+        saved_output = Path(saved_output_text).expanduser() if saved_output_text else None
+        if saved_output and saved_output.is_dir() and (
+            _clean(state.get("active_purchase_order_packet_lock_id", ""))
+            == _clean(state.get("active_review_packet_lock_id", ""))
+        ):
+            self.last_purchase_order_dir = saved_output
 
     def _active_review_needs_decoration_note_upgrade(self) -> bool:
         if (
@@ -708,10 +736,13 @@ class OrchidPurchaseManager(ctk.CTk):
             return
         self._launch_choice_shown = True
 
+        # Create the window hidden, then present it after its final geometry is
+        # known.  This prevents macOS from briefly drawing it at the default
+        # top-left position before it is centered over Orchid.
         dialog = ctk.CTkToplevel(self)
+        dialog.withdraw()
         dialog.title("Unfinished Purchase Packet")
         dialog.transient(self)
-        dialog.grab_set()
         dialog.resizable(False, False)
         dialog.configure(fg_color=BG)
         shell = ctk.CTkFrame(dialog, fg_color=WHITE, border_width=1, border_color="#D8CDE6", corner_radius=18)
@@ -725,7 +756,7 @@ class OrchidPurchaseManager(ctk.CTk):
         )
         ctk.CTkLabel(
             shell,
-            text=f"Would you like to resume {packet_name}, or clear the active packet and begin a new event?\n\nProduct Master and archived reports will not be deleted.",
+            text=f"Would you like to resume {packet_name}, or clear the active packet and begin a new event?\n\nProduct Master and already-created PDFs will not be deleted.",
             text_color=MUTED, font=ctk.CTkFont(size=14), justify="center", wraplength=520,
         ).pack(padx=30, pady=(0, 22))
         actions = ctk.CTkFrame(shell, fg_color="transparent")
@@ -768,8 +799,16 @@ class OrchidPurchaseManager(ctk.CTk):
         x = max(self.winfo_rootx() + (self.winfo_width() - width) // 2, 0)
         y = max(self.winfo_rooty() + (self.winfo_height() - height) // 2, 0)
         dialog.geometry(f"{width}x{height}+{x}+{y}")
-        dialog.lift()
-        dialog.focus_force()
+
+        def present_centered_dialog():
+            if not dialog.winfo_exists():
+                return
+            dialog.deiconify()
+            dialog.lift()
+            dialog.focus_force()
+            dialog.grab_set()
+
+        dialog.after_idle(present_centered_dialog)
 
     @staticmethod
     def _friendly_modified(path: Path | None) -> str:
@@ -828,6 +867,30 @@ class OrchidPurchaseManager(ctk.CTk):
         except Exception:
             pass
         return state
+
+    def _bind_active_review_workbook(self, workbook_path: Path) -> None:
+        """Persist the one workbook allowed to represent the active CSV packet."""
+        state = self._load_review_state()
+        bound = bind_active_workbook(state, Path(workbook_path))
+        self._write_review_state_atomic(bound)
+
+    def _active_packet_is_valid(self, workbook_path: Path | None = None) -> tuple[bool, str]:
+        """Reject a stale review before it can feed any active-event screen."""
+        state = self._load_review_state()
+        return active_workbook_matches_state(state, workbook_path or self.last_review_workbook)
+
+    def _require_active_packet(self, action: str) -> bool:
+        """Show one clear stop instead of silently falling back to an old event."""
+        valid, reason = self._active_packet_is_valid()
+        if valid:
+            return True
+        messagebox.showerror(
+            "Active Event Verification Required",
+            f"Orchid blocked {action} because the selected Purchase Review is not proven to belong to the active CSV.\n\n"
+            f"{reason}\n\n"
+            "No old event data was used. Return to Current Event and process the selected CSV again.",
+        )
+        return False
 
     @staticmethod
     def _review_issue_signature(issue: dict | None) -> str:
@@ -1217,8 +1280,7 @@ class OrchidPurchaseManager(ctk.CTk):
         divider = ctk.CTkFrame(nav, height=1, fg_color="#40375A", corner_radius=0)
         divider.grid(row=7, column=0, sticky="ew", padx=10, pady=(16, 12))
         for row, page, label in [
-            (8, "archive", "▦   Event Archive"),
-            (9, "settings", "⚙   Settings & Tools"),
+            (8, "settings", "⚙   Settings & Tools"),
         ]:
             button = ctk.CTkButton(
                 nav, text=label, command=lambda p=page: self.show_page(p), anchor="w",
@@ -1231,7 +1293,7 @@ class OrchidPurchaseManager(ctk.CTk):
         footer = ctk.CTkFrame(sidebar, fg_color="transparent")
         footer.grid(row=4, column=0, sticky="ew", padx=14, pady=(8, 14))
         ctk.CTkLabel(
-            footer, text="v 4.9.12 RC13", text_color="#CFC4E0",
+            footer, text="v 4.9.104", text_color="#CFC4E0",
             font=ctk.CTkFont(size=12), justify="left", anchor="w",
         ).pack(anchor="w", padx=8, pady=(0, 10))
         ctk.CTkFrame(footer, height=1, fg_color="#40375A").pack(fill="x", padx=7, pady=(0, 11))
@@ -1313,7 +1375,6 @@ class OrchidPurchaseManager(ctk.CTk):
             "purchase": self.build_purchase_page,
             "employees": self.build_employee_totals_page,
             "job_logo": self.build_outsourced_job_logo_page,
-            "archive": self.build_archive_page,
             "settings": self.build_settings_page,
         }
 
@@ -2002,9 +2063,10 @@ class OrchidPurchaseManager(ctk.CTk):
             ("Open Purchase Review", lambda: self.show_page("review")),
             ("Regenerate Purchase Review", self.regenerate_current_review),
             ("Employee Totals", lambda: self.show_page("employees")),
-            ("In-House Receiving Report", lambda: self._open_generated_report("in-house")),
-            ("Outsourced Job Report", lambda: self._open_generated_report("outsourced")),
-            ("Non-Included Items", lambda: self._open_generated_report("non-included")),
+            ("Receiving & Decoration Report", lambda: self._open_generated_report("in-house")),
+            ("Outsourced Embroidery Report", lambda: self._open_generated_report("outsourced-embroidery")),
+            ("Outsourced Screen-Printing Report", lambda: self._open_generated_report("outsourced-screen-printing")),
+            ("Ship to Orchid Purchase Order", lambda: self._open_generated_report("non-included")),
             ("Purchase Documents", self.open_latest_purchase_orders),
         ]
         self.mc_management_action_buttons = {}
@@ -2032,12 +2094,20 @@ class OrchidPurchaseManager(ctk.CTk):
             messagebox.showinfo("Report Not Generated", "Generate purchase orders and reports first.")
             return
         tokens = {
-            "in-house": ("in-house", "receiving"),
+            "in-house": ("receiving", "decoration", "report"),
             "outsourced": ("outsourced", "decoration"),
-            "non-included": ("non-included", "non included"),
+            "outsourced-embroidery": ("outsourced", "embroidery", "job"),
+            "outsourced-screen-printing": ("outsourced", "screen", "printing", "job"),
+            "non-included": ("ship_to_orchid", "ship to orchid", "non-included", "non included"),
         }.get(report_kind, (report_kind,))
         candidates = sorted(root.rglob("*.pdf"), key=lambda path: path.stat().st_mtime, reverse=True)
-        match = next((path for path in candidates if any(token in path.name.casefold() for token in tokens)), None)
+        # A department report must match every part of its filename; matching
+        # only "outsourced" would otherwise open whichever department happened
+        # to sort first.
+        if report_kind == "non-included":
+            match = next((path for path in candidates if any(token in path.name.casefold() for token in tokens)), None)
+        else:
+            match = next((path for path in candidates if all(token in path.name.casefold() for token in tokens)), None)
         if match is None:
             messagebox.showinfo("Report Not Generated", "That report has not been generated for the current event yet.")
             return
@@ -2123,7 +2193,12 @@ class OrchidPurchaseManager(ctk.CTk):
             employee_button.configure(state="normal" if should_show_employee_totals(snapshot, bool(self.last_review_workbook), self.current_mode, self.imported_line_count) else "disabled")
         report_root, _using_archive_fallback = self._purchase_order_release_location()
         report_state = "normal" if report_root else "disabled"
-        for label in ("In-House Receiving Report", "Outsourced Job Report", "Non-Included Items"):
+        for label in (
+            "Receiving & Decoration Report",
+            "Outsourced Embroidery Report",
+            "Outsourced Screen-Printing Report",
+            "Ship to Orchid Purchase Order",
+        ):
             button = self.mc_management_action_buttons.get(label)
             if button is not None:
                 button.configure(state=report_state)
@@ -2185,17 +2260,41 @@ class OrchidPurchaseManager(ctk.CTk):
             print(f"Product candidate sync warning: {error}", file=sys.stderr)
             return {"changed": False, "error": str(error)}
 
-    def _review_is_stale(self) -> bool:
+    def _purchase_review_routing_status(self, force: bool = False) -> dict:
+        """Return whether Product Master can still change this event's PO routes.
+
+        This intentionally ignores a thread/ink color or catalog-only update.
+        It becomes stale only when an active line's vendor, decoration
+        type/location, or Never Outsource result would change.
+        """
+        workbook = self.last_review_workbook
+        if not workbook or not Path(workbook).is_file():
+            return {"current": True, "reason": "", "changes": []}
+        master = live_product_master_path()
+        override = Path(master).parent / "never_outsource_overrides.json"
+        cache_key = (_file_stamp(Path(workbook)), _file_stamp(master), _file_stamp(override))
+        if not force and cache_key == self._routing_status_cache_key:
+            return dict(self._routing_status_cache)
         try:
-            master = live_product_master_path()
-            return bool(
-                self.last_review_workbook
-                and self.last_review_workbook.exists()
-                and master.exists()
-                and master.stat().st_mtime > self.last_review_workbook.stat().st_mtime
-            )
-        except Exception:
-            return False
+            status = review_routing_status(Path(workbook))
+            if not isinstance(status, dict):
+                raise RuntimeError("Routing check returned an invalid result.")
+        except Exception as error:
+            status = {
+                "current": False,
+                "reason": f"Orchid could not verify current Product Master routing: {error}",
+                "changes": [],
+            }
+        self._routing_status_cache_key = cache_key
+        self._routing_status_cache = dict(status)
+        return dict(status)
+
+    def _review_is_stale(self) -> bool:
+        if not self._is_archived_report_reopen() and self.last_review_workbook:
+            valid, _reason = self._active_packet_is_valid(self.last_review_workbook)
+            if not valid:
+                return True
+        return not bool(self._purchase_review_routing_status().get("current", False))
 
     def _poll_product_master_updates(self):
         try:
@@ -2273,7 +2372,7 @@ class OrchidPurchaseManager(ctk.CTk):
         self.show_page("review")
         self._load_review_page_async(force=True)
 
-    def regenerate_current_review(self, silent: bool = False):
+    def regenerate_current_review(self, silent: bool = False, return_to_purchase: bool = False):
         from modules.review_workbook import generate_review_workbook
 
         if self._regenerating_review:
@@ -2288,25 +2387,56 @@ class OrchidPurchaseManager(ctk.CTk):
             if not source_csv.exists():
                 messagebox.showerror("Orders File Missing", f"The saved order CSV can no longer be found:\n{source_csv}")
                 return
+            if not _clean(state.get("active_packet_id", "")):
+                upgraded = new_active_packet_state(source_csv)
+                active_packet_id = upgraded["active_packet_id"]
+                upgraded.update(state)
+                upgraded["active_packet_id"] = active_packet_id
+                state = upgraded
+                self._write_review_state_atomic(state)
             result = generate_review_workbook(
                 source_csv, live_product_master_path(), REPORTS,
                 report_mode=state.get("report_mode") or GENERAL_SALES_PERIOD,
                 event_name=state.get("event_name") or "",
+                active_packet_id=_clean(state.get("active_packet_id", "")),
                 decoration_fulfillment=state.get("decoration_fulfillment") or STANDARD_ORCHID_WORKFLOW,
                 regenerate_helper=REGENERATE_HELPER,
                 previous_review_path=self.last_review_workbook,
             )
             self.selected_csv = source_csv
             self.last_review_workbook = Path(result["output_path"])
+            self._bind_active_review_workbook(self.last_review_workbook)
             self._reset_review_navigation()
             self.current_event_name = result.get("event_name") or self.current_event_name or "General Sales Period"
             self.current_mode = result.get("report_mode") or self.current_mode
             self.current_decoration_fulfillment = result.get("decoration_fulfillment") or self.current_decoration_fulfillment
             self.imported_line_count = int(result.get("lines", 0))
             self.review_needed = int(result.get("review_decisions", result.get("review_lines", 0)))
+            refreshed_state = self._load_review_state()
+            refreshed_state.pop("decoration_color_audit_requires_regeneration", None)
+            refreshed_state.pop("additional_import_pending", None)
+            self._write_review_state_atomic(refreshed_state)
+            self._routing_status_cache_key = None
             self._sync_current_product_candidates()
             self.refresh_dashboard()
-            if silent:
+            if return_to_purchase:
+                self.show_page("purchase")
+                self.refresh_purchase_page()
+                snapshot = self._fresh_snapshot()
+                review_count = int(snapshot.get("review_count", 0) or 0)
+                blocked = int(snapshot.get("blocked_route_count", 0) or 0)
+                if review_count or blocked:
+                    messagebox.showwarning(
+                        "Purchase Review Needs Attention",
+                        "Product Master routing was refreshed, but the updated event has decisions that need attention before Purchase Orders can be created."
+                    )
+                    self.show_page("review")
+                else:
+                    messagebox.showinfo(
+                        "Purchase Review Refreshed",
+                        "Current routing was applied. You are back on Purchase Orders and can continue PO generation."
+                    )
+            elif silent:
                 self.dashboard_status.configure(
                     text="Purchase Review refreshed automatically after Product Master was saved.",
                     text_color=SUCCESS,
@@ -2538,10 +2668,29 @@ class OrchidPurchaseManager(ctk.CTk):
                 "employee_count": 0, "employee_grand_total": 0.0,
             }
             return self._mission_snapshot_cache
+        if REVIEW_STATE_FILE.exists() and not self._is_archived_report_reopen():
+            active_valid, active_reason = self._active_packet_is_valid(self.last_review_workbook)
+            if not active_valid:
+                self._mission_snapshot_cache_key = ("unverified-active-packet", _file_stamp(self.last_review_workbook))
+                self._mission_snapshot_cache = {
+                    "issues": [], "routes": [], "review_count": 0, "blocked_route_count": 0,
+                    "workflow_blocked": True, "line_count": 0, "ready_count": 0,
+                    "event_name": "", "report_mode": "", "employee_totals": [],
+                    "employee_count": 0, "employee_grand_total": 0.0,
+                    "active_packet_error": active_reason,
+                }
+                return self._mission_snapshot_cache
         cache_key = (
             _file_stamp(self.last_review_workbook),
             _file_stamp(DATA / "mission_control_state.json"),
             _file_stamp(REVIEW_STATE_FILE),
+            # Product Master is part of the live review decision.  A workbook
+            # warning can be resolved after the workbook was created, so its
+            # saved file stamp must invalidate the snapshot as well.  Without
+            # this, the dashboard can continue to show an old "Needs Setup"
+            # count even while Product Master correctly says every style is
+            # complete.
+            _file_stamp(live_product_master_path()),
         )
         if not force and cache_key == self._mission_snapshot_cache_key:
             snapshot = self._overlay_completed_review_state(
@@ -2737,10 +2886,27 @@ class OrchidPurchaseManager(ctk.CTk):
         return amount
 
     def _render_employee_totals(self, snapshot: dict):
+        records = list(snapshot.get("employee_totals", []))
+        render_key = (
+            _file_stamp(self.last_review_workbook),
+            str(snapshot.get("report_mode", "") or ""),
+            tuple(
+                (
+                    record.get("row"), record.get("employee"), record.get("company"),
+                    record.get("order_numbers"), record.get("order_total"), record.get("discount"), record.get("total"),
+                )
+                for record in records
+            ),
+        )
+        # Avoid rebuilding the editable table when nothing in the saved source
+        # changed.  This keeps the page responsive and preserves a discount the
+        # user is actively typing until they choose Save Totals.
+        if render_key == getattr(self, "_employee_totals_render_key", None):
+            return
         self._clear_children(self.mc_employee_scroll)
         self.employee_discount_vars = {}
         self.employee_total_labels = {}
-        records = list(snapshot.get("employee_totals", []))
+        self._employee_totals_render_key = render_key
         self.employee_records_by_row = {
             int(record.get("row", index + 1)): dict(record)
             for index, record in enumerate(records)
@@ -2889,6 +3055,8 @@ class OrchidPurchaseManager(ctk.CTk):
 
         if not self.last_review_workbook or not self.last_review_workbook.exists():
             raise FileNotFoundError("Create a Uniform Sizing Event purchase packet first.")
+        if not self._require_active_packet("Employee Totals"):
+            raise RuntimeError("Employee Totals was blocked because the active packet could not be verified.")
         # Save onscreen discounts first so the shared PDF is current.
         if self.employee_discount_vars:
             discounts = {row: self._discount_value(var.get()) for row, var in self.employee_discount_vars.items()}
@@ -2936,17 +3104,21 @@ class OrchidPurchaseManager(ctk.CTk):
         return None
 
     def _outsourced_job_logo_metadata_path(self, workbook_path: Path | None = None, event_name: str = ""):
-        """Return the sidecar file that keeps the production job name with its logo."""
+        """Return the sidecar file that keeps outsourced-cover setup with the event."""
         workbook = Path(workbook_path or self.last_review_workbook) if (workbook_path or self.last_review_workbook) else None
         if not workbook:
             return None
         event_key = safe_filename(event_name or self.current_event_name or "Current Event")
         return workbook.parent / f"{event_key}__Outsourced_Job_Logo_Metadata.json"
 
-    def _outsourced_job_name(self) -> str:
-        """Load the optional production name recognized by the outside decorator."""
+    def _outsourced_job_metadata(self) -> dict:
+        """Load the saved job-cover setup, including per-color artwork files.
+
+        Older events have a metadata file containing only ``outsourced_job_name``.
+        Treat that as a valid first version so archived packets continue to open.
+        """
         if not self.last_review_workbook:
-            return ""
+            return {}
         workbook = Path(self.last_review_workbook)
         event_key = safe_filename(self.current_event_name or "Current Event")
         candidates = [
@@ -2956,12 +3128,62 @@ class OrchidPurchaseManager(ctk.CTk):
         for candidate in candidates:
             try:
                 payload = json.loads(candidate.read_text(encoding="utf-8"))
-                value = _clean(payload.get("outsourced_job_name", payload.get("job_name", "")))
-                if value:
-                    return value
             except (OSError, ValueError, TypeError, AttributeError):
                 continue
-        return ""
+            if isinstance(payload, dict):
+                payload.setdefault("artwork", {})
+                if not isinstance(payload["artwork"], dict):
+                    payload["artwork"] = {}
+                return payload
+        return {"artwork": {}}
+
+    def _save_outsourced_job_metadata(self, payload: dict) -> bool:
+        metadata_path = self._outsourced_job_logo_metadata_path()
+        if not metadata_path:
+            return False
+        payload = dict(payload or {})
+        payload["updated_at"] = time.time()
+        payload.setdefault("artwork", {})
+        try:
+            metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = metadata_path.with_name(
+                f".{metadata_path.name}.{os.getpid()}.{int(time.time() * 1000)}.tmp"
+            )
+            try:
+                temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+                os.replace(temporary, metadata_path)
+            finally:
+                if temporary.exists():
+                    temporary.unlink(missing_ok=True)
+            return True
+        except OSError:
+            return False
+
+    def _outsourced_job_name(self) -> str:
+        """Load the optional production name recognized by the outside decorator."""
+        payload = self._outsourced_job_metadata()
+        return _clean(payload.get("outsourced_job_name", payload.get("job_name", "")))
+
+    def _outsourced_cover_notes(self) -> str:
+        return _clean(self._outsourced_job_metadata().get("cover_notes", ""))
+
+    def _outsourced_to_for_department(self, department: str = "", payload: dict | None = None) -> str:
+        """Return the event's destination for one outsourced report department.
+
+        The destination is intentionally an event setting rather than a Product
+        Master field: the same product can go to a different outside decorator
+        from one job to the next.  Older packets did not save a destination, so
+        they keep Orchid's established Stitch N Print default.
+        """
+        department = self._outsourced_report_department(department) or "embroidery"
+        metadata = payload if isinstance(payload, dict) else self._outsourced_job_metadata()
+        saved = metadata.get("outsourced_to", {}) if isinstance(metadata, dict) else {}
+        if isinstance(saved, dict):
+            value = _clean(saved.get(department, ""))
+        else:
+            # Be tolerant of an early single-value draft if one is ever saved.
+            value = _clean(saved)
+        return value or "Stitch N Print"
 
     def save_outsourced_job_name(self, show_confirmation: bool = True) -> str:
         """Persist the printable job/logo name beside the active event logo."""
@@ -2973,27 +3195,11 @@ class OrchidPurchaseManager(ctk.CTk):
             name = _clean(self.outsourced_logo_name_var.get())[:160]
         else:
             name = self._outsourced_job_name()
-        metadata_path = self._outsourced_job_logo_metadata_path()
-        if not metadata_path:
-            return ""
-        payload = {
-            "outsourced_job_name": name,
-            "updated_at": time.time(),
-        }
-        try:
-            metadata_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = metadata_path.with_name(
-                f".{metadata_path.name}.{os.getpid()}.{int(time.time() * 1000)}.tmp"
-            )
-            try:
-                temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-                os.replace(temporary, metadata_path)
-            finally:
-                if temporary.exists():
-                    temporary.unlink(missing_ok=True)
-        except OSError as error:
+        payload = self._outsourced_job_metadata()
+        payload["outsourced_job_name"] = name
+        if not self._save_outsourced_job_metadata(payload):
             if show_confirmation:
-                messagebox.showerror("Unable to Save Job Name", str(error))
+                messagebox.showerror("Unable to Save Job Name", "Orchid could not save the outsourced job-cover details.")
             return ""
         if hasattr(self, "dashboard_status"):
             summary = name or "Use the event name"
@@ -3007,6 +3213,194 @@ class OrchidPurchaseManager(ctk.CTk):
         self.refresh_outsourced_job_logo_page()
         return name
 
+    @staticmethod
+    def _artwork_label(decoration_type: str, color: str) -> str:
+        suffix = "Thread" if "embroider" in decoration_type.casefold() else "Ink" if "screen" in decoration_type.casefold() else "Artwork"
+        return f"{_clean(color)} {suffix}".strip()
+
+    @staticmethod
+    def _outsourced_report_department(value: str) -> str:
+        text = _clean(value).casefold()
+        if "embroider" in text:
+            return "embroidery"
+        if "screen" in text:
+            return "screen-printing"
+        return ""
+
+    def _active_outsourced_report_department(self) -> str:
+        selection = (
+            self.outsourced_report_type_var.get()
+            if hasattr(self, "outsourced_report_type_var")
+            else "Embroidery"
+        )
+        return self._outsourced_report_department(selection) or "embroidery"
+
+    def _select_outsourced_report_department(self, selection: str) -> None:
+        """Switch the Logo-page department with an unmistakable visual state."""
+        if selection not in {"Embroidery", "Screen Printing"}:
+            return
+        self.outsourced_report_type_var.set(selection)
+        self.refresh_outsourced_job_logo_page()
+
+    def _configure_outsourced_report_department_tabs(self, state: str) -> None:
+        """Give embroidery and screen printing independent, high-contrast tab states."""
+        if not hasattr(self, "outsourced_embroidery_tab") or not hasattr(self, "outsourced_screen_printing_tab"):
+            return
+        selected = self.outsourced_report_type_var.get()
+        embroidery_selected = selected == "Embroidery"
+        screen_printing_selected = selected == "Screen Printing"
+        disabled = state == "disabled"
+        self.outsourced_embroidery_tab.configure(
+            state=state,
+            fg_color="#5B21B6" if embroidery_selected and not disabled else ("#E8E1F3" if disabled else "#F2ECFA"),
+            hover_color="#4C1D95" if embroidery_selected else "#E4D8F3",
+            border_color="#5B21B6" if embroidery_selected else "#C8B4E4",
+            text_color=WHITE if embroidery_selected and not disabled else ("#8A8490" if disabled else "#43206F"),
+        )
+        self.outsourced_screen_printing_tab.configure(
+            state=state,
+            fg_color="#1E4F7A" if screen_printing_selected and not disabled else ("#E1E7EC" if disabled else "#EAF3FA"),
+            hover_color="#173E62" if screen_printing_selected else "#D7E8F5",
+            border_color="#1E4F7A" if screen_printing_selected else "#AFC7D9",
+            text_color=WHITE if screen_printing_selected and not disabled else ("#8A8490" if disabled else "#173E62"),
+        )
+
+    @staticmethod
+    def _outsourced_report_department_label(department: str) -> str:
+        return "Screen Printing" if department == "screen-printing" else "Embroidery"
+
+    def _outsourced_cover_artwork_reference_spec(self, department: str) -> dict:
+        """Return the always-available artwork row for one report department.
+
+        A job can need its artwork loaded before its finalized thread/ink colors
+        are present in the Purchase Review.  This department-specific reference
+        keeps both tabs useful at every stage while preserving the optional,
+        color-specific artwork rows below it.
+        """
+        selected = self._outsourced_report_department(department)
+        label = self._outsourced_report_department_label(selected)
+        return {
+            "key": f"{selected}::artwork-reference",
+            "decoration_type": label,
+            "color": "",
+            "label": f"{label} Artwork Reference",
+            "locations": set(),
+            "department": selected,
+            "reference_only": True,
+        }
+
+    def _outsourced_cover_artwork_specs(self, department: str = "") -> list[dict]:
+        """Return the actual color/type artwork rows needed by the active event."""
+        if not self.last_review_workbook or not Path(self.last_review_workbook).is_file():
+            return []
+        try:
+            fulfillment = load_decoration_fulfillment(self.last_review_workbook)
+            records = load_review_lines(self.last_review_workbook)
+        except Exception:
+            return []
+        selected_department = self._outsourced_report_department(department)
+        grouped: dict[str, dict] = {}
+        for row in records:
+            decoration_type = _clean(row.get("Operational Decoration Type") or row.get("Decoration Type"))
+            color = _clean(row.get("Operational Decoration Color") or row.get("Decoration Color"))
+            location = _clean(row.get("Operational Decoration Location") or row.get("Decoration Location"))
+            if not decoration_type or not color:
+                continue
+            report_department = self._outsourced_report_department(decoration_type)
+            if not report_department or (selected_department and report_department != selected_department):
+                continue
+            if not is_outsourced_decoration(
+                decoration_type, fulfillment,
+                do_not_outsource=_clean(row.get("Do Not Outsource", "")).casefold() in {"yes", "true", "1"},
+            ):
+                continue
+            key = f"{decoration_type.casefold()}::{color.casefold()}"
+            item = grouped.setdefault(key, {
+                "key": key,
+                "decoration_type": decoration_type,
+                "color": color,
+                "label": self._artwork_label(decoration_type, color),
+                "locations": set(),
+                "department": report_department,
+            })
+            if location:
+                item["locations"].add(location)
+        return sorted(
+            grouped.values(),
+            key=lambda item: (item["decoration_type"].casefold(), item["color"].casefold()),
+        )
+
+    def _outsourced_cover_artwork_entries(self, department: str = "") -> list[dict]:
+        """Resolve the artwork that belongs on an outsourced report cover."""
+        if not self.last_review_workbook:
+            return []
+        metadata = self._outsourced_job_metadata()
+        artwork = metadata.get("artwork", {})
+        parent = Path(self.last_review_workbook).parent
+        entries = []
+        departments = (
+            [self._outsourced_report_department(department)]
+            if department else ["embroidery", "screen-printing"]
+        )
+        for selected_department in departments:
+            department_entries = []
+            for spec in self._outsourced_cover_artwork_specs(selected_department):
+                saved = artwork.get(spec["key"], {}) if isinstance(artwork, dict) else {}
+                filename = _clean(saved.get("filename", "")) if isinstance(saved, dict) else ""
+                candidate = parent / filename if filename and Path(filename).name == filename else None
+                if candidate and candidate.is_file():
+                    department_entries.append({**spec, "path": candidate})
+            # A department-wide reference is the practical fallback when a job
+            # has only one logo or when its final thread/ink colors are not
+            # available yet. It deliberately stays off that department's cover
+            # once color-specific artwork has been supplied, avoiding duplicate
+            # artwork on the same report.
+            if not department_entries:
+                reference = self._outsourced_cover_artwork_reference_spec(selected_department)
+                saved = artwork.get(reference["key"], {}) if isinstance(artwork, dict) else {}
+                filename = _clean(saved.get("filename", "")) if isinstance(saved, dict) else ""
+                candidate = parent / filename if filename and Path(filename).name == filename else None
+                if candidate and candidate.is_file():
+                    department_entries.append({**reference, "path": candidate})
+            entries.extend(department_entries)
+        # Legacy events with one uploaded job logo continue to render usable
+        # artwork until their next report regeneration.
+        if not entries:
+            legacy = self._outsourced_job_logo_path()
+            if legacy and legacy.is_file():
+                entries.append({
+                    "key": "legacy-job-logo", "decoration_type": "", "color": "",
+                    "label": "Artwork Reference", "locations": set(), "path": legacy,
+                })
+        return entries
+
+    def save_outsourced_cover_details(self, show_confirmation: bool = True) -> bool:
+        if not self.last_review_workbook or not Path(self.last_review_workbook).is_file():
+            if show_confirmation:
+                messagebox.showinfo("Outsourced Report Cover", "Create the Purchase Review before saving cover details.")
+            return False
+        payload = self._outsourced_job_metadata()
+        payload["outsourced_job_name"] = _clean(self.outsourced_logo_name_var.get())[:160]
+        payload["cover_notes"] = _clean(self.outsourced_cover_notes_text.get("1.0", "end"))[:1200]
+        department = self._active_outsourced_report_department()
+        destinations = payload.get("outsourced_to", {})
+        if not isinstance(destinations, dict):
+            destinations = {}
+        destinations[department] = _clean(self.outsourced_to_var.get())[:160] or "Stitch N Print"
+        payload["outsourced_to"] = destinations
+        if not self._save_outsourced_job_metadata(payload):
+            if show_confirmation:
+                messagebox.showerror("Unable to Save Cover Details", "Orchid could not save the outsourced report cover details.")
+            return False
+        if show_confirmation:
+            destination = self._outsourced_to_for_department(department, payload)
+            messagebox.showinfo(
+                "Outsourced Report Cover Saved",
+                f"Job name, {self._outsourced_report_department_label(department)} destination ({destination}), and special notes are ready for the next report generation.",
+            )
+        self.refresh_outsourced_job_logo_page()
+        return True
+
     def build_outsourced_job_logo_page(self):
         page = self.new_page("job_logo")
         card = ctk.CTkFrame(page, fg_color=WHITE, border_width=1, border_color=BORDER, corner_radius=18)
@@ -3014,68 +3408,93 @@ class OrchidPurchaseManager(ctk.CTk):
         card.grid_columnconfigure(0, weight=1)
         page.grid_rowconfigure(0, weight=1)
         ctk.CTkLabel(
-            card, text="Outsourced Job Details", text_color=PURPLE_DARK,
+            card, text="Outsourced Report Covers", text_color=PURPLE_DARK,
             font=ctk.CTkFont(size=28, weight="bold"),
         ).grid(row=0, column=0, padx=30, pady=(34, 6))
         ctk.CTkLabel(
             card,
-            text="Name the job the way the outside decorator recognizes it, then upload the customer or job logo that should appear on the report.",
-            text_color=MUTED, font=ctk.CTkFont(size=14), wraplength=720, justify="center",
+            text="Choose a report department, set its outsourced destination, then add only the artwork that belongs on that job report.",
+            text_color=MUTED, font=ctk.CTkFont(size=14), wraplength=820, justify="center",
         ).grid(row=1, column=0, padx=30, pady=(0, 24))
-        ctk.CTkLabel(
-            card, text="Outsourced Job / Logo Name", text_color=PURPLE_DARK,
+        self.outsourced_report_type_var = ctk.StringVar(value="Embroidery")
+        self.outsourced_report_type_tabs = ctk.CTkFrame(
+            card, fg_color="#ECE7F1", border_width=1, border_color="#D4C9E3", corner_radius=13,
+        )
+        self.outsourced_report_type_tabs.grid(row=2, column=0, padx=30, pady=(0, 18))
+        self.outsourced_embroidery_tab = ctk.CTkButton(
+            self.outsourced_report_type_tabs, text="Embroidery",
+            command=lambda: self._select_outsourced_report_department("Embroidery"),
+            width=180, height=42, corner_radius=10, border_width=1,
             font=ctk.CTkFont(size=14, weight="bold"),
-        ).grid(row=2, column=0, padx=30, pady=(0, 6))
-        name_controls = ctk.CTkFrame(card, fg_color="transparent")
-        name_controls.grid(row=3, column=0, padx=30, pady=(0, 14))
+        )
+        self.outsourced_embroidery_tab.grid(row=0, column=0, padx=(4, 2), pady=4)
+        self.outsourced_screen_printing_tab = ctk.CTkButton(
+            self.outsourced_report_type_tabs, text="Screen Printing",
+            command=lambda: self._select_outsourced_report_department("Screen Printing"),
+            width=180, height=42, corner_radius=10, border_width=1,
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        self.outsourced_screen_printing_tab.grid(row=0, column=1, padx=(2, 4), pady=4)
+        self._configure_outsourced_report_department_tabs("normal")
+        cover_identity = ctk.CTkFrame(card, fg_color="#FAF7FD", border_width=1, border_color="#E1D5F0", corner_radius=14)
+        cover_identity.grid(row=3, column=0, sticky="ew", padx=54, pady=(0, 12))
+        cover_identity.grid_columnconfigure(0, weight=1)
+        cover_identity.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            cover_identity, text="Job Name", text_color=PURPLE_DARK,
+            font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=(16, 8), pady=(12, 4))
+        self.outsourced_to_heading = ctk.CTkLabel(
+            cover_identity, text="Outsourced To — Embroidery", text_color=PURPLE_DARK,
+            font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
+        )
+        self.outsourced_to_heading.grid(row=0, column=1, sticky="ew", padx=(8, 16), pady=(12, 4))
         self.outsourced_logo_name_var = ctk.StringVar()
         self.outsourced_logo_name_entry = ctk.CTkEntry(
-            name_controls, textvariable=self.outsourced_logo_name_var, width=430, height=42,
+            cover_identity, textvariable=self.outsourced_logo_name_var, height=42,
             placeholder_text="Example: Utilities Department", border_color="#BFA9DD",
         )
-        self.outsourced_logo_name_entry.pack(side="left", padx=(0, 8))
-        self.outsourced_logo_name_entry.bind("<Return>", lambda _event: self.save_outsourced_job_name())
+        self.outsourced_logo_name_entry.grid(row=1, column=0, sticky="ew", padx=(16, 8), pady=(0, 12))
+        self.outsourced_logo_name_entry.bind("<Return>", lambda _event: self.save_outsourced_cover_details())
+        self.outsourced_to_var = ctk.StringVar()
+        self.outsourced_to_entry = ctk.CTkEntry(
+            cover_identity, textvariable=self.outsourced_to_var, height=42,
+            placeholder_text="Stitch N Print", border_color=PURPLE, border_width=2,
+        )
+        self.outsourced_to_entry.grid(row=1, column=1, sticky="ew", padx=(8, 16), pady=(0, 12))
+        self.outsourced_to_entry.bind("<Return>", lambda _event: self.save_outsourced_cover_details())
         self.outsourced_logo_name_save_button = ctk.CTkButton(
-            name_controls, text="Save Name", command=self.save_outsourced_job_name,
-            width=132, height=42, fg_color=PURPLE_LIGHT, hover_color="#E6D9F5",
+            card, text="Save Cover Details", command=self.save_outsourced_cover_details,
+            width=190, height=42, fg_color=PURPLE_LIGHT, hover_color="#E6D9F5",
             border_width=1, border_color="#BFA9DD", text_color=PURPLE_DARK,
         )
-        self.outsourced_logo_name_save_button.pack(side="left")
+        self.outsourced_logo_name_save_button.grid(row=4, column=0, padx=30, pady=(0, 8))
         ctk.CTkLabel(
-            card, text="This is the first line of the outsourced report and is saved with the logo for Event Archive.",
+            card, text="Job Name is the large production name. Outsourced To is saved separately for Embroidery and Screen Printing and prints prominently on that cover.",
             text_color=MUTED, font=ctk.CTkFont(size=12),
-        ).grid(row=4, column=0, padx=30, pady=(0, 4))
-        self.outsourced_logo_preview = ctk.CTkLabel(
-            card, text="No job logo uploaded", width=420, height=230, corner_radius=16,
-            fg_color="#F7F3FC", text_color=MUTED, font=ctk.CTkFont(size=16, weight="bold"),
-        )
-        self.outsourced_logo_preview.grid(row=5, column=0, padx=30, pady=10)
+        ).grid(row=5, column=0, padx=30, pady=(0, 4))
+        details = ctk.CTkFrame(card, fg_color="transparent")
+        details.grid(row=6, column=0, sticky="ew", padx=54, pady=(14, 8))
+        details.grid_columnconfigure(0, weight=1)
+        details.grid_columnconfigure(1, weight=1)
+        self.outsourced_logo_location_heading = ctk.CTkLabel(details, text="Embroidery Locations", text_color=PURPLE_DARK, font=ctk.CTkFont(size=13, weight="bold"), anchor="w")
+        self.outsourced_logo_location_heading.grid(row=0, column=0, sticky="ew", padx=(0, 12), pady=(0, 5))
+        ctk.CTkLabel(details, text="Special Notes", text_color=PURPLE_DARK, font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=(0, 5))
+        self.outsourced_logo_location_summary = ctk.CTkLabel(details, text="Create a Purchase Review to read locations.", fg_color="#F7F3FC", corner_radius=12, text_color=TEXT, font=ctk.CTkFont(size=13, weight="bold"), justify="left", anchor="w", wraplength=355, height=92)
+        self.outsourced_logo_location_summary.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
+        self.outsourced_cover_notes_text = ctk.CTkTextbox(details, height=92, fg_color="#F7F3FC", border_width=1, border_color="#E1D5F0", text_color=TEXT, font=ctk.CTkFont(size=13), wrap="word")
+        self.outsourced_cover_notes_text.grid(row=1, column=1, sticky="nsew", padx=(12, 0))
+        self.outsourced_artwork_heading = ctk.CTkLabel(card, text="Embroidery Artwork by Thread Color", text_color=PURPLE_DARK, font=ctk.CTkFont(size=17, weight="bold"))
+        self.outsourced_artwork_heading.grid(row=7, column=0, padx=30, pady=(14, 2))
         self.outsourced_logo_status = ctk.CTkLabel(
             card, text="", text_color=TEXT, font=ctk.CTkFont(size=13, weight="bold"),
         )
-        self.outsourced_logo_status.grid(row=6, column=0, padx=30, pady=(4, 16))
-        buttons = ctk.CTkFrame(card, fg_color="transparent")
-        buttons.grid(row=7, column=0, pady=(0, 18))
-        self.outsourced_logo_upload_button = ctk.CTkButton(
-            buttons, text="Upload / Replace Logo", command=lambda: self.manage_outsourced_job_logo("upload"),
-            width=210, height=48, fg_color=PURPLE, hover_color=PURPLE_DARK,
-            font=ctk.CTkFont(size=14, weight="bold"),
-        )
-        self.outsourced_logo_upload_button.pack(side="left", padx=6)
-        self.outsourced_logo_preview_button = ctk.CTkButton(
-            buttons, text="Open Logo", command=lambda: self.manage_outsourced_job_logo("preview"),
-            width=145, height=48, fg_color=PURPLE_LIGHT, hover_color="#E6D9F5",
-            border_width=1, border_color="#BFA9DD", text_color=PURPLE_DARK,
-        )
-        self.outsourced_logo_preview_button.pack(side="left", padx=6)
-        self.outsourced_logo_remove_button = ctk.CTkButton(
-            buttons, text="Remove Logo", command=lambda: self.manage_outsourced_job_logo("remove"),
-            width=145, height=48, fg_color="transparent", hover_color=PURPLE_LIGHT,
-            border_width=1, border_color="#BFA9DD", text_color=PURPLE_DARK,
-        )
-        self.outsourced_logo_remove_button.pack(side="left", padx=6)
+        self.outsourced_logo_status.grid(row=8, column=0, padx=30, pady=(0, 8))
+        self.outsourced_artwork_rows = ctk.CTkScrollableFrame(card, fg_color="#FBF9FE", border_width=1, border_color="#E1D5F0", corner_radius=14, height=262)
+        self.outsourced_artwork_rows.grid(row=9, column=0, sticky="ew", padx=54, pady=(0, 16))
+        self.outsourced_artwork_rows.grid_columnconfigure(0, weight=1)
         report_buttons = ctk.CTkFrame(card, fg_color="transparent")
-        report_buttons.grid(row=8, column=0, pady=(0, 28))
+        report_buttons.grid(row=10, column=0, pady=(0, 28))
         self.outsourced_logo_regenerate_button = ctk.CTkButton(
             report_buttons, text="Regenerate Purchase Review & Reports",
             command=self.regenerate_review_and_reports,
@@ -3084,8 +3503,8 @@ class OrchidPurchaseManager(ctk.CTk):
         )
         self.outsourced_logo_regenerate_button.pack(side="left", padx=6)
         self.outsourced_logo_open_report_button = ctk.CTkButton(
-            report_buttons, text="Open Outsourced Job Report",
-            command=lambda: self._open_generated_report("outsourced"),
+            report_buttons, text="Open Embroidery Job Report",
+            command=lambda: self._open_generated_report("outsourced-embroidery"),
             width=235, height=46, fg_color=PURPLE_LIGHT, hover_color="#E6D9F5",
             border_width=1, border_color="#BFA9DD", text_color=PURPLE_DARK,
             font=ctk.CTkFont(size=13, weight="bold"),
@@ -3096,13 +3515,27 @@ class OrchidPurchaseManager(ctk.CTk):
         if not hasattr(self, "outsourced_logo_status"):
             return
         applicable = bool(self.last_review_workbook and self.last_review_workbook.exists())
-        current = self._outsourced_job_logo_path() if applicable else None
-        job_name = self._outsourced_job_name() if applicable else ""
+        department = self._active_outsourced_report_department()
+        department_label = self._outsourced_report_department_label(department)
+        artwork_kind = "Thread" if department == "embroidery" else "Ink"
+        payload = self._outsourced_job_metadata() if applicable else {}
+        job_name = _clean(payload.get("outsourced_job_name", payload.get("job_name", "")))
+        notes = _clean(payload.get("cover_notes", ""))
+        outsourced_to = self._outsourced_to_for_department(department, payload)
         state = "normal" if applicable else "disabled"
-        self.outsourced_logo_upload_button.configure(state=state)
         self.outsourced_logo_name_entry.configure(state=state)
+        self.outsourced_to_entry.configure(state=state)
         self.outsourced_logo_name_save_button.configure(state=state)
         self.outsourced_logo_name_var.set(job_name)
+        self.outsourced_to_var.set(outsourced_to)
+        self.outsourced_to_heading.configure(text=f"Outsourced To — {department_label}")
+        self._configure_outsourced_report_department_tabs(state)
+        self.outsourced_logo_location_heading.configure(text=f"{department_label} Locations")
+        self.outsourced_artwork_heading.configure(text=f"{department_label} Artwork by {artwork_kind} Color")
+        self.outsourced_cover_notes_text.configure(state="normal")
+        self.outsourced_cover_notes_text.delete("1.0", "end")
+        self.outsourced_cover_notes_text.insert("1.0", notes)
+        self.outsourced_cover_notes_text.configure(state=state)
         self.outsourced_logo_regenerate_button.configure(
             state=state,
             text=(
@@ -3111,36 +3544,134 @@ class OrchidPurchaseManager(ctk.CTk):
                 else "Regenerate Purchase Review & Reports"
             ),
         )
+        self.outsourced_logo_open_report_button.configure(
+            text=f"Open {department_label} Job Report",
+            command=lambda kind=f"outsourced-{department}": self._open_generated_report(kind),
+            state=state,
+        )
+        self._clear_children(self.outsourced_artwork_rows)
         if not applicable:
-            self.outsourced_logo_preview.configure(image=None, text="Create a Purchase Review first")
-            self.outsourced_logo_status.configure(text="Import orders and create the Purchase Review before uploading a logo.", text_color=WARNING)
-            self.outsourced_logo_preview_button.configure(state="disabled")
-            self.outsourced_logo_remove_button.configure(state="disabled")
+            self.outsourced_logo_location_summary.configure(text="Create a Purchase Review to read this department's locations.")
+            self.outsourced_logo_status.configure(text="Import orders and create the Purchase Review before setting up the report cover.", text_color=WARNING)
+            ctk.CTkLabel(self.outsourced_artwork_rows, text=f"{department_label} artwork choices will appear once Orchid can see the job's outsourced {artwork_kind.casefold()} colors.", text_color=MUTED, font=ctk.CTkFont(size=13), wraplength=760, justify="center").grid(row=0, column=0, padx=20, pady=42)
             return
-        if not current:
-            self.outsourced_logo_preview.configure(image=None, text="No job logo uploaded")
-            message = (
-                f"Report name saved: {job_name}. Choose a PNG, JPG, JPEG, or WEBP image."
-                if job_name else "Enter a report name, then choose a PNG, JPG, JPEG, or WEBP image."
+        specs = self._outsourced_cover_artwork_specs(department)
+        # Keep a full Replace / Open / Remove row on *both* tabs, even before
+        # Orchid can derive a department's color-specific artwork list.
+        reference_spec = self._outsourced_cover_artwork_reference_spec(department)
+        display_specs = [reference_spec, *specs]
+        locations = sorted({location for spec in specs for location in spec["locations"]}, key=str.casefold)
+        self.outsourced_logo_location_summary.configure(text=" • ".join(locations) if locations else f"No outsourced {department_label.casefold()} locations are currently in this job.")
+        artwork = payload.get("artwork", {}) if isinstance(payload.get("artwork", {}), dict) else {}
+        uploaded_count = 0
+        for row_index, spec in enumerate(display_specs):
+            saved = artwork.get(spec["key"], {}) if isinstance(artwork, dict) else {}
+            filename = _clean(saved.get("filename", "")) if isinstance(saved, dict) else ""
+            path = Path(self.last_review_workbook).parent / filename if filename and Path(filename).name == filename else None
+            exists = bool(path and path.is_file())
+            uploaded_count += int(exists)
+            row = ctk.CTkFrame(self.outsourced_artwork_rows, fg_color=WHITE, border_width=1, border_color=BORDER, corner_radius=11)
+            row.grid(row=row_index, column=0, sticky="ew", padx=8, pady=5)
+            row.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(row, text=spec["label"], text_color=PURPLE_DARK, font=ctk.CTkFont(size=14, weight="bold"), anchor="w").grid(row=0, column=0, sticky="ew", padx=(14, 8), pady=(9, 0))
+            context = (
+                f"Use one file for this entire {department_label.casefold()} job."
+                if spec.get("reference_only")
+                else " • ".join(filter(None, [spec["decoration_type"], ", ".join(sorted(spec["locations"], key=str.casefold))]))
             )
-            self.outsourced_logo_status.configure(text=message, text_color=MUTED)
-            self.outsourced_logo_preview_button.configure(state="disabled")
-            self.outsourced_logo_remove_button.configure(state="disabled")
+            ctk.CTkLabel(row, text=context or "Outsourced artwork", text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w").grid(row=1, column=0, sticky="ew", padx=(14, 8), pady=(0, 9))
+            ctk.CTkLabel(row, text="Artwork uploaded" if exists else "Artwork needed", text_color=SUCCESS if exists else WARNING, font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=1, rowspan=2, padx=8, pady=8)
+            ctk.CTkButton(row, text="Replace" if exists else "Upload", command=lambda item=spec: self.manage_outsourced_cover_artwork(item, "upload"), width=92, height=33, fg_color=PURPLE, hover_color=PURPLE_DARK).grid(row=0, column=2, rowspan=2, padx=4, pady=8)
+            ctk.CTkButton(row, text="Open", command=lambda item=spec: self.manage_outsourced_cover_artwork(item, "preview"), width=74, height=33, state="normal" if exists else "disabled", fg_color=PURPLE_LIGHT, hover_color="#E6D9F5", border_width=1, border_color="#BFA9DD", text_color=PURPLE_DARK).grid(row=0, column=3, rowspan=2, padx=4, pady=8)
+            ctk.CTkButton(row, text="Remove", command=lambda item=spec: self.manage_outsourced_cover_artwork(item, "remove"), width=82, height=33, state="normal" if exists else "disabled", fg_color="transparent", hover_color=PURPLE_LIGHT, border_width=1, border_color="#BFA9DD", text_color=PURPLE_DARK).grid(row=0, column=4, rowspan=2, padx=(4, 10), pady=8)
+        if not specs:
+            self.outsourced_logo_status.configure(
+                text=(
+                    f"Add the {department_label.casefold()} artwork now. "
+                    "Color-specific rows will appear automatically once this job has them."
+                ),
+                text_color=MUTED,
+            )
+        else:
+            self.outsourced_logo_status.configure(
+                text=(
+                    f"{uploaded_count} of {len(display_specs)} {department_label.casefold()} artwork file(s) uploaded. "
+                    "Use the artwork reference when one file covers the whole job, or add color-specific artwork below it."
+                ),
+                text_color=SUCCESS if uploaded_count else MUTED,
+            )
+
+    def manage_outsourced_cover_artwork(self, spec: dict, action: str) -> None:
+        if not self.last_review_workbook:
+            return
+        payload = self._outsourced_job_metadata()
+        artwork = payload.setdefault("artwork", {})
+        saved = artwork.get(spec["key"], {}) if isinstance(artwork, dict) else {}
+        filename = _clean(saved.get("filename", "")) if isinstance(saved, dict) else ""
+        current = Path(self.last_review_workbook).parent / filename if filename and Path(filename).name == filename else None
+        if action == "preview":
+            if current and current.is_file():
+                subprocess.run(["open", str(current)], check=False)
+            return
+        if action == "remove":
+            if not current or not current.is_file() or not messagebox.askyesno("Remove Cover Artwork?", f"Remove the {spec['label']} artwork from this event?"):
+                return
+            current.unlink(missing_ok=True)
+            artwork.pop(spec["key"], None)
+            self._save_outsourced_job_metadata(payload)
+            self.refresh_outsourced_job_logo_page()
+            return
+        self.save_outsourced_cover_details(show_confirmation=False)
+        self._outsourced_cover_artwork_dialog_spec = spec
+        self.after(1, self._open_outsourced_cover_artwork_dialog)
+
+    def _open_outsourced_cover_artwork_dialog(self) -> None:
+        spec = getattr(self, "_outsourced_cover_artwork_dialog_spec", None)
+        if not isinstance(spec, dict) or not self.last_review_workbook:
             return
         try:
-            image = PILImage.open(current).convert("RGBA")
-            image, _removed_white_canvas = remove_outer_near_white_background(image)
-            image.thumbnail((390, 200), PILImage.Resampling.LANCZOS)
-            self._outsourced_logo_preview_image = ctk.CTkImage(
-                light_image=image, dark_image=image, size=image.size,
+            selected = self._choose_outsourced_job_logo_file()
+            if not selected:
+                return
+            source = Path(selected)
+            if source.suffix.casefold() not in {".png", ".jpg", ".jpeg", ".webp"}:
+                messagebox.showwarning("Unsupported Artwork File", "Choose a PNG, JPG, JPEG, or WEBP image for the report cover.")
+                return
+            payload = self._outsourced_job_metadata()
+            artwork = payload.setdefault("artwork", {})
+            old = artwork.get(spec["key"], {}) if isinstance(artwork, dict) else {}
+            old_name = _clean(old.get("filename", "")) if isinstance(old, dict) else ""
+            event_key = safe_filename(self.current_event_name or "Current Event")
+            # Save a normalized transparent PNG for the outsourced cover.
+            # The original customer upload remains untouched; only Orchid's
+            # event copy is cleaned so rectangular image backgrounds do not
+            # print behind the logo.
+            filename = f"{event_key}__Outsourced_Artwork__{safe_filename(spec['key'])}.png"
+            target = Path(self.last_review_workbook).parent / filename
+            prepared = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+            try:
+                background_removed = prepare_artwork_for_report(source, prepared)
+                os.replace(prepared, target)
+            finally:
+                if prepared.exists():
+                    prepared.unlink(missing_ok=True)
+            artwork[spec["key"]] = {"label": spec["label"], "filename": filename}
+            if not self._save_outsourced_job_metadata(payload):
+                raise RuntimeError("The artwork file copied, but its event record could not be saved.")
+            if old_name and old_name != filename and Path(old_name).name == old_name:
+                (Path(self.last_review_workbook).parent / old_name).unlink(missing_ok=True)
+            self.dashboard_status.configure(
+                text=(
+                    f"Saved clean cover artwork: {spec['label']}"
+                    if background_removed else f"Saved cover artwork: {spec['label']}"
+                ),
+                text_color=SUCCESS,
             )
-            self.outsourced_logo_preview.configure(image=self._outsourced_logo_preview_image, text="")
-        except Exception:
-            self.outsourced_logo_preview.configure(image=None, text=current.name)
-        prefix = f"Report name: {job_name}  •  " if job_name else ""
-        self.outsourced_logo_status.configure(text=f"{prefix}Uploaded: {current.name}", text_color=SUCCESS)
-        self.outsourced_logo_preview_button.configure(state="normal")
-        self.outsourced_logo_remove_button.configure(state="normal")
+        except Exception as error:
+            messagebox.showerror("Unable to Save Cover Artwork", f"Orchid could not save that artwork.\n\n{error}")
+        finally:
+            self._outsourced_cover_artwork_dialog_spec = None
+            self.after(120, self.refresh_outsourced_job_logo_page)
 
     def manage_outsourced_job_logo(self, action: str = "upload"):
         if not self.last_review_workbook or not self.last_review_workbook.is_file():
@@ -3222,14 +3753,32 @@ end try
                 )
                 return
             event_key = safe_filename(self.current_event_name or "Current Event")
+            old_paths = []
             for ext in (".png", ".jpg", ".jpeg", ".webp"):
                 old = self.last_review_workbook.parent / f"{self.last_review_workbook.stem}__Outsourced_Job_Logo{ext}"
-                old.unlink(missing_ok=True)
                 stable_old = self.last_review_workbook.parent / f"{event_key}__Outsourced_Job_Logo{ext}"
-                stable_old.unlink(missing_ok=True)
-            target = self.last_review_workbook.parent / f"{event_key}__Outsourced_Job_Logo{source.suffix.lower()}"
-            shutil.copy2(source, target)
-            self.dashboard_status.configure(text=f"Outsourced job logo saved: {target.name}", text_color=SUCCESS)
+                old_paths.extend((old, stable_old))
+            # Store a clean transparent event copy. This is the same
+            # non-destructive cleanup used for uploaded outsourced-cover art,
+            # so Current Event and the PDF never display a rectangular canvas.
+            target = self.last_review_workbook.parent / f"{event_key}__Outsourced_Job_Logo.png"
+            prepared = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+            try:
+                background_removed = prepare_artwork_for_report(source, prepared)
+                os.replace(prepared, target)
+            finally:
+                if prepared.exists():
+                    prepared.unlink(missing_ok=True)
+            for old_path in old_paths:
+                if old_path != target:
+                    old_path.unlink(missing_ok=True)
+            self.dashboard_status.configure(
+                text=(
+                    "Saved clean transparent job logo"
+                    if background_removed else "Saved transparent job logo"
+                ),
+                text_color=SUCCESS,
+            )
         except Exception as error:
             try:
                 self.outsourced_logo_status.configure(
@@ -3346,8 +3895,10 @@ end try
         # While permanent setup decisions remain, Step 2 owns the workflow.
         # A review is considered stale only after those setup items are complete.
         review_stale = bool(has_active_review and product_master_count == 0 and self._review_is_stale())
+        review_state = self._load_review_state()
         audit_requires_regeneration = bool(
-            self._load_review_state().get("decoration_color_audit_requires_regeneration", False)
+            review_state.get("decoration_color_audit_requires_regeneration", False)
+            and (review_stale or review_state.get("additional_import_pending", False))
         )
         purchase_generated_for_current = bool(
             self.last_purchase_order_dir
@@ -3621,8 +4172,8 @@ end try
             font=ctk.CTkFont(size=23, weight="bold"), anchor="w",
         ).grid(row=0, column=0, padx=24, pady=(22, 4), sticky="ew")
         subtitle = (
-            "Enter one PO number for each vendor. These numbers are saved with this Purchase Review "
-            "and printed on every page of the vendor PDF."
+            "Enter one PO number for each vendor in this receiving packet. These numbers are saved with "
+            "this Purchase Review and appear on the vendor PDFs and the Receiving & Decoration Report."
         )
         ctk.CTkLabel(
             window, text=subtitle, text_color=MUTED,
@@ -3842,6 +4393,11 @@ end try
                 "audit_override": True,
                 "editing_search": True,
                 "allow_missing": True,
+                # A verification is valid only when it can be reapplied to the
+                # current event. Do not let final reconciliation silently drop
+                # a saved audit approval if neither its line ID nor its exact
+                # audit identity is present in the workbook.
+                "require_event_match": True,
             })
         return jobs
 
@@ -4028,7 +4584,14 @@ end try
                 updated = dict(job)
                 updated["workbook"] = str(building)
                 reconciled_jobs.append(updated)
-            self._apply_review_save_jobs(reconciled_jobs)
+            # A regenerated packet can legitimately omit a line that was
+            # completed in an earlier copy of the same event.  Reconciliation
+            # must retain every possibly-current decision, but a decision with
+            # no source, line, key, or unique semantic trace in either sheet is
+            # an orphaned historical marker and cannot block audit/report work.
+            self._apply_review_save_jobs(
+                reconciled_jobs, skip_orphaned_recovery_jobs=True
+            )
         os.replace(building, target)
         return target
 
@@ -4048,6 +4611,17 @@ end try
                 "This completed event is open only for job-name/logo updates and report regeneration. "
                 "The original archived event remains unchanged.",
             )
+            return
+        routing_status = self._purchase_review_routing_status()
+        if not routing_status.get("current", False):
+            messagebox.showwarning(
+                "Purchase Review Refresh Needed",
+                "Product Master changed a route used by this event. No PDFs were created.\n\n"
+                + _clean(routing_status.get("reason", ""))
+                + "\n\nUse Regenerate Purchase Review on this Purchase Orders page. Orchid will return you here afterward.",
+            )
+            self.show_page("purchase")
+            self.refresh_purchase_page()
             return
         active_workbook = Path(self.last_review_workbook)
         snapshot = self._fresh_snapshot()
@@ -4172,6 +4746,60 @@ end try
     def generate_latest_purchase_orders(self):
         self._prepare_purchase_orders_from_journal()
 
+    def generate_test_purchase_orders(self) -> None:
+        """Generate an audited test packet while holding unfinished review lines.
+
+        This is deliberately separate from normal PO generation.  It never
+        marks Purchase Review complete and cannot place an unanswered review
+        line into a vendor order.
+        """
+        if self._review_save_pending:
+            messagebox.showinfo(
+                "Finishing Purchase Review Saves",
+                "Wait for the current Purchase Review save to finish before generating a test packet.",
+            )
+            return
+        if not self.last_review_workbook or not self.last_review_workbook.is_file():
+            messagebox.showinfo("No Purchase Review", "Process the imported orders before generating a test packet.")
+            return
+        if not self._require_active_packet("Test purchase-order generation"):
+            return
+        routing_status = self._purchase_review_routing_status()
+        if not routing_status.get("current", False):
+            messagebox.showwarning(
+                "Purchase Review Refresh Needed",
+                "Product Master changed a route used by this event. Regenerate Purchase Review first so the test uses the current saved vendor and decoration setup.\n\n"
+                + _clean(routing_status.get("reason", "")),
+            )
+            return
+        snapshot = self._fresh_snapshot()
+        product_master_count = int(snapshot.get("product_master_count", 0) or 0)
+        if product_master_count:
+            messagebox.showwarning(
+                "Product Setup Still Required",
+                "Test purchase orders cannot guess missing permanent purchasing information. Complete the remaining Product Master setup first, then use Test Generate POs.\n\n"
+                + (self._blocker_summary(snapshot) or f"{product_master_count} product setup item(s) remain."),
+            )
+            return
+        pending = int(snapshot.get("review_count", 0) or 0)
+        blocked = int(snapshot.get("blocked_route_count", 0) or 0)
+        held = pending + blocked
+        if not messagebox.askyesno(
+            "Generate Audited Test Purchase Orders?",
+            "This creates TEST-numbered purchase-order PDFs for the fully configured lines only.\n\n"
+            f"{held} unfinished Purchase Review line{'s' if held != 1 else ''} will be held out of vendor orders and listed in a separate Held for Review report.\n\n"
+            "Before release, Orchid will verify that every included garment is accounted for exactly once. This does not mark Purchase Review complete. Continue?",
+            parent=self,
+        ):
+            return
+        self._run_final_purchase_order_generation(
+            self.last_review_workbook,
+            po_overrides={},
+            active_workbook_path=self.last_review_workbook,
+            hold_unresolved_review=True,
+            test_mode=True,
+        )
+
     def open_archived_report_regeneration(self) -> None:
         """Open the safe logo/name screen for a report-only archived event."""
         if not self.last_review_workbook or not self.last_review_workbook.is_file():
@@ -4225,6 +4853,8 @@ end try
         if not self.last_review_workbook or not self.last_review_workbook.exists():
             messagebox.showinfo("No Purchase Review", "Create a Purchase Review first.")
             return
+        if not self._require_active_packet("Purchase Order regeneration"):
+            return
         if hasattr(self, "outsourced_logo_name_var"):
             self.save_outsourced_job_name(show_confirmation=False)
         report_only_archive = self._is_archived_report_reopen()
@@ -4240,12 +4870,9 @@ end try
             )
             return
         if not report_only_archive:
-            # Product Master routes, including Never Outsource, are always
-            # authoritative. Refresh a stale review before it can send an
-            # in-house product to the outsourced decoration report.
-            if not review_uses_current_product_master(
-                self.last_review_workbook, live_product_master_path()
-            ):
+            # Refresh only when Product Master changed an active PO route.
+            # Thread/ink and catalog-only saves do not interrupt regeneration.
+            if self._review_is_stale():
                 self.regenerate_current_review(silent=True)
                 if not self.last_review_workbook or not self.last_review_workbook.exists():
                     return
@@ -4313,7 +4940,7 @@ end try
         self._build_workflow_tracker(page, 0, "current_event_stage_labels", padx=48)
 
         split = ctk.CTkFrame(page, fg_color="transparent")
-        split.grid(row=1, column=0, sticky="nsew", padx=48, pady=(2, 24))
+        split.grid(row=1, column=0, sticky="nsew", padx=48, pady=(2, 8))
         split.grid_columnconfigure(0, weight=11, uniform="current_event_split")
         split.grid_columnconfigure(1, weight=9, uniform="current_event_split")
         split.grid_rowconfigure(0, weight=1)
@@ -4343,7 +4970,7 @@ end try
         ctk.CTkLabel(
             illustration_card, text="", image=self.current_event_cats_image,
             fg_color="transparent",
-        ).grid(row=0, column=0, sticky="e", padx=0, pady=(0, 58))
+        ).grid(row=0, column=0, sticky="e", padx=0, pady=(0, 4))
 
         # The event action area intentionally blends into the shared Current
         # Event canvas instead of looking like a separate floating window.
@@ -4353,51 +4980,43 @@ end try
             split, fg_color="transparent", border_width=0,
             corner_radius=0,
         )
-        card.grid(row=0, column=1, sticky="nsew", padx=(0, 64), pady=(0, 58))
+        card.grid(row=0, column=1, sticky="nsew", padx=(0, 64), pady=(0, 6))
         card.grid_columnconfigure(0, weight=1)
         card.grid_rowconfigure(0, weight=1)
-        card.grid_rowconfigure(9, weight=2)
         self.current_event_card = card
         self.current_event_card_shadow = card_shadow
 
-        icon_source = PILImage.open(resource_path("assets", "workflow_import_purple.png")).convert("RGBA")
-        self.current_event_import_image = ctk.CTkImage(
-            light_image=icon_source, dark_image=icon_source, size=(48, 48)
-        )
-        self.current_event_icon = ctk.CTkLabel(
-            card, text="", image=self.current_event_import_image,
-            width=62, height=62, corner_radius=0,
-            fg_color="transparent",
-        )
-        self.current_event_icon.grid(row=1, column=0, pady=(48, 16))
+        # The Current Event actions already make importing and adding orders
+        # explicit.  Keep this hero focused on the active job and its logo;
+        # a second decorative import icon above it is redundant and distracting.
         self.current_event_title = ctk.CTkLabel(
             card, text="No Active Purchase Packet", text_color=PURPLE_DARK,
             font=ctk.CTkFont(size=33, weight="bold"), justify="center", wraplength=440,
         )
-        self.current_event_title.grid(row=2, column=0, padx=30, pady=(0, 12))
+        self.current_event_title.grid(row=1, column=0, padx=30, pady=(22, 8))
         self.current_event_job_logo = ctk.CTkLabel(
             card, text="", width=1, height=1, fg_color="transparent",
         )
-        self.current_event_job_logo.grid(row=3, column=0, padx=30, pady=(0, 12))
+        self.current_event_job_logo.grid(row=2, column=0, padx=30, pady=(0, 7))
         self.current_event_job_logo.grid_remove()
         self.current_event_body = ctk.CTkLabel(
             card, text="Import the Shopify or Report Toaster CSV for the orders you want to process. Product Master and saved settings are preserved.",
-            text_color="#51485F", font=ctk.CTkFont(size=17), justify="center", wraplength=430,
+            text_color="#51485F", font=ctk.CTkFont(size=16), justify="center", wraplength=430,
         )
-        self.current_event_body.grid(row=4, column=0, padx=38, pady=(0, 18))
+        self.current_event_body.grid(row=3, column=0, padx=38, pady=(0, 12))
         self.import_file_label = ctk.CTkLabel(
             card, text="No order CSV selected", text_color=TEXT,
-            fg_color="#EEEAF4", corner_radius=15, height=36,
+            fg_color="#EEEAF4", corner_radius=15, height=32,
             font=ctk.CTkFont(size=13, weight="bold"), justify="center",
         )
-        self.import_file_label.grid(row=5, column=0, padx=34, pady=(0, 16))
+        self.import_file_label.grid(row=4, column=0, padx=34, pady=(0, 10))
         self.current_event_details = ctk.CTkLabel(
             card, text="", text_color=MUTED, font=ctk.CTkFont(size=12),
             justify="center", wraplength=390,
         )
-        self.current_event_details.grid(row=6, column=0, padx=30, pady=(0, 10))
+        self.current_event_details.grid(row=5, column=0, padx=30, pady=(0, 6))
         buttons = ctk.CTkFrame(card, fg_color="transparent")
-        buttons.grid(row=7, column=0, sticky="ew", padx=46, pady=(0, 7))
+        buttons.grid(row=6, column=0, sticky="ew", padx=46, pady=(0, 4))
         buttons.grid_columnconfigure((0, 1), weight=1, uniform="event_actions")
         self.current_event_buttons = buttons
         self.current_event_primary = ctk.CTkButton(
@@ -4408,52 +5027,92 @@ end try
         self.current_event_primary.grid(row=0, column=0, columnspan=2, padx=5, pady=5)
         self.current_event_add = ctk.CTkButton(
             buttons, text="Add Orders CSV", command=self.add_orders_to_current_event,
-            width=190, height=46, corner_radius=10, fg_color=PURPLE, hover_color=PURPLE_DARK,
+            width=190, height=40, corner_radius=10, fg_color=PURPLE, hover_color=PURPLE_DARK,
             border_width=0, text_color=WHITE,
             font=ctk.CTkFont(size=13, weight="bold"),
         )
         self.current_event_add.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
         self.current_event_replace = ctk.CTkButton(
-            buttons, text="Replace CSV", command=self.replace_current_csv,
-            width=190, height=46, corner_radius=10, fg_color=PURPLE, hover_color=PURPLE_DARK,
+            buttons, text="Start New Event", command=self.start_new_purchase_packet,
+            width=190, height=40, corner_radius=10, fg_color=PURPLE, hover_color=PURPLE_DARK,
             border_width=0, text_color=WHITE,
             font=ctk.CTkFont(size=12, weight="bold"),
         )
-        self.current_event_replace.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
+        # Replacing an import must never compete with the longer Review button
+        # for horizontal space.  On the Current Event card the two buttons used
+        # to share a narrow row, which clipped the "CSV" part of the label on
+        # compact laptop windows.  Give each maintenance action its own stable,
+        # full-width row instead.
+        self.current_event_replace.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
         self.current_event_regenerate = ctk.CTkButton(
             buttons, text="Regenerate Purchase Review", command=self.regenerate_current_review,
-            width=220, height=46, corner_radius=10, fg_color=PURPLE, hover_color=PURPLE_DARK,
+            width=220, height=40, corner_radius=10, fg_color=PURPLE, hover_color=PURPLE_DARK,
             border_width=0, text_color=WHITE,
         )
-        self.current_event_regenerate.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
+        self.current_event_regenerate.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
         self.current_event_regenerate_po = ctk.CTkButton(
             buttons, text="Regenerate Purchase Orders", command=self.regenerate_current_purchase_orders,
-            width=220, height=46, corner_radius=10, fg_color=PURPLE, hover_color=PURPLE_DARK,
+            width=220, height=40, corner_radius=10, fg_color=PURPLE, hover_color=PURPLE_DARK,
             border_width=0, text_color=WHITE,
             font=ctk.CTkFont(size=12, weight="bold"),
         )
-        self.current_event_regenerate_po.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
+        self.current_event_regenerate_po.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
         self.current_event_edit_po = ctk.CTkButton(
             buttons, text="Edit PO Numbers", command=self.open_po_number_editor,
-            width=180, height=46, corner_radius=10, fg_color=PURPLE, hover_color=PURPLE_DARK,
+            width=180, height=40, corner_radius=10, fg_color=PURPLE, hover_color=PURPLE_DARK,
             border_width=0, text_color=WHITE,
             font=ctk.CTkFont(size=12, weight="bold"),
         )
-        self.current_event_edit_po.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
+        self.current_event_edit_po.grid(row=3, column=1, sticky="ew", padx=5, pady=5)
         self.current_event_discard = ctk.CTkButton(
-            buttons, text="Remove CSV / Clear Event", command=self.discard_current_event,
-            width=210, height=40, corner_radius=9, fg_color="#FFF1F1", hover_color="#FADDDD",
+            buttons, text="Finish & Clear Event", command=self.finish_and_clear_current_event,
+            width=210, height=38, corner_radius=9, fg_color="#FFF1F1", hover_color="#FADDDD",
             border_width=1, border_color="#D8A5A5", text_color=DANGER,
             font=ctk.CTkFont(size=13, weight="bold"),
         )
-        self.current_event_discard.grid(row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=(9, 0))
-        self.current_event_archive = ctk.CTkButton(
+        self.current_event_discard.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=(6, 0))
+        self.current_event_master = ctk.CTkButton(
             card, text="Open Product Master", command=lambda: self.show_page("master"),
-            width=250, height=42, corner_radius=10, fg_color=PURPLE,
+            width=250, height=40, corner_radius=10, fg_color=PURPLE,
             hover_color=PURPLE_DARK, text_color=WHITE,
             font=ctk.CTkFont(size=14, weight="bold"),
         )
-        self.current_event_archive.grid(row=8, column=0, pady=(0, 22))
+        self.current_event_master.grid(row=7, column=0, pady=(6, 8))
+
+        # The empty state is a single, centered composition.  Keep the normal
+        # two-column layout available for active purchase packets, where the
+        # customer/job logo belongs above the event details.
+        self._current_event_empty_layout_visible = False
+
+    def _show_current_event_empty_layout(self) -> None:
+        """Show the reliable centered empty-state layout without the glow seam."""
+        if not hasattr(self, "current_event_split"):
+            return
+        self._current_event_empty_layout_visible = True
+        self.current_event_glow.place_forget()
+        # Keep the illustration and actions under one geometry manager.  The
+        # 4.9.102 placement conversion can leave both widgets unmapped on
+        # macOS, producing an entirely blank Current Event page.
+        self.current_event_illustration_card.place_forget()
+        self.current_event_card.place_forget()
+        self.current_event_split.grid_columnconfigure(0, weight=0, minsize=474, uniform="")
+        self.current_event_split.grid_columnconfigure(1, weight=0, minsize=536, uniform="")
+        self.current_event_split.grid_anchor("center")
+        self.current_event_illustration_card.grid()
+        self.current_event_card.grid()
+
+    def _show_current_event_active_layout(self) -> None:
+        """Restore the logo-ready layout used by active purchase packets."""
+        if not hasattr(self, "current_event_split"):
+            return
+        self._current_event_empty_layout_visible = False
+        self.current_event_illustration_card.place_forget()
+        self.current_event_card.place_forget()
+        self.current_event_split.grid_columnconfigure(0, weight=11, minsize=0, uniform="current_event_split")
+        self.current_event_split.grid_columnconfigure(1, weight=9, minsize=0, uniform="current_event_split")
+        self.current_event_illustration_card.grid()
+        self.current_event_card.grid()
+        self.current_event_glow.place(relx=0.52, rely=0.47, anchor="center")
 
     def _refresh_current_event_job_logo(self) -> None:
         """Show the saved customer/job logo below the active event name."""
@@ -4465,9 +5124,8 @@ end try
             self.current_event_job_logo.grid_remove()
             return
         try:
-            image = PILImage.open(logo_path).convert("RGBA")
-            image, _removed_white_canvas = remove_outer_near_white_background(image)
-            image.thumbnail((220, 128), PILImage.Resampling.LANCZOS)
+            image, _background_removed = prepare_artwork_for_preview(logo_path)
+            image.thumbnail((220, 86), PILImage.Resampling.LANCZOS)
             self.current_event_job_logo_image = ctk.CTkImage(
                 light_image=image, dark_image=image, size=image.size,
             )
@@ -4521,8 +5179,11 @@ end try
         snapshot = snapshot or {}
         has_review = bool(self.last_review_workbook and self.last_review_workbook.exists())
         has_csv = bool(self.selected_csv) or has_review
+        review_state = self._load_review_state()
+        routing_stale = bool(has_review and self._review_is_stale())
         audit_requires_regeneration = bool(
-            self._load_review_state().get("decoration_color_audit_requires_regeneration", False)
+            review_state.get("decoration_color_audit_requires_regeneration", False)
+            and (routing_stale or review_state.get("additional_import_pending", False))
         )
         has_purchase_orders = bool(
             self.last_purchase_order_dir and self.last_purchase_order_dir.exists()
@@ -4861,14 +5522,16 @@ end try
         # uses row 1 as its expanding workspace, so remove that empty weighted
         # row and give every available vertical pixel to the editor.
         page.grid_rowconfigure(9, weight=0, minsize=0)
-        page.grid_rowconfigure(1, weight=1, minsize=360)
+        page.grid_rowconfigure(1, weight=1, minsize=430)
         self._build_workflow_tracker(page, 0, "review_stage_labels", padx=34)
         review_shadow = ctk.CTkFrame(page, fg_color=SHADOW, corner_radius=24, width=1, height=1)
         review_shadow.grid(row=1, column=0, sticky="nsew", padx=20, pady=(1, 3))
         shell = ctk.CTkFrame(page, fg_color=WHITE, border_width=1, border_color=BORDER, corner_radius=24)
         shell.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 4))
         shell.grid_columnconfigure(0, weight=1)
-        shell.grid_rowconfigure(4, weight=1, minsize=320)
+        # Keep the editable decision form roomy on smaller Mac displays while
+        # leaving the action bar fixed below it.
+        shell.grid_rowconfigure(4, weight=1, minsize=410)
         self.review_shell = shell
         self._add_orchid_watermark(shell, size=(520, 520), relx=0.5, rely=0.58)
 
@@ -4945,7 +5608,7 @@ end try
         self.review_decoration_decision_menu = ctk.CTkOptionMenu(
             self.review_decision_frame, variable=self.review_vars["Decoration Decision"],
             values=INSTRUCTION_DECISION_OPTIONS,
-            command=self._apply_review_decoration_decision, height=38,
+            command=self._apply_review_decoration_decision, height=44,
             fg_color=PURPLE, button_color=PURPLE_DARK,
         )
         self.review_decoration_decision_menu.grid(row=4, column=1, padx=(0, 22), pady=6, sticky="ew")
@@ -4965,7 +5628,7 @@ end try
                 self.review_location_menu = ctk.CTkOptionMenu(
                     self.review_decision_frame, variable=self.review_vars[label],
                     values=DECORATION_LOCATIONS, command=self._apply_review_location_choice,
-                    height=36, fg_color=PURPLE, button_color=PURPLE_DARK,
+                    height=42, fg_color=PURPLE, button_color=PURPLE_DARK,
                 )
                 self.review_location_menu.grid(row=row, column=1, padx=(0, 14), pady=4, sticky="ew")
             elif label == "Decoration Type":
@@ -4973,12 +5636,12 @@ end try
                     self.review_decision_frame, variable=self.review_vars[label],
                     values=["Embroidery", "Screen Print", SEW_ON_PATCH_LABEL, HEMMING_ALTERATION_LABEL, BLANK_DECORATION_LABEL],
                     command=lambda _choice: self._on_review_decoration_type_changed(),
-                    height=36, fg_color=PURPLE, button_color=PURPLE_DARK,
+                    height=42, fg_color=PURPLE, button_color=PURPLE_DARK,
                 )
                 self.review_decoration_type_menu.grid(row=row, column=1, padx=(0, 14), pady=4, sticky="ew")
             else:
                 entry = ctk.CTkEntry(
-                    self.review_decision_frame, textvariable=self.review_vars[label], height=36,
+                    self.review_decision_frame, textvariable=self.review_vars[label], height=42,
                     fg_color=WHITE, border_color=BORDER, border_width=1,
                 )
                 entry.grid(row=row, column=1, padx=(0, 14), pady=4, sticky="ew")
@@ -4986,7 +5649,7 @@ end try
 
         # The reserved panel gives the expanded location menu a clean area instead
         # of letting it visually cover Include Item. It also holds custom input.
-        self.review_location_detail = ctk.CTkFrame(self.review_decision_frame, fg_color="#F7F3FC", corner_radius=10, height=56)
+        self.review_location_detail = ctk.CTkFrame(self.review_decision_frame, fg_color="#F7F3FC", corner_radius=10, height=64)
         self.review_location_detail.grid(row=12, column=0, columnspan=2, padx=14, pady=(1, 5), sticky="ew")
         self.review_location_detail.grid_columnconfigure(1, weight=1)
         self.review_location_detail.grid_propagate(False)
@@ -5001,7 +5664,7 @@ end try
             font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
         )
         self.review_custom_location_entry = ctk.CTkEntry(
-            self.review_location_detail, textvariable=self.review_custom_location_var, height=38,
+            self.review_location_detail, textvariable=self.review_custom_location_var, height=42,
             placeholder_text="Example: Right Chest or Center Back",
         )
         self.review_custom_location_label.grid(row=1, column=0, padx=(12, 10), pady=(3, 10), sticky="w")
@@ -5013,7 +5676,7 @@ end try
                      font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(
             row=15, column=0, padx=(14, 10), pady=4, sticky="w")
         self.review_include_menu = ctk.CTkOptionMenu(
-            self.review_decision_frame, variable=self.review_vars["Include"], values=["Yes", "No"], height=38
+            self.review_decision_frame, variable=self.review_vars["Include"], values=["Yes", "No"], height=42
         )
         self.review_include_menu.grid(row=15, column=1, padx=(0, 14), pady=4, sticky="w")
 
@@ -5051,6 +5714,12 @@ end try
             fg_color="transparent", hover_color=PURPLE_LIGHT, border_width=1, border_color=BORDER, text_color=MUTED,
         )
         self.review_export_button.pack(side="left", padx=4)
+        self.review_test_generate_button = ctk.CTkButton(
+            action_bar, text="Test Generate POs", command=self.generate_test_purchase_orders,
+            width=165, height=44, fg_color="#FFF1DC", hover_color="#F5DEB6",
+            border_width=1, border_color="#E2A21A", text_color="#8A5200",
+        )
+        self.review_test_generate_button.pack(side="left", padx=4)
         self.review_save_button = ctk.CTkButton(
             action_bar, text="Save & Next", command=self.save_current_review_decision,
             width=160, height=46, fg_color=PURPLE, hover_color=PURPLE_DARK,
@@ -5088,7 +5757,7 @@ end try
             self.review_custom_location_entry.grid()
             self.review_custom_location_entry.configure(state="normal")
         else:
-            self.review_location_detail.configure(height=56)
+            self.review_location_detail.configure(height=64)
             self.review_custom_location_var.set("")
             self.review_custom_location_label.grid_remove()
             self.review_custom_location_entry.grid_remove()
@@ -5759,6 +6428,14 @@ end try
         if not path or not path.exists():
             self.refresh_review_page(snapshot={})
             return
+        if not self._is_archived_report_reopen() and not self._active_packet_is_valid(path)[0]:
+            self.review_state_title.configure(text="Active Event Verification Required")
+            self.review_state_body.configure(
+                text="This Purchase Review is not proven to match the selected CSV, so Orchid will not display its decisions."
+            )
+            self.review_progress.configure(text="Return to Current Event and process the selected CSV again.")
+            self.review_save_button.configure(text="Return to Current Event", state="normal", command=lambda: self.show_page("import"))
+            return
         cache_key = _file_stamp(path)
         if not force and cache_key == self._review_fast_cache_key and self._review_fast_snapshot_cache:
             snapshot = self._overlay_completed_review_state(self._review_fast_snapshot_cache, path)
@@ -5806,6 +6483,7 @@ end try
             _file_stamp(path),
             _file_stamp(DATA / "mission_control_state.json"),
             _file_stamp(REVIEW_STATE_FILE),
+            _file_stamp(live_product_master_path()),
         )
         if cache_key == self._mission_snapshot_cache_key:
             return
@@ -6249,9 +6927,21 @@ end try
         OrchidPurchaseManager._apply_review_save_jobs([job])
 
     @staticmethod
-    def _apply_review_save_jobs(jobs: list[dict]) -> None:
-        """Apply many completed decisions with one open/save cycle per workbook."""
+    def _apply_review_save_jobs(
+        jobs: list[dict], *, skip_orphaned_recovery_jobs: bool = False,
+    ) -> list[dict]:
+        """Apply many completed decisions with one open/save cycle per workbook.
+
+        A completed Purchase Review decision can legitimately become orphaned
+        after the corresponding line is removed from a regenerated packet.  An
+        orphan must not blank the whole Decoration Color Audit or block final
+        report generation.  The optional recovery mode excludes *only* jobs
+        whose source, line, decision key, and unique semantic identity are all
+        absent from both event sheets.  Anything even possibly current remains
+        strict and raises instead of being guessed or silently dropped.
+        """
         grouped: dict[str, list[dict]] = {}
+        skipped_jobs: list[dict] = []
         for job in jobs:
             workbook_value = _clean(job.get("workbook", ""))
             grouped.setdefault(workbook_value, []).append(job)
@@ -6374,6 +7064,22 @@ end try
 
                 target_line = _clean(job.get("line_id", ""))
                 target_key = _clean(job.get("decision_key", ""))
+                # Audit confirmations are line-specific. Purchase Review rows
+                # can share a decision key (for example, multiple TLS608
+                # garment colors share product:TLS608|), so combining a saved
+                # audit line ID with that broad key overwrites every color.
+                # Prefer the immutable line ID. If regeneration changes it,
+                # fall back only to exact style, garment color, and decoration
+                # type—never to the Purchase Review decision key.
+                if bool(job.get("audit_override", False)):
+                    if target_line:
+                        direct_rows = by_line.get(target_line, [])
+                        if direct_rows:
+                            return sorted(direct_rows)
+                    stable_identity = audit_identity(job.get("values", {}))
+                    if stable_identity:
+                        return sorted(by_audit_identity.get(stable_identity, []))
+                    return []
                 rows = set()
                 if target_line:
                     rows.update(by_line.get(target_line, []))
@@ -6388,11 +7094,63 @@ end try
                         if len(candidates) == 1:
                             rows.update(candidates)
                             break
-                if not rows and bool(job.get("audit_override", False)):
-                    stable_identity = audit_identity(job.get("values", {}))
-                    if stable_identity:
-                        rows.update(by_audit_identity.get(stable_identity, []))
                 return sorted(rows)
+
+            def possible_current_rows(job, by_line, by_key, by_semantic):
+                """Return any non-source evidence that a recovery job is current.
+
+                This is deliberately more conservative than a normal match:
+                multiple candidates are evidence that the job may still matter,
+                not permission to apply it.  They therefore prevent an orphan
+                skip and preserve the normal safety error.
+
+                A Source ID is different.  It is the immutable identity of one
+                imported event line and is deliberately authoritative in
+                ``matching_rows``.  If that exact ID is absent, an older Line
+                ID, Decision Key, or semantic product match must *not* keep the
+                recovery job alive: those values can legitimately belong to a
+                different line after an event is regenerated.  Treating them as
+                proof here created a contradiction where a job was declared
+                "possibly current" but was forbidden from being applied, which
+                blanked Decoration Color Audit with a phantom "1 to Review".
+                """
+                rows = set()
+                if _clean(job.get("source_id", "")):
+                    return rows
+                target_line = _clean(job.get("line_id", ""))
+                target_key = _clean(job.get("decision_key", ""))
+                if target_line:
+                    rows.update(by_line.get(target_line, []))
+                if target_key:
+                    rows.update(by_key.get(target_key, []))
+                issue = job.get("issue", {}) if isinstance(job.get("issue"), dict) else {}
+                for semantic in semantic_keys(job.get("values", {}), issue):
+                    rows.update(by_semantic.get(semantic, []))
+                return rows
+
+            def is_orphaned_recovery_job(job, visible_rows, source_rows):
+                if (
+                    not skip_orphaned_recovery_jobs
+                    or bool(job.get("audit_override", False))
+                    or visible_rows
+                    or source_rows
+                ):
+                    return False
+                visible_candidates = possible_current_rows(
+                    job, review_by_line, review_by_key, review_by_semantic
+                )
+                source_candidates = possible_current_rows(
+                    job, source_by_line, source_by_key, source_by_semantic
+                )
+                return not visible_candidates and not source_candidates
+
+            def record_orphaned_job(job):
+                skipped_jobs.append({
+                    "job_id": _clean(job.get("job_id", "")),
+                    "source_id": _clean(job.get("source_id", "")),
+                    "line_id": _clean(job.get("line_id", "")),
+                    "decision_key": _clean(job.get("decision_key", "")),
+                })
 
             def write_rows(target_sheet, row_numbers, headers, job, *, source=False):
                 values = dict(job.get("values", {}))
@@ -6452,11 +7210,15 @@ end try
                         job, review_by_source, review_by_line, review_by_key, review_by_semantic, review_by_audit_identity
                     )
                     allow_missing = bool(job.get("allow_missing", False))
-                    if not visible_rows and not bool(job.get("editing_search", False)) and not allow_missing:
-                        raise RuntimeError("The matching Purchase Review decision could not be located.")
                     source_rows = matching_rows(
                         job, source_by_source, source_by_line, source_by_key, source_by_semantic, source_by_audit_identity
                     )
+                    orphaned = is_orphaned_recovery_job(job, visible_rows, source_rows)
+                    if orphaned:
+                        record_orphaned_job(job)
+                        continue
+                    if not visible_rows and not bool(job.get("editing_search", False)) and not allow_missing:
+                        raise RuntimeError("The matching Purchase Review decision could not be located.")
                     # Direct audit saves may never be recorded as completed if
                     # they could not update the event source.  Previously an
                     # unmatched editing-search job could become a silent no-op,
@@ -6492,6 +7254,7 @@ end try
                         temp_path.unlink()
                 except Exception:
                     pass
+        return skipped_jobs
 
     def _poll_review_save_results(self) -> None:
         had_result = False
@@ -6804,20 +7567,30 @@ end try
         self.refresh_review_page(snapshot=snapshot)
 
     def _archive_release_roots(self) -> list[Path]:
-        """Return plausible completed archive roots for the active event, newest first."""
-        candidates = []
+        """Return only archive roots explicitly bound to the active packet.
+
+        Archive folders are historical records.  They must never be discovered
+        by event name or modified date because two unrelated runs can share a
+        name such as ``Line Boots 2026``.  An unbound archive can be opened
+        from Event Archive, but can never become the current event's report.
+        """
+        preferred = []
         state = self._load_review_state()
-        saved = _clean(state.get("last_purchase_order_archive_dir", ""))
-        if saved:
-            candidates.append(Path(saved).expanduser())
-        event_name = _clean(self.current_event_name or state.get("event_name", ""))
-        if event_name:
-            archive_root = REPORTS / "Event Archive"
-            if archive_root.is_dir():
-                candidates.extend(archive_root.glob(f"{safe_filename(event_name)} - *"))
+        # ``last_purchase_order_dir`` is allowed to change when reports are
+        # regenerated from a completed event.  The original completed packet is
+        # not.  Retain that immutable archive path separately, then fall back to
+        # the legacy archive key for Test 2 sessions created before this field
+        # existed.
+        for key in (
+            "completed_purchase_order_archive_dir",
+            "last_purchase_order_archive_dir",
+        ):
+            saved = _clean(state.get(key, ""))
+            if saved:
+                preferred.append(Path(saved).expanduser())
         unique = []
         seen = set()
-        for candidate in candidates:
+        for candidate in preferred:
             try:
                 resolved = candidate.resolve()
             except Exception:
@@ -6826,21 +7599,285 @@ end try
                 continue
             seen.add(resolved)
             unique.append(candidate)
-        return sorted(unique, key=lambda item: item.stat().st_mtime, reverse=True)
+        return unique
+
+    def _release_belongs_to_active_packet(self, packet_root: Path | None) -> bool:
+        """Require a final release to carry this event's exact identity."""
+        if self._is_archived_report_reopen():
+            return True
+        if not packet_root:
+            return False
+        state = self._load_review_state()
+        active_id = _clean(state.get("active_packet_id", ""))
+        active_lock_id = _clean(state.get("active_review_packet_lock_id", ""))
+        if not active_id or not active_lock_id:
+            return False
+        try:
+            manifest = json.loads((Path(packet_root) / "FINAL_RELEASE_MANIFEST.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return False
+        return (
+            _clean(manifest.get("active_packet_id", "")) == active_id
+            and _clean(manifest.get("packet_lock_id", "")) == active_lock_id
+        )
+
+    @staticmethod
+    def _release_manifest_identity(packet_root: Path | None) -> str:
+        """Return the exact manifest identity for one live or archived release."""
+        if not packet_root:
+            return ""
+        manifest_path = Path(packet_root) / "FINAL_RELEASE_MANIFEST.json"
+        if not manifest_path.is_file():
+            return ""
+        try:
+            return hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _manifest_vendor_purchase_order_count(packet_root: Path | None) -> int:
+        """Count vendor POs listed in one protected release manifest.
+
+        A report-only reopen can produce a valid manifest with just the three
+        supporting reports.  It is a valid report release but not a complete
+        purchase-order packet, so Finder must never use it for the Purchase
+        Orders action.
+        """
+        if not packet_root:
+            return 0
+        manifest_path = Path(packet_root) / "FINAL_RELEASE_MANIFEST.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return 0
+        entries = manifest.get("files")
+        if not isinstance(entries, list):
+            return 0
+        count = 0
+        for entry in entries:
+            if is_final_purchase_order_pdf(str(entry.get("path", ""))):
+                count += 1
+        return count
+
+    def _verified_complete_archive_purchase_orders(self, archive_root: Path | None) -> Path | None:
+        """Return an archive's PDF folder only when it includes vendor POs."""
+        if not archive_root:
+            return None
+        archive_root = Path(archive_root)
+        valid, _reason = validate_release_packet(archive_root, archived=True)
+        archive_pdfs = archive_root / "Purchase Orders"
+        if (
+            valid
+            and archive_pdfs.is_dir()
+            and self._release_belongs_to_active_packet(archive_root)
+            and self._manifest_vendor_purchase_order_count(archive_root) > 0
+        ):
+            return archive_pdfs
+        return None
 
     def _purchase_order_release_location(self) -> tuple[Path | None, bool]:
-        """Return a manifest-verified live release, or its verified archive fallback."""
+        """Return only the manifest-verified release for the live active event.
+
+        Completed event files are intentionally not a fallback. Once an event is
+        finished and cleared, Orchid has no route back to its PDFs or workbook.
+        That prevents an older event from ever becoming a current report source.
+        """
+        if not self._active_packet_is_valid()[0]:
+            return None, False
         live = self.last_purchase_order_dir
         if live and live.is_dir():
             valid, _reason = validate_release_packet(live)
-            if valid:
+            if (
+                valid
+                and self._release_belongs_to_active_packet(live)
+                and self._manifest_vendor_purchase_order_count(live) > 0
+            ):
                 return live, False
-        for archive_root in self._archive_release_roots():
-            valid, _reason = validate_release_packet(archive_root, archived=True)
-            archived_pdfs = archive_root / "Purchase Orders"
-            if valid and archived_pdfs.is_dir():
-                return archived_pdfs, True
         return None, False
+
+    def _archived_source_purchase_order_location(self) -> Path | None:
+        """Return the original completed packet when viewing an archived report copy.
+
+        Regenerating reports from an archived event deliberately produces only
+        reports: it must never replace that event's original vendor purchase
+        orders in the Finder display.  The archive source workbook identifies
+        the immutable original packet, whose manifest validates the complete
+        purchase-order set independently of the report-only working copy.
+        """
+        state = self._load_review_state()
+        if not bool(state.get("archived_report_reopen", False)):
+            return None
+        source_workbook = _clean(state.get("archive_source_workbook", ""))
+        if not source_workbook:
+            return None
+        archive_root = Path(source_workbook).expanduser().parent
+        return self._verified_complete_archive_purchase_orders(archive_root)
+
+    def _purchase_order_display_location(self) -> Path | None:
+        """Return the complete, manifest-verified folder intended for Finder.
+
+        Test 2 proved that a report-only reopen can become the newest active
+        output.  That folder contains only supporting reports, so comparing
+        against the mutable active manifest is unsafe.  Prefer the saved
+        protected archive, and accept only a manifest that inventories at
+        least one vendor purchase order.
+        """
+        live, _using_archive_fallback = self._purchase_order_release_location()
+        if live:
+            return live
+        return self._archived_source_purchase_order_location()
+
+    def _completed_purchase_packet_display_folder(self) -> Path | None:
+        """Create one immutable Finder-friendly copy of the current PO packet.
+
+        The Purchase Orders page may correctly list vendor PDFs while macOS
+        Finder is still showing a separate, same-named report-only folder.  Do
+        not ask Finder to resolve another live or archive path.  Instead, use
+        the exact manifest-verified release that supplied the purchase-order
+        list, copy its manifest-listed PDFs into a uniquely named display
+        packet, and open that single unambiguous folder.
+
+        This never changes the live release, Event Archive, or any existing
+        display copy.  A matching display packet is reused; a mismatched or
+        incomplete older display packet is left intact for diagnosis and a new
+        uniquely named packet is created.
+        """
+        pdf_root, _using_archive_fallback = self._purchase_order_release_location()
+        if not pdf_root or not pdf_root.is_dir():
+            return None
+
+        packet_root = None
+        for candidate in (pdf_root, pdf_root.parent):
+            if (candidate / "FINAL_RELEASE_MANIFEST.json").is_file():
+                packet_root = candidate
+                break
+        if packet_root is None:
+            return None
+
+        valid, _reason = validate_release_packet(packet_root, archived=(packet_root != pdf_root))
+        if not valid or self._manifest_vendor_purchase_order_count(packet_root) < 1:
+            return None
+
+        try:
+            manifest = json.loads((packet_root / "FINAL_RELEASE_MANIFEST.json").read_text(encoding="utf-8"))
+            entries = manifest.get("files", [])
+        except Exception:
+            return None
+        if not isinstance(entries, list):
+            return None
+
+        source_roots = [pdf_root, packet_root / "Purchase Orders", packet_root]
+        source_pdfs: list[tuple[Path, str, int]] = []
+        source_names: set[str] = set()
+        for entry in entries:
+            name = Path(str(entry.get("path", ""))).name
+            if not name.casefold().endswith(".pdf"):
+                continue
+            expected_sha256 = str(entry.get("sha256", "")).strip().casefold()
+            try:
+                expected_size = int(entry.get("size"))
+            except (TypeError, ValueError):
+                return None
+            if len(expected_sha256) != 64 or expected_size < 1 or name in source_names:
+                return None
+            source = next((root / name for root in source_roots if (root / name).is_file()), None)
+            if source is None:
+                return None
+            source_names.add(name)
+            source_pdfs.append((source, expected_sha256, expected_size))
+        if not source_pdfs:
+            return None
+
+        manifest_identity = self._release_manifest_identity(packet_root)
+        if not manifest_identity:
+            return None
+        packet_name = safe_filename(self.current_event_name or manifest.get("event_name") or "Purchase Packet")
+        display_parent = REPORTS / "Completed Purchase Packets"
+        display_parent.mkdir(parents=True, exist_ok=True)
+        base_name = f"{packet_name}__Completed_Purchase_Packet__{manifest_identity[:12]}"
+
+        receipt = {
+            "source_manifest_sha256": manifest_identity,
+            "source_packet": str(packet_root),
+            "pdf_count": len(source_pdfs),
+            "pdfs": [path.name for path, _sha256, _size in source_pdfs],
+            "verified_pdf_count": len(source_pdfs),
+            "pdf_checks": [
+                {"name": path.name, "sha256": sha256, "size": size}
+                for path, sha256, size in source_pdfs
+            ],
+            "created_at": time.time(),
+        }
+
+        def sha256_file(path: Path) -> str:
+            digest = hashlib.sha256()
+            with path.open("rb") as file_handle:
+                for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        # Keep the internal verification record hidden in Finder.  It is only
+        # used to prove that the visible PDFs are the exact locked release.
+        receipt_name = ".orchid_packet_display_receipt.json"
+
+        def complete_display_packet(folder: Path) -> bool:
+            try:
+                saved = json.loads((folder / receipt_name).read_text(encoding="utf-8"))
+                return (
+                    saved.get("source_manifest_sha256") == manifest_identity
+                    and saved.get("pdfs") == receipt["pdfs"]
+                    and saved.get("verified_pdf_count") == len(source_pdfs)
+                    and all(
+                        (folder / path.name).is_file()
+                        and (folder / path.name).stat().st_size == size
+                        and sha256_file(folder / path.name) == sha256
+                        for path, sha256, size in source_pdfs
+                    )
+                )
+            except Exception:
+                return False
+
+        destination = display_parent / base_name
+        if destination.is_dir() and complete_display_packet(destination):
+            return destination
+        if destination.exists():
+            suffix = 2
+            while (display_parent / f"{base_name}__{suffix}").exists():
+                suffix += 1
+            destination = display_parent / f"{base_name}__{suffix}"
+
+        staging = display_parent / f".{destination.name}__building_{time.time_ns()}"
+        try:
+            staging.mkdir(parents=False, exist_ok=False)
+            for source, expected_sha256, expected_size in source_pdfs:
+                destination_pdf = staging / source.name
+                # Use a content-only copy.  macOS metadata copied by copy2 can
+                # carry Finder visibility flags from an older report location.
+                # A fresh content copy gives this display packet no inherited
+                # Finder metadata, then verifies it against the locked manifest.
+                with source.open("rb") as source_handle, destination_pdf.open("xb") as destination_handle:
+                    shutil.copyfileobj(source_handle, destination_handle, length=1024 * 1024)
+                if (
+                    destination_pdf.stat().st_size != expected_size
+                    or sha256_file(destination_pdf) != expected_sha256
+                ):
+                    raise OSError(f"Verification failed while creating display copy: {source.name}")
+            (staging / receipt_name).write_text(
+                json.dumps(receipt, indent=2), encoding="utf-8"
+            )
+            staging.rename(destination)
+            return destination if complete_display_packet(destination) else None
+        except Exception as error:
+            # Preserve an incomplete staging copy for inspection rather than
+            # deleting any evidence or source documents.
+            try:
+                (staging / "PACKET_DISPLAY_ERROR.txt").write_text(
+                    f"Completed Purchase Packet could not be assembled.\n{error}\n",
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+            return None
 
     def _purchase_order_document_paths(self, root: Path | None = None) -> list[Path]:
         """Return final vendor purchase-order PDFs, excluding decoration-only reports."""
@@ -6848,20 +7885,10 @@ end try
             root, _archived = self._purchase_order_release_location()
         if not root or not root.exists():
             return []
-        documents = []
-        excluded_terms = (
-            "screen print", "screen_print", "screen-print", "embroidery job",
-            "embroidery_job", "decoration report", "decoration_report",
-            "outsourced job", "outsourced_job", "outsourced decoration", "outsourced_decoration",
-            "in-house", "in_house",
-            "non-included", "non_included", "non included",
-            "employee totals", "employee_totals", "event summary", "event_summary",
-        )
-        for candidate in root.rglob("*.pdf"):
-            folded = candidate.stem.casefold()
-            if any(term in folded for term in excluded_terms):
-                continue
-            documents.append(candidate)
+        documents = [
+            candidate for candidate in root.rglob("*.pdf")
+            if is_final_purchase_order_pdf(candidate)
+        ]
         return sorted(documents, key=lambda item: (item.name.casefold(), str(item)))
 
     def _open_purchase_document(self, document: Path) -> None:
@@ -6871,11 +7898,78 @@ end try
         else:
             messagebox.showinfo("Purchase Order Not Found", "This purchase-order PDF is no longer available at its saved location.")
 
+    def _completed_packet_report_paths(self) -> list[Path]:
+        """Return all manifest-verified reports in the exact packet order."""
+        display_dir = self._completed_purchase_packet_display_folder()
+        if not display_dir:
+            return []
+        try:
+            receipt = json.loads(
+                (display_dir / ".orchid_packet_display_receipt.json").read_text(encoding="utf-8")
+            )
+            names = receipt.get("pdfs", [])
+        except Exception:
+            return []
+        if not isinstance(names, list):
+            return []
+        documents = [display_dir / str(name) for name in names]
+        return documents if documents and all(path.is_file() for path in documents) else []
+
+    def print_all_purchase_reports(self) -> None:
+        """Make one print-ready PDF from the verified completed packet.
+
+        The source PDFs are read only.  A temporary combined print file is
+        written only after every source page has been read successfully, then
+        atomically promoted for Preview to open as one document.
+        """
+        documents = self._completed_packet_report_paths()
+        if not documents:
+            messagebox.showwarning(
+                "Print Packet Not Ready",
+                "Orchid could not assemble the verified completed packet. The existing purchase orders were not changed.",
+            )
+            return
+        try:
+            from pypdf import PdfReader, PdfWriter
+
+            print_dir = REPORTS / "Print Packets"
+            print_dir.mkdir(parents=True, exist_ok=True)
+            content_key = hashlib.sha256(
+                "|".join(f"{path.name}:{_file_stamp(path)}" for path in documents).encode("utf-8")
+            ).hexdigest()[:12]
+            packet_name = safe_filename(self.current_event_name or "Purchase Packet")
+            output = print_dir / f"{packet_name}__Print_All_Reports__{content_key}.pdf"
+            if not output.is_file():
+                staging = print_dir / f".{output.name}.{time.time_ns()}.building"
+                writer = PdfWriter()
+                for document in documents:
+                    reader = PdfReader(str(document))
+                    for page in reader.pages:
+                        writer.add_page(page)
+                with staging.open("wb") as handle:
+                    writer.write(handle)
+                if not staging.is_file() or staging.stat().st_size < 1:
+                    raise OSError("The combined print file was not created.")
+                staging.replace(output)
+            opened = subprocess.run(["open", "-a", "Preview", str(output)], check=False)
+            if opened.returncode != 0:
+                raise OSError("Preview could not be opened.")
+            messagebox.showinfo(
+                "Print All Reports Ready",
+                "All reports are combined in one PDF. In Preview, choose File > Print once to print the complete packet.",
+            )
+        except Exception as error:
+            messagebox.showerror("Unable to Prepare Print Packet", str(error))
+
     def _render_purchase_order_documents(self, documents: list[Path]) -> None:
         if not hasattr(self, "purchase_documents_frame"):
             return
+        render_key = tuple((str(path.resolve()), _file_stamp(path)) for path in documents)
+        if render_key == getattr(self, "_purchase_documents_render_key", None):
+            return
         for child in self.purchase_documents_frame.winfo_children():
             child.destroy()
+        self._purchase_documents_render_key = render_key
         count = len(documents)
         self.purchase_document_count.configure(text=str(count))
         if not documents:
@@ -7117,7 +8211,49 @@ end try
     def _decoration_audit_verified_map(self) -> dict:
         state = self._load_review_state()
         value = state.get("decoration_color_audit_verified", {})
-        return dict(value) if isinstance(value, dict) else {}
+        verified = dict(value) if isinstance(value, dict) else {}
+
+        # Audit overrides are written atomically for every successfully saved
+        # event line.  Treat those durable, user-approved overrides as
+        # confirmation candidates as well.  This both restores an RC13 test
+        # state where two confirmations were overwritten under the same rebuilt
+        # display key and makes rebuild recovery independent of a visual group
+        # merge.  The audit builder deduplicates these candidates against the
+        # normal confirmation records by immutable line IDs, color, and
+        # location, so a multi-line combination still counts once.
+        overrides = state.get("decoration_color_audit_overrides", [])
+        # A normal confirmation may represent several source lines.  Only use
+        # a durable override to repair a line that has no confirmation at all;
+        # otherwise we would double-count a legitimate multi-line group.
+        confirmed_line_ids = {
+            _clean(line_id)
+            for candidate in verified.values()
+            if isinstance(candidate, dict)
+            for line_id in candidate.get("line_ids", [])
+            if _clean(line_id)
+        }
+        if isinstance(overrides, list):
+            for override in overrides:
+                if not isinstance(override, dict):
+                    continue
+                line_id = _clean(override.get("line_id", ""))
+                color = _clean(override.get("decoration_color", ""))
+                location = _clean(override.get("location", ""))
+                if not line_id or line_id in confirmed_line_ids or not color or not location:
+                    continue
+                stable_identity = "|".join([line_id, color.casefold(), location.casefold()])
+                storage_key = "audit-override-confirmation:" + hashlib.sha256(
+                    stable_identity.encode("utf-8")
+                ).hexdigest()
+                verified[storage_key] = {
+                    "color": color,
+                    "location": location,
+                    "line_ids": [line_id],
+                    "style": _clean(override.get("style", "")),
+                    "garment_color": _clean(override.get("garment_color", "")),
+                    "decoration_type": _clean(override.get("decoration_type", "")),
+                }
+        return verified
 
     def _decoration_audit_failure_map(self) -> dict:
         state = self._load_review_state()
@@ -7567,19 +8703,49 @@ end try
                     record.get("decoration_type", ""), record.get("style", ""),
                     record.get("product_name", ""), record.get("garment_color", ""), value["location"],
                 )
-                if old_key != final_key:
-                    verified.pop(old_key, None)
+                line_ids = list(dict.fromkeys(
+                    _clean(line.get("Line ID", ""))
+                    for line in record.get("line_records", [])
+                    if _clean(line.get("Line ID", ""))
+                ))
+                # Remove an earlier confirmation for these exact source lines
+                # before replacing it.  Do not use the rebuilt display key as
+                # storage: different original confirmations can legitimately
+                # share that key after reconciliation.
+                line_id_set = set(line_ids)
+                for verification_key, candidate in list(verified.items()):
+                    if not isinstance(candidate, dict):
+                        continue
+                    candidate_ids = {
+                        _clean(line_id) for line_id in candidate.get("line_ids", [])
+                        if _clean(line_id)
+                    }
+                    if candidate_ids and candidate_ids == line_id_set:
+                        verified.pop(verification_key, None)
+                verification_identity = "|".join([
+                    old_key, value["color"].casefold(), value["location"].casefold(), *sorted(line_ids),
+                ])
+                confirmation_key = "audit-confirmation:" + hashlib.sha256(
+                    verification_identity.encode("utf-8")
+                ).hexdigest()
                 if value["verified"] and (not value["requires_save"] or old_key in fully_saved_keys):
-                    verified[final_key] = {
+                    verified[confirmation_key] = {
                         "color": value["color"],
                         "location": value["location"],
+                        # Display grouping can be recomputed after journal
+                        # reconciliation.  Keep immutable line identities so a
+                        # successful audit confirmation remains visible even if
+                        # its former group key changes or merges.
+                        "line_ids": line_ids,
+                        "style": _clean(record.get("style", "")),
+                        "garment_color": _clean(record.get("garment_color", "")),
+                        "decoration_type": _clean(record.get("decoration_type", "")),
                         "verified_at": time.time(),
                     }
                 else:
                     # Failed saves can never remain verified. This keeps the
                     # attention count and visible rows in perfect agreement.
-                    verified.pop(old_key, None)
-                    verified.pop(final_key, None)
+                    verified.pop(confirmation_key, None)
             state["decoration_color_audit_verified"] = verified
             failure_map = state.get("decoration_color_audit_failures", {})
             failure_map = dict(failure_map) if isinstance(failure_map, dict) else {}
@@ -7603,7 +8769,12 @@ end try
                     }
             state["decoration_color_audit_failures"] = failure_map
             if fully_saved_keys:
-                state["decoration_color_audit_requires_regeneration"] = True
+                # The audit writes its exact color/location choice to the
+                # current event lines before completing the row. A normal
+                # thread/ink confirmation therefore never needs to rerun
+                # Purchase Review. The protected routing check still catches
+                # a later Product Master vendor/type/location/outsourcing edit.
+                state.pop("decoration_color_audit_requires_regeneration", None)
             self._write_review_state_atomic(state)
 
             if master_saved_keys:
@@ -7727,6 +8898,9 @@ end try
     def build_purchase_page(self):
         """Build the approved Purchase Orders dashboard layout without cat artwork."""
         page = self.new_page("purchase")
+        # new_page reserves row 9 for dashboard-style pages.  Purchase Orders
+        # owns row 1, so release that otherwise blank lower area to the PDF list.
+        page.grid_rowconfigure(9, weight=0, minsize=0)
         page.grid_rowconfigure(1, weight=1)
         self._build_workflow_tracker(page, 0, "purchase_stage_labels", padx=34)
 
@@ -7826,7 +9000,14 @@ end try
             border_width=1, border_color="#CDBBE5", text_color=PURPLE,
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self.open_latest_purchase_orders,
-        ).grid(row=0, column=2, sticky="e")
+        ).grid(row=0, column=2, padx=(5, 0), sticky="e")
+        self.purchase_print_all_button = ctk.CTkButton(
+            list_header, text="Print All Reports", width=132, height=34, corner_radius=9,
+            fg_color=PURPLE, hover_color=PURPLE_DARK, text_color=WHITE,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self.print_all_purchase_reports,
+        )
+        self.purchase_print_all_button.grid(row=0, column=3, padx=(8, 0), sticky="e")
         self.purchase_documents_frame = ctk.CTkScrollableFrame(
             list_card, fg_color="#FCFBFE", border_width=0, corner_radius=13,
             scrollbar_button_color="#CDBBE5", scrollbar_button_hover_color=PURPLE,
@@ -7900,10 +9081,14 @@ end try
     def refresh_purchase_page(self):
         if not hasattr(self, "purchase_state_title"):
             return
-        audit_requires_regeneration = bool(
-            self._load_review_state().get("decoration_color_audit_requires_regeneration", False)
-        )
         review_exists = bool(self.last_review_workbook and self.last_review_workbook.exists())
+        routing_status = self._purchase_review_routing_status() if review_exists else {"current": True, "reason": "", "changes": []}
+        routing_stale = review_exists and not bool(routing_status.get("current", False))
+        review_state = self._load_review_state()
+        audit_requires_regeneration = bool(
+            review_state.get("decoration_color_audit_requires_regeneration", False)
+            and (routing_stale or review_state.get("additional_import_pending", False))
+        )
         snapshot = self._fresh_snapshot() if review_exists else {}
         review_count = int(snapshot.get("review_count", 0) or 0)
         blocked_routes = int(snapshot.get("blocked_route_count", 0) or 0)
@@ -7915,6 +9100,7 @@ end try
         generated = bool(
             release_dir
             and not audit_requires_regeneration
+            and not routing_stale
             and audit_status.get("complete")
         )
         documents = self._purchase_order_document_paths(release_dir) if generated else []
@@ -7958,6 +9144,38 @@ end try
             self.purchase_action_note.configure(
                 text="This archived event is report-only. Update the job name/logo, then regenerate the reports."
             )
+        elif routing_stale:
+            changed_count = len(routing_status.get("changes", []) or [])
+            self.purchase_status_icon.configure(text="↻", fg_color="#FFF1DC", text_color=WARNING)
+            self.purchase_state_title.configure(text="Purchase Review Refresh Needed")
+            self.purchase_state_body.configure(
+                text=(
+                    "Product Master changed an active purchase route. Refresh the review before creating PDFs; "
+                    "saved decisions will carry forward and Orchid will return you to this page.\n\n"
+                    + _clean(routing_status.get("reason", ""))
+                )
+            )
+            self.purchase_folder_label.configure(text=self.last_review_workbook.name, text_color=WARNING)
+            self.purchase_metric_labels["status"].configure(
+                text=f"Refresh {changed_count}" if changed_count else "Refresh",
+                text_color=WARNING,
+            )
+            self.purchase_action_primary.configure(
+                text="Refresh Routing & Return to POs",
+                command=lambda: self.regenerate_current_review(return_to_purchase=True),
+                state="normal",
+            )
+            self.purchase_action_regenerate.configure(
+                text="Regenerate Purchase Review",
+                command=lambda: self.regenerate_current_review(return_to_purchase=True),
+                state="normal",
+            )
+            self.purchase_action_audit.configure(state="normal")
+            self.purchase_action_edit.configure(text="Edit PO Numbers", state="disabled")
+            self.purchase_action_new.configure(state="normal")
+            self.purchase_action_note.configure(
+                text="Only a current-event vendor, decoration type/location, or Never Outsource route requires this refresh."
+            )
         elif generated:
             count = len(documents)
             self.purchase_status_icon.configure(text="✓", fg_color="#2ECC71", text_color=WHITE)
@@ -7965,11 +9183,7 @@ end try
             self.purchase_state_body.configure(
                 text=(
                     f"{count} purchase-order document{'s have' if count != 1 else ' has'} been created and are ready to review. "
-                    + (
-                        "The live output folder is unavailable, so Orchid is using the verified Event Archive copy."
-                        if using_archive_fallback
-                        else "Open, regenerate, or update PO numbers using the actions on the right."
-                    )
+                    + "Open, regenerate, or update PO numbers using the actions on the right."
                 )
             )
             self.purchase_folder_label.configure(text=str(release_dir), text_color=MUTED)
@@ -8075,6 +9289,9 @@ end try
 
     def build_employee_totals_page(self):
         page = self.new_page("employees")
+        # Employee Totals owns row 0; do not leave new_page's dashboard spacer
+        # competing for the lower half of the window.
+        page.grid_rowconfigure(9, weight=0, minsize=0)
         page.grid_rowconfigure(0, weight=1)
 
         employee_shadow = ctk.CTkFrame(page, fg_color=SHADOW, corner_radius=18, width=1, height=1)
@@ -8187,7 +9404,7 @@ end try
 
         optional = self.section_card(
             scroll, 4, "Safe Product Candidate Preview",
-            "Review new product/style numbers found in the selected order export. Professional 4.9.12 RC13 does not mass-add order lines to Product Master, so a large import cannot create hundreds of incomplete permanent records."
+            "Review new product/style numbers found in the selected order export. This separate audit-reconciliation recovery test does not mass-add order lines to Product Master, so a large import cannot create hundreds of incomplete permanent records."
         )
         self.primary_button(optional, "Create Candidate List", self.process_csv)
 
@@ -8213,10 +9430,10 @@ end try
 
         about = self.section_card(
             scroll, 7, "About Orchid Purchase Manager",
-            "Professional 4.9.12 RC13\nEvery event locks the order CSV, live Product Master, Never Outsource overrides, and immutable Shopify source ledger before review. Final reports are built in a hidden staging folder and are released only after source, routing, quantity, and file-hash checks pass."
+            "Professional 4.9.104\nAdds one-click Needs Setup navigation in Product Master and renames the Ship to Orchid purchase order."
         )
         ctk.CTkLabel(
-            about, text="Version 4.9.12 RC13", text_color=PURPLE_DARK,
+            about, text="Version 4.9.104", text_color=PURPLE_DARK,
             font=ctk.CTkFont(size=18, weight="bold"), anchor="w",
         ).grid(row=2, column=0, padx=22, pady=(0, 20), sticky="w")
 
@@ -8226,6 +9443,7 @@ end try
         snapshot = snapshot or self.last_snapshot or {}
         self._refresh_current_event_progress(snapshot)
         if self.selected_csv or (self.last_review_workbook and self.last_review_workbook.exists()):
+            self._show_current_event_active_layout()
             event = self.current_event_name or snapshot.get("event_name") or "Active Purchase Packet"
             event_length = len(event)
             event_font_size = 33 if event_length <= 24 else 29 if event_length <= 38 else 25
@@ -8257,11 +9475,11 @@ end try
                 self.current_event_regenerate,
                 self.current_event_regenerate_po,
                 self.current_event_edit_po,
-                self.current_event_archive,
+                self.current_event_master,
             ):
                 button.configure(
                     fg_color=PURPLE, hover_color=PURPLE_DARK, text_color=WHITE,
-                    border_width=0, corner_radius=10, height=46,
+                    border_width=0, corner_radius=10, height=40,
                 )
             self.current_event_primary.configure(font=ctk.CTkFont(size=12, weight="bold"))
             if self.last_review_workbook and self.last_review_workbook.exists():
@@ -8286,23 +9504,23 @@ end try
                     text="Process Orders", command=self.create_review_workbook
                 )
             self.current_event_add.grid(row=0, column=1, sticky="ew", padx=6, pady=6)
-            self.current_event_replace.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
-            self.current_event_discard.grid(row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=(9, 0))
+            self.current_event_replace.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+            self.current_event_discard.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=(6, 0))
             if self.last_review_workbook and self.last_review_workbook.exists():
                 self.current_event_regenerate.configure(state="normal")
-                self.current_event_regenerate.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
+                self.current_event_regenerate.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
             else:
                 self.current_event_regenerate.grid_remove()
-                self.current_event_replace.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
             if self.last_purchase_order_dir and self.last_purchase_order_dir.exists():
                 self.current_event_regenerate_po.configure(state="normal")
-                self.current_event_regenerate_po.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
+                self.current_event_regenerate_po.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
                 self.current_event_edit_po.configure(state="normal")
-                self.current_event_edit_po.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
+                self.current_event_edit_po.grid(row=3, column=1, sticky="ew", padx=5, pady=5)
             else:
                 self.current_event_regenerate_po.grid_remove()
                 self.current_event_edit_po.grid_remove()
         else:
+            self._show_current_event_empty_layout()
             self.current_event_job_logo.configure(image=None, text="")
             self.current_event_job_logo.grid_remove()
             self.current_event_title.configure(text="No Active Purchase Packet")
@@ -8562,6 +9780,7 @@ end try
                     Path(self.selected_csv), live_product_master_path(), REPORTS,
                     report_mode=state.get("report_mode") or self.current_mode or GENERAL_SALES_PERIOD,
                     event_name=state.get("event_name") or self.current_event_name or "",
+                    active_packet_id=_clean(state.get("active_packet_id", "")),
                     decoration_fulfillment=(
                         state.get("decoration_fulfillment")
                         or self.current_decoration_fulfillment
@@ -8581,6 +9800,7 @@ end try
                         Path(self.selected_csv), live_product_master_path(), REPORTS,
                         report_mode=state.get("report_mode") or self.current_mode or GENERAL_SALES_PERIOD,
                         event_name=state.get("event_name") or self.current_event_name or "",
+                        active_packet_id=_clean(state.get("active_packet_id", "")),
                         decoration_fulfillment=(
                             state.get("decoration_fulfillment")
                             or self.current_decoration_fulfillment
@@ -8707,15 +9927,6 @@ end try
         threading.Thread(target=worker, daemon=True, name="orchid-add-orders-worker").start()
         self.after(100, poll_worker)
 
-    def replace_current_csv(self):
-        if self.selected_csv and not messagebox.askyesno(
-            "Replace Imported CSV",
-            "Replace the current order import?\n\nThe active Purchase Review and generated purchase orders will be cleared from the workflow. Product Master, settings, and the original CSV file will not be changed.",
-        ):
-            return
-        self._clear_active_packet_state()
-        self.choose_csv()
-
     def _clear_active_packet_state(self):
         try:
             ACTIVE_PACKET_RESET_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -8749,10 +9960,29 @@ end try
         self.show_page("import")
         self.after_idle(lambda: (self.refresh_current_event_page({}), self.refresh_dashboard()))
 
+    def finish_and_clear_current_event(self):
+        """Close the active packet and leave its PDFs outside Orchid's workflow."""
+        if not (self.selected_csv or self.last_review_workbook or self.last_purchase_order_dir):
+            messagebox.showinfo("No Current Event", "There is no active purchase packet to finish.")
+            return
+        body = (
+            "Before clearing, save any PDFs you want to keep in your normal computer folder.\n\n"
+            "This removes the event's CSV, Purchase Review, totals, and purchase-order references from Orchid. "
+            "Product Master remains saved. Orchid will not reopen this event or use its reports in a later event."
+        )
+        if not messagebox.askyesno("Finish & Clear Event", body, default=messagebox.NO):
+            return
+        self._suppress_empty_import_prompt = True
+        self._clear_active_packet_state()
+        self.refresh_current_event_page({})
+        self.refresh_dashboard()
+        self.show_page("import")
+        self.after_idle(lambda: (self.refresh_current_event_page({}), self.refresh_dashboard()))
+
     def start_new_purchase_packet(self):
         if not messagebox.askyesno(
             "Start New Event",
-            "Start a new purchase packet?\n\nThe completed event and all generated files will remain safely archived.",
+            "Start a new purchase packet?\n\nThe active event will be cleared from Orchid. Product Master stays saved; already-created PDFs remain on your computer but cannot be reopened in Orchid.",
         ):
             return
         self._suppress_empty_import_prompt = True
@@ -8763,18 +9993,22 @@ end try
         self.after_idle(lambda: (self.refresh_current_event_page({}), self.refresh_dashboard()))
 
     def open_latest_purchase_orders(self):
-        release_dir, using_archive_fallback = self._purchase_order_release_location()
-        if release_dir:
-            if using_archive_fallback:
-                messagebox.showinfo(
-                    "Opening Verified Archive Copy",
-                    "The live Purchase Orders folder is incomplete or unavailable. Orchid is opening the matching verified Event Archive copy instead.",
+        report_dir, _unused_archive_flag = self._purchase_order_release_location()
+        if report_dir:
+            try:
+                opened = subprocess.run(["open", str(report_dir)], check=False)
+            except OSError:
+                opened = None
+            if not opened or opened.returncode != 0:
+                messagebox.showwarning(
+                    "Unable to Open Purchase Orders",
+                    "The current purchase-order folder is ready, but Finder could not be opened automatically:\n"
+                    f"{report_dir}",
                 )
-            subprocess.run(["open", str(release_dir)], check=False)
         else:
             messagebox.showwarning(
                 "Purchase Orders Need Attention",
-                "Orchid could not verify the live Purchase Orders folder or a matching Event Archive copy. Regenerate only after checking the current packet.",
+                "Orchid could not verify purchase orders for the active event. The existing PDFs were not changed. Do not regenerate; check the current packet first.",
             )
 
     # ---------- actions ----------
@@ -8917,25 +10151,45 @@ end try
 
     @staticmethod
     def _pid_is_running(pid: int) -> bool:
-        if pid <= 0:
-            return False
+        return process_is_running(pid)
+
+    @staticmethod
+    def _pid_is_product_master(pid: int) -> bool:
+        """Return True only when ``pid`` belongs to Orchid's Product Master.
+
+        A PID file survives a forced quit or an app replacement.  macOS can
+        reuse that numeric PID for an unrelated process, so ``os.kill(pid, 0)``
+        alone is not enough evidence that Product Master is still open.  The
+        editor is always launched with ``--product-master`` in its command
+        line, which gives us a safe and specific identity check.
+        """
+        def command_reader(candidate: int) -> str:
+            completed = subprocess.run(
+                ["/bin/ps", "-p", str(candidate), "-o", "command="],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            return completed.stdout if completed.returncode == 0 else ""
+
+        return product_master_process_matches(pid, command_reader)
+
+    @staticmethod
+    def _clear_product_master_pid() -> None:
         try:
-            os.kill(pid, 0)
-            return True
-        except (ProcessLookupError, PermissionError, OSError):
-            return False
+            PRODUCT_MASTER_PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def _existing_product_master_pid(self) -> int:
         try:
             pid = int(PRODUCT_MASTER_PID_FILE.read_text(encoding="utf-8").strip())
         except Exception:
             return 0
-        if self._pid_is_running(pid):
+        if self._pid_is_product_master(pid):
             return pid
-        try:
-            PRODUCT_MASTER_PID_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
+        self._clear_product_master_pid()
         return 0
 
     @staticmethod
@@ -8971,6 +10225,7 @@ end try
         widgets = [
             getattr(self, "mc_master_button", None),
             getattr(self, "master_page_open_button", None),
+            getattr(self, "master_page_secondary_button", None),
             getattr(self, "mc_banner_button", None),
             getattr(self, "mc_work_open_button", None),
             getattr(self, "mc_action_button", None),
@@ -8979,23 +10234,58 @@ end try
             if widget is None:
                 continue
             try:
-                current = str(widget.cget("text"))
-                if "Product Master" not in current and current != "Opening Product Master…":
-                    continue
-                widget.configure(
-                    text="Opening Product Master…" if opening else "Open Product Master",
-                    state="disabled" if opening else "normal",
-                )
+                key = str(widget)
+                if opening:
+                    originals = getattr(self, "_product_master_button_labels", {})
+                    originals.setdefault(key, str(widget.cget("text")))
+                    self._product_master_button_labels = originals
+                    widget.configure(text="Opening Product Master…", state="disabled")
+                else:
+                    original = getattr(self, "_product_master_button_labels", {}).get(key)
+                    if original is not None:
+                        widget.configure(text=original, state="normal")
             except Exception:
                 pass
 
-    def _finish_product_master_launch(self, pid: int) -> None:
-        if self._pid_is_running(pid):
-            self._activate_process(pid)
+    def _wait_for_product_master_window(self, started_at: float, *, attempts: int = 0) -> None:
+        """Finish a Product Master launch only after the editor confirms itself.
+
+        ``open -n`` returns as soon as macOS accepts the application request,
+        not when Product Master has finished building its catalog window.  The
+        editor therefore writes its own PID file once it is live, which is the
+        only reliable success signal for this handoff.
+        """
+        editor_pid = self._existing_product_master_pid()
+        if editor_pid:
+            self._product_master_was_open = True
+            self._activate_process(editor_pid)
+            self.after(300, lambda pid=editor_pid: self._activate_process(pid))
             self.dashboard_status.configure(
                 text="Product Master is open. Repeated clicks will bring the same window forward.",
                 text_color=PURPLE,
             )
+            self._set_product_master_opening_state(False)
+            self.refresh_dashboard()
+            return
+
+        # A large catalog can take a moment to load, especially immediately
+        # after an app update.  Keep the dashboard responsive while allowing
+        # the actual Product Master window time to appear.
+        if time.monotonic() - started_at < 15.0:
+            self.after(250, lambda: self._wait_for_product_master_window(started_at, attempts=attempts + 1))
+            return
+
+        self._clear_product_master_pid()
+        self.dashboard_status.configure(
+            text="Product Master did not open. Please try again after this message closes.",
+            text_color=WARNING,
+        )
+        messagebox.showerror(
+            "Product Master Did Not Open",
+            "Orchid could not confirm the Product Master window after 15 seconds. "
+            "The launch log was saved for support.\n\n"
+            "Your current event and Product Master data were not changed.",
+        )
         self._set_product_master_opening_state(False)
         self.refresh_dashboard()
 
@@ -9022,30 +10312,32 @@ end try
                 return
 
             self._set_product_master_opening_state(True)
-            command = [sys.executable, "--product-master"] if getattr(sys, "frozen", False) else [sys.executable, str(Path(__file__).resolve()), "--product-master"]
+            command, is_bundle_handoff = product_master_launch_command(
+                Path(__file__),
+                sys.executable,
+                is_frozen=bool(getattr(sys, "frozen", False)),
+                platform=sys.platform,
+            )
             if prefill_product:
                 command.extend(["--new-product", str(prefill_product)])
             elif setup_product:
                 command.extend(["--setup-product", str(setup_product)])
             elif search_product:
                 command.extend(["--search-product", str(search_product)])
-            log_file = open(DATA / "product_master_launch.log", "a", encoding="utf-8")
-            process = subprocess.Popen(
-                command,
-                cwd=str(PROJECT),
-                stdout=log_file,
-                stderr=log_file,
-                start_new_session=True,
-            )
+            self._clear_product_master_pid()
+            with open(DATA / "product_master_launch.log", "a", encoding="utf-8") as log_file:
+                log_file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} Product Master launch: {command!r}\n")
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(PROJECT),
+                    stdout=log_file,
+                    stderr=log_file,
+                    start_new_session=True,
+                )
             self.product_master_process = process
-            self._product_master_was_open = True
-            PRODUCT_MASTER_PID_FILE.write_text(str(process.pid), encoding="utf-8")
-            self.dashboard_status.configure(text="Opening Product Master…", text_color=PURPLE)
-            # Product Master can take a few seconds to load a large catalog. Try
-            # activation more than once so it appears in front when it is ready.
-            for delay in (500, 1300, 2600, 4200):
-                self.after(delay, lambda pid=process.pid: self._activate_process(pid))
-            self.after(4600, lambda pid=process.pid: self._finish_product_master_launch(pid))
+            method = "macOS app window" if is_bundle_handoff else "Product Master window"
+            self.dashboard_status.configure(text=f"Opening {method}…", text_color=PURPLE)
+            self.after(150, lambda: self._wait_for_product_master_window(time.monotonic()))
         except Exception as error:
             self._set_product_master_opening_state(False)
             messagebox.showerror("Unable to Open Product Master", str(error))
@@ -9141,7 +10433,7 @@ end try
         ).pack(anchor="w", padx=28, pady=(26, 6))
         ctk.CTkLabel(
             dialog,
-            text="This controls which garments appear on the in-house receiving report and which appear on the outside-decorator job report.",
+            text="This controls which garments appear on the Receiving & Decoration Report and which appear on the outside-decorator job report.",
             text_color=MUTED, font=ctk.CTkFont(size=13), wraplength=610, justify="left",
         ).pack(anchor="w", padx=28, pady=(0, 18))
 
@@ -9187,14 +10479,13 @@ end try
 
     def _save_review_state(self, report_mode: str, event_name: str, decoration_fulfillment: str):
         existing = self._load_review_state()
-        state = {
-            "source_csv": str(self.selected_csv or ""),
-            "source_signature": self._source_file_signature(self.selected_csv),
+        state = new_active_packet_state(Path(self.selected_csv))
+        state.update({
             "report_mode": report_mode,
             "event_name": event_name,
             "decoration_fulfillment": normalize_decoration_fulfillment(decoration_fulfillment),
             "app_source": str(Path(__file__).resolve()),
-        }
+        })
         # Preserve the append-import manifest when orders were combined before
         # the first Purchase Review workbook was created.
         for key in ("import_batches", "last_additional_import"):
@@ -9282,6 +10573,7 @@ end try
                 result = generate_review_workbook(
                     selected_csv, master_path, REPORTS,
                     report_mode=report_mode, event_name=event_name,
+                    active_packet_id=_clean(self._load_review_state().get("active_packet_id", "")),
                     decoration_fulfillment=decoration_fulfillment,
                     regenerate_helper=REGENERATE_HELPER,
                     normalized_orders=normalized_orders,
@@ -9300,6 +10592,7 @@ end try
                     rebuilt = generate_review_workbook(
                         selected_csv, live_product_master_path(), REPORTS,
                         report_mode=report_mode, event_name=event_name,
+                        active_packet_id=_clean(self._load_review_state().get("active_packet_id", "")),
                         decoration_fulfillment=decoration_fulfillment,
                         regenerate_helper=REGENERATE_HELPER,
                         previous_review_path=first_workbook,
@@ -9344,6 +10637,7 @@ end try
                 self.current_mode = result["report_mode"]
                 self.current_decoration_fulfillment = result.get("decoration_fulfillment", decoration_fulfillment)
                 self.last_review_workbook = Path(result["output_path"])
+                self._bind_active_review_workbook(self.last_review_workbook)
                 self._candidate_sync_workbook = str(self.last_review_workbook.resolve())
                 self._reset_review_navigation()
                 self.imported_line_count = int(result["lines"])
@@ -9431,10 +10725,14 @@ end try
         workbook_path: Path,
         po_overrides=None,
         active_workbook_path: Path | None = None,
+        hold_unresolved_review: bool = False,
+        test_mode: bool = False,
     ):
         from modules.final_po_generator import generate_final_purchase_orders
 
         try:
+            if not self._require_active_packet("Purchase Order generation"):
+                return
             requested_workbook = Path(workbook_path)
             active_workbook = Path(active_workbook_path) if active_workbook_path else requested_workbook
             # Every report-generation path must use the same reconciled event
@@ -9445,7 +10743,7 @@ end try
             # older Decoration Color (for example JP56 Baby showing as Black)
             # even though the color-specific Product Master/audit decision was
             # saved correctly.
-            report_only_archive = self._is_archived_report_reopen()
+            report_only_archive = False
             effective_workbook = requested_workbook
             if active_workbook_path is None and not report_only_archive:
                 effective_workbook = self._build_journal_reconciled_workbook(active_workbook)
@@ -9455,12 +10753,20 @@ end try
             )
             job_logo = self._outsourced_job_logo_path()
             outsourced_job_name = self._outsourced_job_name()
+            outsourced_cover_artwork = self._outsourced_cover_artwork_entries()
+            outsourced_cover_notes = self._outsourced_cover_notes()
+            outsourced_to = self._outsourced_job_metadata().get("outsourced_to", {})
             job_logo_metadata = self._outsourced_job_logo_metadata_path()
             result = generate_final_purchase_orders(
                 effective_workbook, REPORTS, po_number_overrides=overrides,
                 job_logo_path=job_logo,
                 outsourced_job_name=outsourced_job_name,
-                allow_historical_lock=report_only_archive,
+                outsourced_cover_artwork=outsourced_cover_artwork,
+                outsourced_cover_notes=outsourced_cover_notes,
+                outsourced_to=outsourced_to,
+                allow_historical_lock=False,
+                hold_unresolved_review=hold_unresolved_review,
+                test_mode=test_mode,
             )
             generated_from = effective_workbook
             output_dir = Path(result["output_dir"])
@@ -9489,32 +10795,31 @@ end try
             state = self._load_review_state()
             state.pop("decoration_color_audit_requires_regeneration", None)
             state["last_purchase_order_dir"] = str(self.last_purchase_order_dir)
+            state["active_purchase_order_dir"] = str(self.last_purchase_order_dir)
+            state["active_purchase_order_packet_lock_id"] = _clean(
+                state.get("active_review_packet_lock_id", "")
+            )
             state["last_purchase_order_generated_at"] = time.time()
-            if not report_only_archive:
-                archive_dir = archive_completed_event(
-                    reports_root=REPORTS,
-                    event_name=self.current_event_name,
-                    review_workbook=generated_from,
-                    purchase_order_dir=self.last_purchase_order_dir,
-                    source_csv=self.selected_csv,
-                    job_logo_path=job_logo,
-                    job_logo_metadata_path=job_logo_metadata,
-                )
-                archive_valid, archive_reason = validate_release_packet(archive_dir, archived=True)
-                if not archive_valid:
-                    raise RuntimeError(f"The Event Archive copy could not be verified: {archive_reason}.")
-                state["last_purchase_order_archive_dir"] = str(archive_dir)
+            state.pop("last_purchase_order_archive_dir", None)
+            state.pop("completed_purchase_order_archive_dir", None)
+            state.pop("archived_report_reopen", None)
+            state.pop("archive_source_workbook", None)
             try:
                 self._write_review_state_atomic(state)
             except Exception:
                 pass
-            self.dashboard_status.configure(
-                text=(
+            held_count = int(result.get("review_lines", 0) or 0)
+            if test_mode:
+                status_text = (
+                    f"Created {result['report_count']} test purchase-order document(s). "
+                    f"{held_count} unfinished line{'s' if held_count != 1 else ''} were held out of the orders."
+                )
+            else:
+                status_text = (
                     f"Created {result['report_count']} purchase-order document(s), "
                     f"plus {result.get('decoration_report_count', 0)} decoration report(s)."
-                ),
-                text_color=SUCCESS,
-            )
+                )
+            self.dashboard_status.configure(text=status_text, text_color=SUCCESS)
             # Force a fresh workflow/page render after generation.  The
             # dashboard cache must not leave Step 5 showing the pre-generation
             # "Ready" state after protected PDFs have already been released.
@@ -9528,11 +10833,32 @@ end try
                     "Protected PDFs were released, but the Purchase Orders page could not locate them. "
                     f"Open this folder manually: {self.last_purchase_order_dir}"
                 )
-            messagebox.showinfo(
-                "Purchase Orders Created",
-                f"Created {len(visible_documents)} purchase-order PDF(s).\n\n"
-                f"Folder: {self.last_purchase_order_dir}",
-            )
+            if test_mode:
+                hold_text = (
+                    f"\n\n{held_count} unfinished line{'s were' if held_count != 1 else ' was'} held from vendor orders in "
+                    "TEST_ONLY_Held_for_Review.pdf."
+                    if held_count else "\n\nNo unfinished lines were held."
+                )
+                messagebox.showinfo(
+                    "Test Purchase Orders Created",
+                    f"Created {len(visible_documents)} test purchase-order PDF(s)."
+                    f"{hold_text}\n\n"
+                    "The protected release check verified that every included garment appears exactly once "
+                    "in a vendor order, the held-items report, or the internal purchase route.\n\n"
+                    f"Folder: {self.last_purchase_order_dir}\n\n"
+                    "Finder will open this event's verified PDF folder when this message closes.",
+                )
+            else:
+                messagebox.showinfo(
+                    "Purchase Orders Created",
+                    f"Created {len(visible_documents)} purchase-order PDF(s).\n\n"
+                    f"Folder: {self.last_purchase_order_dir}\n\n"
+                    "Finder will open this event's verified PDF folder when this message closes.",
+                )
+            # A successful final release should take the user directly to the
+            # one verified folder.  Do this after the confirmation closes so
+            # Finder is not hidden behind the modal success message.
+            self.after(120, self.open_latest_purchase_orders)
             self.after(220, self._play_orchid_success_animation)
         except Exception as error:
             messagebox.showerror("Unable to Create Final Purchase Orders", str(error))
@@ -9571,9 +10897,8 @@ end try
         subprocess.run(["open", str(folder)], check=False)
 
     def _is_archived_report_reopen(self) -> bool:
-        """Return whether the active workbook is a report-only archive reopen."""
-        state = self._load_review_state()
-        return bool(state.get("archived_report_reopen", False))
+        """Archived events are no longer available to the live workflow."""
+        return False
 
     def _stage_archived_event_for_reports(self, archived_workbook: Path) -> dict:
         """Create a protected working copy of one archived completed event.
@@ -9644,6 +10969,23 @@ end try
                 working_logo_metadata = working_dir / f"{safe_filename(event_name)}__Outsourced_Job_Logo_Metadata.json"
                 shutil.copy2(candidate, working_logo_metadata)
                 break
+
+        # The report-cover metadata names the exact per-color artwork files.
+        # Restore those files beside the staged workbook as well so a later
+        # archived report regeneration uses the same artwork reference page.
+        if working_logo_metadata:
+            try:
+                cover_artwork = json.loads(working_logo_metadata.read_text(encoding="utf-8")).get("artwork", {})
+            except (OSError, ValueError, TypeError, AttributeError):
+                cover_artwork = {}
+            if isinstance(cover_artwork, dict):
+                for entry in cover_artwork.values():
+                    filename = _clean(entry.get("filename", "")) if isinstance(entry, dict) else ""
+                    if not filename or Path(filename).name != filename:
+                        continue
+                    candidate = archived_workbook.parent / filename
+                    if candidate.is_file():
+                        shutil.copy2(candidate, working_dir / filename)
 
         return {
             "archive_workbook": archived_workbook,
@@ -9725,6 +11067,7 @@ end try
                 "review_completed_at": time.time(),
                 "archived_report_reopen": True,
                 "archive_source_workbook": str(staged["archive_workbook"]),
+                "completed_purchase_order_archive_dir": str(Path(selected).parent),
                 "reopened_workbook": str(self.last_review_workbook),
                 "outsourced_job_name": self._outsourced_job_name(),
                 "app_source": str(Path(__file__).resolve()),
@@ -9894,6 +11237,7 @@ def regenerate_review_from_saved_state(request_path: Path | None = None):
             source_csv, live_product_master_path(), REPORTS,
             report_mode=state.get("report_mode") or GENERAL_SALES_PERIOD,
             event_name=state.get("event_name") or "",
+            active_packet_id=_clean(state.get("active_packet_id", "")),
             decoration_fulfillment=state.get("decoration_fulfillment") or STANDARD_ORCHID_WORKFLOW,
             regenerate_helper=REGENERATE_HELPER,
             previous_review_path=previous_workbook,

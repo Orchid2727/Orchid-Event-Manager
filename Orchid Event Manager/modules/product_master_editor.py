@@ -18,7 +18,7 @@ import pandas as pd
 from modules.paths import product_master_path, product_master_update_marker_path
 from modules.outsource_rules import (
     NEVER_OUTSOURCE_COLUMN, apply_never_outsource_defaults, default_never_outsource,
-    vendor_never_outsource,
+    is_boots_product, vendor_never_outsource,
 )
 from modules.product_resolver import default_product_id
 from modules.blank_garment_rules import (
@@ -44,13 +44,21 @@ from modules.decoration_locations import (
 )
 from modules.product_intelligence import apply_product_intelligence, infer_default_decoration
 from modules.routing_rules import preferred_vendor_for_brand_text
+from modules.shopify_parser import is_purchasing_color
 from modules.thread_ink_colors import (
     load_thread_ink_colors, register_thread_ink_color, save_thread_ink_colors,
+)
+from modules.color_setup_guidance import (
+    is_new_color_setup_row,
+    is_setup_required,
+    new_color_setup_guidance,
+    new_color_setup_message,
+    prioritize_new_color_setup_rows,
 )
 from modules.internal_services import (
     HEMMING_ALTERATION_LABEL, SEW_ON_PATCH_LABEL,
     infer_in_house_decoration, is_in_house_decoration, is_in_house_service_product,
-    is_internal_service_style,
+    is_internal_service_style, is_phantom_product_label,
 )
 from modules.purchase_rules import (
     CATEGORY_OPTIONS,
@@ -81,6 +89,7 @@ COLUMNS = [
     "Product Aliases",
     "Vendor Color Code",
     "Color Aliases",
+    "Purchasing Style Number",
     "Product Category",
     "Requires Size",
     "Requires Color",
@@ -100,13 +109,25 @@ WORKBOOK_VENDORS = [
     "VF",
     "Wrangler",
 ]
+# A vendor added in Product Master is an Orchid-wide purchasing choice, not a
+# temporary value for whichever style happens to be open.  Keep Rocky Boots
+# canonical as well, so prior entries such as "rocky boots" and "Rocky-Boots"
+# do not split its styles into separate vendor groups.
+CUSTOM_VENDOR_CANONICAL_NAMES = {
+    "rockyboot": "Rocky Boots",
+    "rockyboots": "Rocky Boots",
+}
 PREFERRED_VENDOR_CASE = {vendor.casefold(): vendor for vendor in WORKBOOK_VENDORS}
+PREFERRED_VENDOR_CASE.update({value.casefold(): value for value in CUSTOM_VENDOR_CANONICAL_NAMES.values()})
+PURCHASE_VENDOR_REGISTRY_FILE = PRODUCT_MASTER_PATH.parent / "purchase_vendor_options.json"
 DECORATION_TYPES = ["", "Embroidery", "Screen Print", SEW_ON_PATCH_LABEL, HEMMING_ALTERATION_LABEL, BLANK_DECORATION_LABEL]
 
 PURPLE = "#5B2AA8"
 PURPLE_DARK = "#3D176F"
 PURPLE_LIGHT = "#F2ECFB"
 PURPLE_BORDER = "#D7C8EE"
+KEY_VENDOR_MAPPING_BG = "#F7F0FF"
+KEY_VENDOR_MAPPING_BADGE_BG = "#E9DDFB"
 TEXT_DARK = "#201A2D"
 TEXT_MUTED = "#6F667A"
 CARD_BG = "#FFFFFF"
@@ -116,10 +137,27 @@ SUCCESS = "#2D7A46"
 WARNING = "#B26A00"
 DANGER = "#B42318"
 MAX_DASHBOARD_ROWS = 60
-# The editor catalog is intentionally shorter than the dashboard list.  Each
-# item contains several native Tk controls, and building too many at once can
-# make macOS defer drawing the selected product form.
-MAX_EDITOR_CATALOG_ROWS = 60
+
+# The editor no longer displays a second Product Catalog beside the selected
+# product.  That reclaimed width lets every purchasing-color control stay on
+# one easy-to-read left-to-right line.  The label and field share the exact
+# same grid column, so they cannot drift out of alignment.
+COLOR_TABLE_COLUMNS = (
+    ("Purchasing Color", 150),
+    ("Vendor Color Code", 135),
+    ("Shopify Color Alias", 180),
+    ("Purchase As Style #", 150),
+    ("Thread / Ink", 140),
+)
+COLOR_TABLE_ACTION_WIDTH = 76
+PURCHASE_AS_STYLE_COLUMN = 3
+
+
+def configure_color_table_columns(widget):
+    """Set the shared full-width columns for one purchasing-color mapping."""
+    for column, (_label, minimum) in enumerate(COLOR_TABLE_COLUMNS):
+        widget.grid_columnconfigure(column, weight=1, minsize=minimum)
+    widget.grid_columnconfigure(len(COLOR_TABLE_COLUMNS), weight=0, minsize=COLOR_TABLE_ACTION_WIDTH)
 
 
 
@@ -162,6 +200,7 @@ def canonical_vendor_name(value):
     if not value:
         return ""
     preferred_by_identity = {vendor_identity_key(vendor): vendor for vendor in WORKBOOK_VENDORS}
+    preferred_by_identity.update(CUSTOM_VENDOR_CANONICAL_NAMES)
     return preferred_by_identity.get(vendor_identity_key(value), PREFERRED_VENDOR_CASE.get(value.casefold(), value))
 
 
@@ -202,6 +241,67 @@ def canonicalize_vendor_values(values):
     return result
 
 
+def _load_purchase_vendor_registry() -> list[str]:
+    """Read custom purchase vendors saved independently of any one style.
+
+    Before this registry existed, ``+ Add Vendor`` only changed the dropdown in
+    the current Product Master window.  Closing that window before a style save
+    made a custom vendor appear to vanish.  The registry is deliberately small
+    and stores only the permanent dropdown choices; vendor assignments continue
+    to live on the Product Master styles themselves.
+    """
+    try:
+        payload = json.loads(PURCHASE_VENDOR_REGISTRY_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, TypeError, json.JSONDecodeError):
+        return []
+    values = payload.get("vendors", []) if isinstance(payload, dict) else payload
+    if not isinstance(values, list):
+        return []
+    return canonicalize_vendor_values(values)
+
+
+def _save_purchase_vendor_registry(values) -> list[str]:
+    """Persist canonical custom vendor options without touching Product Master."""
+    saved = alphabetical_options(canonicalize_vendor_values(values))
+    try:
+        PURCHASE_VENDOR_REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = PURCHASE_VENDOR_REGISTRY_FILE.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps({"vendors": saved}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(PURCHASE_VENDOR_REGISTRY_FILE)
+    except OSError:
+        # A vendor assignment saved on a product remains authoritative even if
+        # this convenience registry cannot be written on a particular launch.
+        pass
+    return saved
+
+
+def purchase_vendor_options(master=None) -> list[str]:
+    """Return all permanent vendor choices, including saved custom vendors."""
+    saved_custom = _load_purchase_vendor_registry()
+    master_vendors = []
+    if master is not None and "Vendor" in master.columns:
+        master_vendors = master["Vendor"].tolist()
+        # Seed the new registry from pre-v4.9.75 Product Master assignments.
+        # This is what carries the user's already-assigned Rocky Boots styles
+        # forward as a permanent dropdown choice after the first upgraded open.
+        if master_vendors:
+            saved_custom = _save_purchase_vendor_registry([*saved_custom, *master_vendors])
+    values = list(WORKBOOK_VENDORS) + saved_custom + master_vendors
+    return alphabetical_options(canonicalize_vendor_values(values))
+
+
+def register_purchase_vendor(value) -> str:
+    """Add one permanent dropdown vendor and return its canonical name."""
+    value = canonical_vendor_name(value)
+    if not value:
+        return ""
+    _save_purchase_vendor_registry([*_load_purchase_vendor_registry(), value])
+    return value
+
+
 def normalize_style(value):
     return re.sub(r"\s+", "", clean_text(value)).upper()
 
@@ -221,16 +321,11 @@ def search_tokens(value):
     return [token for token in normalize_search_text(value).split() if token]
 
 
-def search_match_score(rows, query):
-    """Return a lower-is-better search score, or None when the row does not match."""
+def search_match_score_values(style, product_id, name, vendor, combined, query):
+    """Return a lower-is-better search score for pre-normalized catalog values."""
     tokens = search_tokens(query)
     if not tokens:
         return 50
-    style = normalize_search_text(first_nonblank(rows.get("Style Number", [])))
-    product_id = normalize_search_text(first_nonblank(rows.get("Product ID", [])))
-    name = normalize_search_text(best_product_name(rows.get("Product Name", [])))
-    vendor = normalize_search_text(first_nonblank(rows.get("Vendor", [])))
-    combined = normalize_search_text(" ".join(clean_text(value) for value in rows[COLUMNS].to_numpy().flatten()))
     if not all(token in combined for token in tokens):
         return None
     normalized_query = " ".join(tokens)
@@ -249,6 +344,18 @@ def search_match_score(rows, query):
     if normalized_query in vendor:
         return 6
     return 10
+
+
+def search_match_score(rows, query):
+    """Return a lower-is-better search score, or None when the row does not match."""
+    return search_match_score_values(
+        normalize_search_text(first_nonblank(rows.get("Style Number", []))),
+        normalize_search_text(first_nonblank(rows.get("Product ID", []))),
+        normalize_search_text(best_product_name(rows.get("Product Name", []))),
+        normalize_search_text(first_nonblank(rows.get("Vendor", []))),
+        normalize_search_text(" ".join(clean_text(value) for value in rows[COLUMNS].to_numpy().flatten())),
+        query,
+    )
 
 
 def canonical_product_name(value):
@@ -290,6 +397,85 @@ def style_group_key(row):
     return f"product:{canonical_product_name(row['Product Name']).casefold()}"
 
 
+def clear_legacy_size_like_purchasing_colors(master):
+    """Remove values that Orchid already knows cannot be garment colors.
+
+    Versions before 4.9.67 could save a Shopify size or footwear-width marker
+    in Product Master's Garment Color column.  The current importer rejects
+    those values, but existing catalog rows are also read whenever the editor
+    opens.  Leaving a stale value such as ``15`` there makes it look like a
+    new purchasing color and can create an unnecessary thread/ink decision.
+
+    This migration is intentionally narrow: it clears only values rejected by
+    ``is_purchasing_color``.  Numeric vendor color *codes* are not touched,
+    because a vendor may legitimately use a numeric code.
+    """
+    if master.empty:
+        return master
+
+    result = master.copy()
+    if "Garment Color" not in result.columns:
+        result["Garment Color"] = ""
+    if "Color Aliases" not in result.columns:
+        result["Color Aliases"] = ""
+
+    for index, raw_color in result["Garment Color"].items():
+        color = normalize_space(raw_color)
+        if not color or is_purchasing_color(color):
+            continue
+
+        # The Product Master is not the place to preserve an order's size.
+        # The original Shopify line retains the size for Purchase Review and
+        # reporting; Product Master keeps a blank base row for no-color items.
+        result.at[index, "Garment Color"] = ""
+
+        aliases = []
+        seen = set()
+        for alias in re.split(r"[|;,\n]+", normalize_space(result.at[index, "Color Aliases"])):
+            alias = normalize_space(alias)
+            if not alias or not is_purchasing_color(alias):
+                continue
+            key = alias.casefold()
+            if key not in seen:
+                aliases.append(alias)
+                seen.add(key)
+        result.at[index, "Color Aliases"] = " | ".join(aliases)
+
+    return result
+
+
+def settle_complete_boot_setup_rows(master):
+    """Clear the false setup flag left by a discarded boot size color.
+
+    Boots require a size but no garment color or decoration.  Once their base
+    details are present, a stale `Setup Required` flag created only by a bogus
+    size-color row should not keep the style in the Needs Setup queue.
+    """
+    if master.empty:
+        return master
+
+    result = master.copy()
+    for index, row in result.iterrows():
+        if not is_setup_required(row.get("Setup Required", "")):
+            continue
+        if not is_boots_product(
+            row.get("Product Name", ""), row.get("Product Category", ""), row.get("Style Number", "")
+        ):
+            continue
+        rules = row_rules(row)
+        base_details_complete = all(
+            clean_text(row.get(column, ""))
+            for column in ("Product Name", "Style Number", "Vendor", "Product Category")
+        )
+        if (
+            base_details_complete
+            and not normalize_bool(rules.get("Requires Color", ""), True)
+            and not normalize_bool(rules.get("Requires Decoration", ""), True)
+        ):
+            result.at[index, "Setup Required"] = "No"
+    return result
+
+
 def remove_blank_color_placeholders(master):
     """Remove a stale blank placeholder once a color-required style has real colors."""
     if master.empty:
@@ -325,6 +511,31 @@ def remove_blank_color_placeholders(master):
     return result.drop(columns=["_style_group"]).reset_index(drop=True)
 
 
+def remove_internal_service_product_records(master):
+    """Keep decoration charges out of the permanent purchasing catalog.
+
+    A Shopify decoration service is a valid sales/order-total line, but Orchid
+    never buys it from a garment vendor.  It therefore must not survive as a
+    Product Master setup item.  ``load_product_master`` already makes a dated
+    backup before writing a cleanup, so older service rows remain recoverable
+    without cluttering the live purchasing catalog.
+    """
+    if master.empty:
+        return master
+    service_mask = master.apply(
+        lambda row: is_in_house_service_product(
+            row.get("Product Name", ""),
+            row.get("Original Line Item", ""),
+            row.get("Decoration Type", ""),
+            style_number=row.get("Style Number", ""),
+            garment_color=row.get("Garment Color", ""),
+        ) or is_phantom_product_label(row.get("Product Name", ""))
+          or is_phantom_product_label(row.get("Style Number", "")),
+        axis=1,
+    )
+    return master.loc[~service_mask].copy().reset_index(drop=True)
+
+
 def clean_and_deduplicate_master(master):
     master = master.copy()
     for column in COLUMNS:
@@ -336,6 +547,10 @@ def clean_and_deduplicate_master(master):
     master["Product Name"] = master["Product Name"].map(canonical_product_name)
     master["Style Number"] = master["Style Number"].map(normalize_style)
     master["Garment Color"] = master["Garment Color"].map(normalize_space)
+    master = clear_legacy_size_like_purchasing_colors(master)
+    # A decoration fee may have been materialized by an older import.  Remove
+    # it on upgrade so it cannot remain in All Products or Needs Setup.
+    master = remove_internal_service_product_records(master)
     # Repair duplicate spellings such as SanMar / Sanmar before saving or routing.
     master["Vendor"] = canonicalize_vendor_values(master["Vendor"])
     if master.empty:
@@ -358,6 +573,7 @@ def clean_and_deduplicate_master(master):
                 "Product Aliases": first_nonblank(group["Product Aliases"]),
                 "Vendor Color Code": first_nonblank(group["Vendor Color Code"]),
                 "Color Aliases": first_nonblank(group["Color Aliases"]),
+                "Purchasing Style Number": first_nonblank(group["Purchasing Style Number"]),
                 "Product Category": first_nonblank(group["Product Category"]),
                 "Requires Size": first_nonblank(group["Requires Size"]),
                 "Requires Color": first_nonblank(group["Requires Color"]),
@@ -374,7 +590,39 @@ def clean_and_deduplicate_master(master):
             axis=1,
         )
     result = apply_never_outsource_defaults(apply_product_intelligence(apply_purchase_rule_defaults(apply_blank_garment_defaults(result))))
+    result = settle_complete_boot_setup_rows(result)
     return result.sort_values(
+        by=["Style Number", "Product Name", "Garment Color"],
+        key=lambda series: series.astype(str).str.casefold(),
+    ).reset_index(drop=True)
+
+
+def clean_changed_style_groups(master, style_keys):
+    """Clean only edited product groups after the catalog was cleaned on load.
+
+    Normal Product Master saves change one style at a time. Re-cleaning every
+    historical style on each Save made a large, already-valid catalog feel slow.
+    The unchanged portion has already passed ``clean_and_deduplicate_master``
+    when it was opened; this function runs the same rules on the edited style
+    (and a newly merged style, if the product number changed) before writing the
+    complete, sorted file back to disk.
+    """
+    keys = {clean_text(key) for key in style_keys if clean_text(key)}
+    if not keys:
+        return clean_and_deduplicate_master(master)
+    working = master.copy()
+    for column in COLUMNS:
+        if column not in working.columns:
+            working[column] = ""
+    working = working[COLUMNS].fillna("")
+    group_keys = working.apply(style_group_key, axis=1)
+    changed_mask = group_keys.isin(keys)
+    if not changed_mask.any():
+        return clean_and_deduplicate_master(working)
+    unchanged = working.loc[~changed_mask, COLUMNS].copy()
+    changed = clean_and_deduplicate_master(working.loc[changed_mask, COLUMNS])
+    combined = pd.concat([unchanged, changed], ignore_index=True)
+    return combined.sort_values(
         by=["Style Number", "Product Name", "Garment Color"],
         key=lambda series: series.astype(str).str.casefold(),
     ).reset_index(drop=True)
@@ -438,7 +686,7 @@ def load_product_master():
     return cleaned
 
 
-def save_product_master(master, *, expected_style="", expected_vendor=""):
+def save_product_master(master, *, expected_style="", expected_vendor="", affected_style_keys=None):
     """Save the live Product Master and verify critical values from disk.
 
     Product Master saves must not report success until the exact live CSV can be
@@ -447,7 +695,11 @@ def save_product_master(master, *, expected_style="", expected_vendor=""):
     the application.
     """
     try:
-        cleaned = clean_and_deduplicate_master(master)
+        cleaned = (
+            clean_changed_style_groups(master, affected_style_keys)
+            if affected_style_keys is not None
+            else clean_and_deduplicate_master(master)
+        )
         style_key = normalize_style(expected_style)
         vendor_key = canonical_vendor_name(expected_vendor)
         if style_key and vendor_key:
@@ -469,7 +721,13 @@ def save_product_master(master, *, expected_style="", expected_vendor=""):
                     f"Save verification failed after writing. {style_key} was not reloaded from "
                     f"{PRODUCT_MASTER_PATH} with vendor {vendor_key}."
                 )
-        return clean_and_deduplicate_master(disk)
+        # ``cleaned`` was the exact frame written above. Returning the physical
+        # file avoids doing a second whole-catalog cleanup after every save while
+        # still proving the saved vendor can be read back from disk.
+        for column in COLUMNS:
+            if column not in disk.columns:
+                disk[column] = ""
+        return disk[COLUMNS].fillna("")
     except Exception as error:
         messagebox.showerror("Unable to Save Product Master", str(error))
         return None
@@ -499,6 +757,10 @@ def save_never_outsource_overrides(overrides):
 
 def editor_never_outsource_value(key, overrides, saved_value, product_name, category, style_number, vendor=""):
     """Resolve the editor switch while distinguishing legacy No from a manual override."""
+    # Boots are never allowed to route to an outside decorator.  Check this
+    # before the legacy override sidecar so an old saved No cannot reappear.
+    if is_boots_product(product_name, category, style_number):
+        return True
     if key in overrides:
         return bool(overrides[key])
     if vendor_never_outsource(vendor) or default_never_outsource(product_name, category, style_number):
@@ -513,9 +775,9 @@ class ProductMasterV2(ctk.CTk):
         super().__init__()
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
-        self.title("Orchid Purchase Manager - Product Master 4.9.12 RC13")
+        self.title("Orchid Purchase Manager - Product Master 4.9.104")
         self.geometry("1320x930")
-        self.minsize(1120, 780)
+        self.minsize(1280, 780)
         self.configure(fg_color=WINDOW_BG)
         self.after(80, self._maximize_window)
         self._last_open_request = 0.0
@@ -531,6 +793,8 @@ class ProductMasterV2(ctk.CTk):
         self._style_render_generation = 0
         self._style_render_after_id = None
         self._catalog_refresh_after_id = None
+        self._dashboard_refresh_after_id = None
+        self._editor_filter_after_id = None
         self.session_start_complete = 0
         self.session_start_total = 0
         self.session_saved_styles = set()
@@ -539,9 +803,7 @@ class ProductMasterV2(ctk.CTk):
         self.never_outsource_overrides = load_never_outsource_overrides()
         self._never_outsource_touched = False
 
-        self.vendor_options = alphabetical_options(WORKBOOK_VENDORS)
-        for vendor in self.master_data.get("Vendor", pd.Series(dtype=str)):
-            append_vendor_option(self.vendor_options, vendor)
+        self.vendor_options = purchase_vendor_options(self.master_data)
         self.decoration_color_options = load_thread_ink_colors(PRODUCT_MASTER_PATH)
         self.active_color_control_index = None
 
@@ -588,7 +850,7 @@ class ProductMasterV2(ctk.CTk):
         self.build_editor()
         install_native_scroll_support(
             self,
-            [self.queue_scroll, self.vendor_stats_frame, self.editor_catalog_scroll, self.left_scroll, self.colors_scroll],
+            [self.queue_scroll, self.vendor_stats_frame, self.left_scroll, self.colors_scroll],
         )
         self.product_name_var.trace_add("write", self.on_product_name_changed)
         self.decoration_type_var.trace_add("write", self.on_decoration_type_changed)
@@ -667,16 +929,61 @@ class ProductMasterV2(ctk.CTk):
         """Build an index once so large Product Masters do not require repeated full-file scans."""
         self.all_style_keys = []
         self.style_rows_cache = {}
+        self.style_search_cache = {}
+        self.style_display_cache = {}
+        self.style_vendor_cache = {}
+        self.style_category_cache = {}
+        self.style_editor_metadata_cache = {}
         # Product completeness is derived from the current master rows. Clear
         # it only when those rows are reindexed, then reuse it while browsing.
         self.style_complete_cache = {}
+        self.style_issues_cache = {}
         self._complete_count_cache = None
         for index, row in self.master_data.iterrows():
+            # Defense in depth for a catalog changed by another process while
+            # this editor is open.  Decoration charges never belong in the
+            # Product Master navigation or its setup counts.
+            if is_in_house_service_product(
+                row.get("Product Name", ""),
+                row.get("Original Line Item", ""),
+                row.get("Decoration Type", ""),
+                style_number=row.get("Style Number", ""),
+                garment_color=row.get("Garment Color", ""),
+            ):
+                continue
             key = style_group_key(row)
             if key not in self.style_rows_cache:
                 self.style_rows_cache[key] = []
                 self.all_style_keys.append(key)
             self.style_rows_cache[key].append(index)
+        # Search used to normalize every field of every row on each keystroke.
+        # Build that small search index only when the data actually changes.
+        for key in self.all_style_keys:
+            indices = self.style_rows_cache[key]
+            rows = self.master_data.loc[indices]
+            style = first_nonblank(rows["Style Number"])
+            product_id = first_nonblank(rows["Product ID"])
+            name = best_product_name(rows["Product Name"])
+            vendor = first_nonblank(rows["Vendor"])
+            category = first_nonblank(rows["Product Category"])
+            self.style_search_cache[key] = {
+                "style": normalize_search_text(style),
+                "product_id": normalize_search_text(product_id),
+                "name": normalize_search_text(name),
+                "vendor": normalize_search_text(vendor),
+                "combined": normalize_search_text(
+                    " ".join(clean_text(value) for value in rows[COLUMNS].to_numpy().flatten())
+                ),
+            }
+            self.style_display_cache[key] = (
+                f"{style} — {name}" if style and name else (style or name or "Unnamed product")
+            )
+            self.style_vendor_cache[key] = vendor or "Unassigned"
+            self.style_category_cache[key] = category or "Category not assigned"
+            self.style_editor_metadata_cache[key] = {
+                "style": style or "No product number",
+                "name": name or "Unnamed product",
+            }
 
     def get_style_rows(self, style_key):
         if self.master_data.empty:
@@ -690,7 +997,27 @@ class ProductMasterV2(ctk.CTk):
         issues = []
         if rows.empty:
             return ["No product record"]
-        if "Setup Required" in rows.columns and rows["Setup Required"].astype(str).str.strip().str.casefold().isin({"yes", "y", "true", "1"}).any():
+        decoration_type = first_nonblank(rows["Decoration Type"])
+        style_number = first_nonblank(rows["Style Number"])
+        if is_in_house_service_product(
+            first_nonblank(rows["Product Name"]),
+            decoration_type=decoration_type,
+            style_number=style_number,
+        ):
+            return []
+        new_color_guidance = new_color_setup_guidance(rows)
+        if new_color_guidance["new_count"]:
+            names = ", ".join((new_color_guidance["thread_ink_color_names"] or new_color_guidance["new_color_names"])[:2])
+            remaining = new_color_guidance["new_count"] - min(
+                2, len(new_color_guidance["thread_ink_color_names"] or new_color_guidance["new_color_names"])
+            )
+            if remaining:
+                names += f" +{remaining} more"
+            if new_color_guidance["thread_ink_color_names"]:
+                issues.append(f"New color needs thread/ink: {names}")
+            else:
+                issues.append(f"New color setup must be reviewed: {names}")
+        elif "Setup Required" in rows.columns and rows["Setup Required"].map(is_setup_required).any():
             issues.append("New product setup must be reviewed and saved")
         if not first_nonblank(rows["Product Name"]):
             issues.append("Missing product name")
@@ -703,8 +1030,6 @@ class ProductMasterV2(ctk.CTk):
         requires_decoration = normalize_bool(rules["Requires Decoration"], True)
         if requires_color and rows["Garment Color"].astype(str).str.strip().eq("").any():
             issues.append("Missing purchasing color")
-        decoration_type = first_nonblank(rows["Decoration Type"])
-        style_number = first_nonblank(rows["Style Number"])
         service_only = is_internal_service_style(style_number) or is_in_house_service_product(
             first_nonblank(rows["Product Name"]),
             decoration_type=decoration_type,
@@ -746,8 +1071,14 @@ class ProductMasterV2(ctk.CTk):
     def style_key_is_complete(self, key):
         """Cache catalog health until Product Master data actually changes."""
         if key not in self.style_complete_cache:
-            self.style_complete_cache[key] = self.style_is_complete(self.get_style_rows(key))
+            self.style_complete_cache[key] = not self.style_key_issues(key)
         return self.style_complete_cache[key]
+
+    def style_key_issues(self, key):
+        """Reuse a style's health result across search, dashboard, and editor cards."""
+        if key not in self.style_issues_cache:
+            self.style_issues_cache[key] = self.style_issues(self.get_style_rows(key))
+        return self.style_issues_cache[key]
 
     def incomplete_style_keys(self):
         return [key for key in self.all_style_keys if not self.style_key_is_complete(key)]
@@ -755,17 +1086,12 @@ class ProductMasterV2(ctk.CTk):
     def vendor_style_counts(self):
         counts = {}
         for key in self.all_style_keys:
-            vendor = first_nonblank(self.get_style_rows(key)["Vendor"]) or "Unassigned"
+            vendor = self.style_vendor_cache.get(key, "Unassigned")
             counts[vendor] = counts.get(vendor, 0) + 1
         return sorted(counts.items(), key=lambda item: (-item[1], item[0].casefold()))
 
     def style_display(self, key):
-        rows = self.get_style_rows(key)
-        style = first_nonblank(rows["Style Number"])
-        name = best_product_name(rows["Product Name"])
-        if style and name:
-            return f"{style} — {name}"
-        return style or name or "Unnamed product"
+        return self.style_display_cache.get(key, "Unnamed product")
 
     # ---------- dashboard ----------
     def _open_search_result(self, value: str):
@@ -830,7 +1156,16 @@ class ProductMasterV2(ctk.CTk):
             self.dashboard_stats.grid_columnconfigure(column, weight=1)
         self.total_card = self.create_stat_card(self.dashboard_stats, 0, "Total Styles", "0")
         self.complete_card = self.create_stat_card(self.dashboard_stats, 1, "Fully Configured", "0")
-        self.incomplete_card = self.create_stat_card(self.dashboard_stats, 2, "Vendors", "0")
+        # Needs Setup is intentionally an action, not just a status.  When an
+        # import identifies a few unfinished styles among a large catalog, the
+        # operator should be able to go directly to that short queue.
+        self.incomplete_card = self.create_stat_card(
+            self.dashboard_stats,
+            2,
+            "Needs Setup",
+            "0",
+            command=self.open_needs_setup_queue,
+        )
         self.percent_card = self.create_stat_card(self.dashboard_stats, 3, "Catalog Status", "Ready")
 
         health = ctk.CTkFrame(frame, fg_color=CARD_BG, border_width=1, border_color=PURPLE_BORDER, corner_radius=12)
@@ -863,11 +1198,22 @@ class ProductMasterV2(ctk.CTk):
         dashboard_vendor_values = ["All Vendors"] + self.vendor_options + ["Unassigned"]
         self.dashboard_vendor_filter = ctk.CTkComboBox(search_row, variable=self.dashboard_vendor_filter_var, values=list(dict.fromkeys(dashboard_vendor_values)), width=170, height=38, command=lambda _value: self.refresh_dashboard(), border_color=PURPLE_BORDER, button_color="#EAE3F5", button_hover_color="#DED2EF", fg_color="#FFFFFF", text_color=TEXT_DARK)
         self.dashboard_vendor_filter.grid(row=0, column=1, padx=(8, 0))
+        self.dashboard_setup_button = ctk.CTkButton(
+            search_row,
+            text="Set Up Next  ➜",
+            command=self.open_needs_setup_queue,
+            width=142,
+            height=38,
+            fg_color=PURPLE,
+            hover_color=PURPLE_DARK,
+            font=ctk.CTkFont(size=11, weight="bold"),
+        )
+        self.dashboard_setup_button.grid(row=0, column=2, padx=(8, 0))
         self.dashboard_search_results = ctk.CTkLabel(
             search_row, text="", text_color=TEXT_MUTED, font=ctk.CTkFont(size=11), anchor="w"
         )
-        self.dashboard_search_results.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0))
-        self.dashboard_search_var.trace_add("write", lambda *_: self.refresh_dashboard())
+        self.dashboard_search_results.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(5, 0))
+        self.dashboard_search_var.trace_add("write", lambda *_: self._schedule_dashboard_refresh())
         self.queue_scroll = ctk.CTkScrollableFrame(queue_card, fg_color="#FFFFFF", corner_radius=8, border_width=1, border_color=PURPLE_BORDER)
         self.queue_scroll.grid(row=3, column=0, sticky="nsew", padx=20, pady=(0, 18))
         self.queue_scroll.grid_columnconfigure(0, weight=1)
@@ -882,12 +1228,18 @@ class ProductMasterV2(ctk.CTk):
         vendor_card.grid_rowconfigure(1, weight=1)
         ctk.CTkLabel(vendor_card, text="Click a vendor to filter the Product Catalog.", text_color=TEXT_MUTED, font=ctk.CTkFont(size=11), justify="left", wraplength=330).grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 18))
 
-    def create_stat_card(self, parent, column, title, value):
+    def create_stat_card(self, parent, column, title, value, command=None):
         card = ctk.CTkFrame(parent, fg_color=CARD_BG, border_width=1, border_color=PURPLE_BORDER, corner_radius=12)
         card.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 7, 0 if column == 3 else 7))
-        ctk.CTkLabel(card, text=title, text_color=TEXT_MUTED, font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=18, pady=(15, 3))
+        title_label = ctk.CTkLabel(card, text=title, text_color=TEXT_MUTED, font=ctk.CTkFont(size=12, weight="bold"))
+        title_label.pack(anchor="w", padx=18, pady=(15, 3))
         label = ctk.CTkLabel(card, text=value, text_color=TEXT_DARK, font=ctk.CTkFont(size=27, weight="bold"))
         label.pack(anchor="w", padx=18, pady=(0, 15))
+        if command is not None:
+            # Bind each visible part of the card so clicking the count or its
+            # heading produces the same one-click Needs Setup view.
+            for widget in (card, title_label, label):
+                widget.bind("<Button-1>", lambda _event: command())
         return label
 
     def refresh_dashboard(self):
@@ -898,11 +1250,9 @@ class ProductMasterV2(ctk.CTk):
         complete = self.completed_style_count()
         incomplete = total - complete
         percent = complete / total if total else 0
-        assigned_vendors = {first_nonblank(self.get_style_rows(key)["Vendor"]) for key in self.all_style_keys}
-        assigned_vendors.discard("")
         self.total_card.configure(text=str(total))
         self.complete_card.configure(text=str(complete), text_color=SUCCESS)
-        self.incomplete_card.configure(text=str(len(assigned_vendors)), text_color=PURPLE)
+        self.incomplete_card.configure(text=str(incomplete), text_color=WARNING if incomplete else SUCCESS)
         self.percent_card.configure(
             text="Ready" if not incomplete else "Needs Setup",
             text_color=SUCCESS if not incomplete else WARNING,
@@ -915,6 +1265,14 @@ class ProductMasterV2(ctk.CTk):
         if hasattr(self, "dashboard_vendor_filter"):
             values = ["All Vendors"] + self.vendor_options + ["Unassigned"]
             self.dashboard_vendor_filter.configure(values=list(dict.fromkeys(values)))
+        if hasattr(self, "dashboard_setup_button"):
+            if incomplete:
+                self.dashboard_setup_button.configure(
+                    text=f"Set Up Next ({incomplete})  ➜",
+                    state="normal",
+                )
+            else:
+                self.dashboard_setup_button.configure(text="Product Master Ready", state="disabled")
         if hasattr(self, "filter_buttons"):
             self.filter_buttons["All Products"].configure(text=f"All Products ({total})")
             self.filter_buttons["Needs Setup"].configure(text=f"Needs Setup ({incomplete})")
@@ -959,7 +1317,7 @@ class ProductMasterV2(ctk.CTk):
                 item.grid(row=row_index, column=0, sticky="ew", padx=4, pady=3)
                 item.grid_columnconfigure(0, weight=1)
                 ctk.CTkLabel(item, text=self.style_display(key), text_color=TEXT_DARK, font=ctk.CTkFont(size=13, weight="bold"), anchor="w", wraplength=500).grid(row=0, column=0, sticky="ew", padx=14, pady=(10, 2))
-                issues = self.style_issues(rows)
+                issues = self.style_key_issues(key)
                 has_vendor = bool(first_nonblank(rows["Vendor"]))
                 has_decoration = bool(first_nonblank(rows["Decoration Type"]))
                 if not issues:
@@ -1015,21 +1373,56 @@ class ProductMasterV2(ctk.CTk):
         self.dashboard_vendor_filter_var.set(vendor or "All Vendors")
         self.refresh_dashboard()
 
+    def open_needs_setup_queue(self):
+        """Open only unfinished styles and select the next one to complete."""
+        incomplete = self.incomplete_style_keys()
+        if not incomplete:
+            messagebox.showinfo("Product Master Complete", "Every saved style is fully configured.", parent=self)
+            return
+        self._suspend_editor_filter_trace = True
+        try:
+            self.dashboard_search_var.set("")
+            self.dashboard_vendor_filter_var.set("All Vendors")
+            self.search_var.set("")
+            self.catalog_filter_var.set("Needs Setup")
+            self.incomplete_only_var.set(True)
+        finally:
+            self._suspend_editor_filter_trace = False
+        self.show_editor(target_key=incomplete[0])
+
     def dashboard_matching_style_keys(self):
         query = self.dashboard_search_var.get().strip()
         vendor_filter = self.dashboard_vendor_filter_var.get().strip() or "All Vendors"
         ranked = []
         for position, key in enumerate(self.all_style_keys):
-            rows = self.get_style_rows(key)
-            vendor = first_nonblank(rows["Vendor"]) or "Unassigned"
+            vendor = self.style_vendor_cache.get(key, "Unassigned")
             if vendor_filter != "All Vendors" and vendor.casefold() != vendor_filter.casefold():
                 continue
-            score = search_match_score(rows, query)
+            search = self.style_search_cache.get(key, {})
+            score = search_match_score_values(
+                search.get("style", ""), search.get("product_id", ""),
+                search.get("name", ""), search.get("vendor", ""),
+                search.get("combined", ""), query,
+            )
             if score is None:
                 continue
             ranked.append((score, position, key))
         ranked.sort(key=lambda item: (item[0], item[1]))
         return [key for _, _, key in ranked]
+
+    def _schedule_dashboard_refresh(self):
+        """Wait for a short typing pause before rebuilding visual catalog cards."""
+        if self._dashboard_refresh_after_id:
+            try:
+                self.after_cancel(self._dashboard_refresh_after_id)
+            except Exception:
+                pass
+
+        def refresh():
+            self._dashboard_refresh_after_id = None
+            self.refresh_dashboard()
+
+        self._dashboard_refresh_after_id = self.after(140, refresh)
 
     def open_first_dashboard_match(self):
         matches = self.dashboard_matching_style_keys()
@@ -1054,9 +1447,7 @@ class ProductMasterV2(ctk.CTk):
         """Reload the active Product Master from disk so this window cannot show stale data."""
         self.master_data = load_product_master()
         self._loaded_master_stamp = product_master_file_stamp()
-        self.vendor_options = alphabetical_options(WORKBOOK_VENDORS)
-        for vendor in self.master_data.get("Vendor", pd.Series(dtype=str)):
-            append_vendor_option(self.vendor_options, vendor)
+        self.vendor_options = purchase_vendor_options(self.master_data)
         self.decoration_color_options = load_thread_ink_colors(PRODUCT_MASTER_PATH)
         if hasattr(self, "dashboard_vendor_filter"):
             self.dashboard_vendor_filter.configure(values=["All Vendors"] + self.vendor_options + ["Unassigned"])
@@ -1078,6 +1469,9 @@ class ProductMasterV2(ctk.CTk):
         value = canonical_vendor_name(value or "")
         if not value:
             return
+        # Adding a vendor is itself a permanent Product Master action.  Do not
+        # make the operator save an unrelated style merely to keep the option.
+        value = register_purchase_vendor(value)
         existing = next((vendor for vendor in self.vendor_options if vendor.casefold() == value.casefold()), "")
         selected = existing or value
         if not existing:
@@ -1381,22 +1775,24 @@ class ProductMasterV2(ctk.CTk):
         self._style_render_after_id = self.after(18, render_if_current)
 
     def _schedule_editor_catalog_refresh(self, generation):
-        """Let the product form paint before rebuilding the catalog card list."""
-        if self._catalog_refresh_after_id:
-            try:
-                self.after_cancel(self._catalog_refresh_after_id)
-            except Exception:
-                pass
-
-        def refresh_if_current():
-            if generation == self._style_render_generation:
-                self.refresh_editor_catalog()
-
-        self._catalog_refresh_after_id = self.after(80, refresh_if_current)
+        """Compatibility no-op after removing the redundant in-editor catalog."""
+        return
 
     def _on_editor_search_changed(self, *_):
         if not self._suspend_editor_filter_trace:
-            self.apply_filters(reset_position=True)
+            if self._editor_filter_after_id:
+                try:
+                    self.after_cancel(self._editor_filter_after_id)
+                except Exception:
+                    pass
+
+            def apply_after_typing_pause():
+                self._editor_filter_after_id = None
+                self.apply_filters(reset_position=True)
+
+            # Avoid redrawing the selected form and up to 60 catalog cards for
+            # every character while a user is typing a style or employee search.
+            self._editor_filter_after_id = self.after(140, apply_after_typing_pause)
 
     def build_editor_header(self, parent):
         header = ctk.CTkFrame(parent, fg_color=CARD_BG, corner_radius=0, height=92)
@@ -1476,12 +1872,7 @@ class ProductMasterV2(ctk.CTk):
             )
 
     def continue_setup(self):
-        incomplete = self.incomplete_style_keys()
-        if not incomplete:
-            messagebox.showinfo("Product Master Complete", "Every saved style is fully configured.")
-            return
-        self.set_catalog_filter("Needs Setup")
-        self.show_editor(target_key=incomplete[0])
+        self.open_needs_setup_queue()
 
     def build_filter_bar(self, parent):
         bar = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=0)
@@ -1503,7 +1894,7 @@ class ProductMasterV2(ctk.CTk):
         complete = total - incomplete
         labels = {
             "All Products": f"{total} Products",
-            "Needs Setup": f"{incomplete} Need Setup",
+            "Needs Setup": f"Needs Setup ({incomplete})",
             "Complete": f"{complete} Ready",
         }
         for col, value in enumerate(("All Products", "Needs Setup", "Complete"), start=1):
@@ -1515,13 +1906,24 @@ class ProductMasterV2(ctk.CTk):
             )
             button.grid(row=0, column=col, padx=3)
             self.filter_buttons[value] = button
+        self.set_up_next_button = ctk.CTkButton(
+            bar,
+            text="Set Up Next  ➜",
+            command=self.open_needs_setup_queue,
+            width=132,
+            height=40,
+            fg_color=PURPLE,
+            hover_color=PURPLE_DARK,
+            font=ctk.CTkFont(size=11, weight="bold"),
+        )
+        self.set_up_next_button.grid(row=0, column=4, padx=(8, 0))
         self._refresh_filter_button_styles()
 
         ctk.CTkButton(
             bar, text="Clear", command=self.browse_all, width=72, height=40,
             fg_color="transparent", hover_color=PURPLE_LIGHT,
             border_width=1, border_color=PURPLE_BORDER, text_color=PURPLE,
-        ).grid(row=0, column=4, padx=(8, 0))
+        ).grid(row=0, column=5, padx=(8, 0))
 
     def build_style_banner(self, parent):
         banner = ctk.CTkFrame(
@@ -1590,16 +1992,13 @@ class ProductMasterV2(ctk.CTk):
     def build_content_area(self, parent):
         content = ctk.CTkFrame(parent, fg_color="transparent")
         content.grid(row=4, column=0, sticky="nsew", padx=20, pady=8)
-        content.grid_columnconfigure(0, weight=32, minsize=290)
-        content.grid_columnconfigure(1, weight=68, minsize=720)
+        content.grid_columnconfigure(0, weight=1)
         content.grid_rowconfigure(0, weight=1)
 
-        self.build_editor_catalog(content)
-
         workspace = ctk.CTkFrame(content, fg_color="transparent", corner_radius=0)
-        workspace.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        workspace.grid_columnconfigure(0, weight=43, minsize=360, uniform="editor_workspace")
-        workspace.grid_columnconfigure(1, weight=57, minsize=500, uniform="editor_workspace")
+        workspace.grid(row=0, column=0, sticky="nsew")
+        workspace.grid_columnconfigure(0, weight=38, minsize=410)
+        workspace.grid_columnconfigure(1, weight=62, minsize=860)
         workspace.grid_rowconfigure(0, weight=1)
         self.build_left_panel(workspace)
         self.build_color_panel(workspace)
@@ -1662,12 +2061,12 @@ class ProductMasterV2(ctk.CTk):
             return
         visible = keys[:MAX_EDITOR_CATALOG_ROWS]
         for row_index, key in enumerate(visible):
-            rows = self.get_style_rows(key)
-            style = first_nonblank(rows["Style Number"]) or "No product number"
-            name = best_product_name(rows["Product Name"]) or "Unnamed product"
-            vendor = first_nonblank(rows["Vendor"]) or "Vendor not assigned"
-            category = first_nonblank(rows["Product Category"]) or "Category not assigned"
-            issues = self.style_issues(rows)
+            metadata = self.style_editor_metadata_cache.get(key, {})
+            style = metadata.get("style", "No product number")
+            name = metadata.get("name", "Unnamed product")
+            vendor = self.style_vendor_cache.get(key, "Unassigned")
+            category = self.style_category_cache.get(key, "Category not assigned")
+            issues = self.style_key_issues(key)
             selected = key == self.current_style_key
             fill = "#F1E8FC" if selected else ("#FFFFFF" if row_index % 2 == 0 else "#FCFAFE")
             border = PURPLE if selected else "#E9E2F0"
@@ -1706,7 +2105,7 @@ class ProductMasterV2(ctk.CTk):
 
     def build_left_panel(self, parent):
         left = ctk.CTkScrollableFrame(parent, fg_color="transparent", corner_radius=0)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         left.grid_columnconfigure(0, weight=1)
         self.left_scroll = left
 
@@ -1791,18 +2190,37 @@ class ProductMasterV2(ctk.CTk):
 
     def build_color_panel(self, parent):
         panel = ctk.CTkFrame(parent, fg_color=CARD_BG, border_width=1, border_color=PURPLE_BORDER, corner_radius=12)
-        panel.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        panel.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
         panel.grid_columnconfigure(0, weight=1)
-        panel.grid_rowconfigure(4, weight=1)
+        # The color list is the final grid row.  Giving row 4 the flexible
+        # height left a dead strip below it whenever the Product Master window
+        # was tall.  Keep the purchase-color work area usable all the way down
+        # to the action bar, including for styles with many color mappings.
+        panel.grid_rowconfigure(3, weight=1)
         title_row = ctk.CTkFrame(panel, fg_color="transparent")
         title_row.grid(row=0, column=0, sticky="ew", padx=22, pady=(16, 4))
         title_row.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(title_row, text="Decoration Defaults & Purchasing Colors", text_color=PURPLE, font=ctk.CTkFont(size=17, weight="bold"), anchor="w").grid(row=0, column=0, sticky="ew")
-        ctk.CTkButton(title_row, text="+ Add Garment Color", command=self.add_color_row, width=150, height=34, fg_color="transparent", hover_color=PURPLE_LIGHT, border_width=1, border_color=PURPLE, text_color=PURPLE).grid(row=0, column=1)
+        ctk.CTkLabel(
+            title_row,
+            text="Key Vendor Mapping: Use Purchase As Style # when the vendor order number differs from your Shopify style — often by color.",
+            text_color=PURPLE_DARK,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            anchor="w",
+            wraplength=690,
+        ).grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        ctk.CTkButton(title_row, text="+ Add Garment Color", command=self.add_color_row, width=150, height=34, fg_color="transparent", hover_color=PURPLE_LIGHT, border_width=1, border_color=PURPLE, text_color=PURPLE).grid(row=0, column=1, rowspan=2, sticky="n")
         helper_row = ctk.CTkFrame(panel, fg_color="transparent")
         helper_row.grid(row=1, column=0, sticky="ew", padx=22, pady=(0, 8))
         helper_row.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(helper_row, text="Set the permanent decoration route first, then maintain purchasing colors below.", text_color=TEXT_MUTED, font=ctk.CTkFont(size=12), anchor="w").grid(row=0, column=0, sticky="ew")
+        self.color_setup_summary_label = ctk.CTkLabel(
+            helper_row,
+            text="Set the permanent decoration route first, then maintain purchasing colors below.",
+            text_color=TEXT_MUTED,
+            font=ctk.CTkFont(size=12),
+            anchor="w",
+        )
+        self.color_setup_summary_label.grid(row=0, column=0, sticky="ew")
         ctk.CTkButton(
             helper_row, text="+ Add Thread/Ink Color", command=self.add_thread_ink_color_option,
             width=158, height=32, fg_color="transparent", hover_color=PURPLE_LIGHT,
@@ -1844,22 +2262,8 @@ class ProductMasterV2(ctk.CTk):
         self.placement_instructions_entry.grid(row=3, column=0, columnspan=3, sticky="ew", padx=14, pady=(0, 10))
         self.on_decoration_location_selected(self.decoration_location_var.get())
 
-        table_header = ctk.CTkFrame(panel, fg_color=PURPLE_LIGHT, border_width=1, border_color=PURPLE_BORDER, corner_radius=8, height=44)
-        table_header.grid(row=3, column=0, sticky="ew", padx=22)
-        table_header.grid_columnconfigure(1, weight=2)
-        table_header.grid_columnconfigure(2, weight=1)
-        table_header.grid_columnconfigure(3, weight=2)
-        table_header.grid_columnconfigure(4, weight=1)
-        table_header.grid_columnconfigure(5, weight=0)
-        ctk.CTkLabel(table_header, text="#", text_color=PURPLE, font=ctk.CTkFont(size=12, weight="bold"), width=38).grid(row=0, column=0, padx=(8, 0), pady=10)
-        ctk.CTkLabel(table_header, text="Purchasing Color", text_color=PURPLE, font=ctk.CTkFont(size=12, weight="bold"), anchor="w").grid(row=0, column=1, sticky="ew", padx=8, pady=10)
-        ctk.CTkLabel(table_header, text="Vendor Color Code (optional)", text_color=PURPLE, font=ctk.CTkFont(size=12, weight="bold"), anchor="w").grid(row=0, column=2, sticky="ew", padx=8, pady=10)
-        ctk.CTkLabel(table_header, text="Shopify Color Aliases", text_color=PURPLE, font=ctk.CTkFont(size=12, weight="bold"), anchor="w").grid(row=0, column=3, sticky="ew", padx=8, pady=10)
-        ctk.CTkLabel(table_header, text="Thread / Ink", text_color=PURPLE, font=ctk.CTkFont(size=12, weight="bold"), anchor="w").grid(row=0, column=4, sticky="ew", padx=8, pady=10)
-        ctk.CTkLabel(table_header, text="Remove", text_color=PURPLE, font=ctk.CTkFont(size=12, weight="bold"), width=68).grid(row=0, column=5, padx=(4, 10), pady=10)
-
         self.colors_scroll = ctk.CTkScrollableFrame(panel, fg_color="#FFFFFF", corner_radius=8, border_width=1, border_color=PURPLE_BORDER)
-        self.colors_scroll.grid(row=4, column=0, sticky="nsew", padx=22, pady=(6, 18))
+        self.colors_scroll.grid(row=3, column=0, sticky="nsew", padx=22, pady=(6, 18))
         self.colors_scroll.grid_columnconfigure(0, weight=1)
 
     def build_action_bar(self, parent):
@@ -1939,13 +2343,17 @@ class ProductMasterV2(ctk.CTk):
         catalog_filter = self.catalog_filter_var.get() if hasattr(self, "catalog_filter_var") else ("Needs Setup" if self.incomplete_only_var.get() else "All Products")
         ranked = []
         for position, key in enumerate(self.all_style_keys):
-            rows = self.get_style_rows(key)
             is_complete = self.style_key_is_complete(key)
             if catalog_filter == "Needs Setup" and is_complete:
                 continue
             if catalog_filter == "Complete" and not is_complete:
                 continue
-            score = search_match_score(rows, query)
+            search = self.style_search_cache.get(key, {})
+            score = search_match_score_values(
+                search.get("style", ""), search.get("product_id", ""),
+                search.get("name", ""), search.get("vendor", ""),
+                search.get("combined", ""), query,
+            )
             if score is None:
                 continue
             ranked.append((score, position, key))
@@ -1960,6 +2368,12 @@ class ProductMasterV2(ctk.CTk):
             self.status_label.configure(text="No Product Master records match that search.")
 
     def apply_filters(self, reset_position=True, target_key=None):
+        if self._editor_filter_after_id:
+            try:
+                self.after_cancel(self._editor_filter_after_id)
+            except Exception:
+                pass
+            self._editor_filter_after_id = None
         self.filtered_style_keys = self.get_matching_style_keys()
         if target_key and target_key in self.filtered_style_keys:
             self.style_position = self.filtered_style_keys.index(target_key)
@@ -2126,7 +2540,8 @@ class ProductMasterV2(ctk.CTk):
             if inferred_decoration:
                 self.decoration_type_var.set(inferred_decoration)
 
-        sorted_rows = rows.sort_values(by="Garment Color", key=lambda series: series.astype(str).str.casefold())
+        self._update_color_setup_guidance(rows)
+        sorted_rows = prioritize_new_color_setup_rows(rows)
         for display_index, (data_index, row) in enumerate(sorted_rows.iterrows(), start=1):
             self.render_color_row(display_index, data_index, row)
         self.update_decoration_color_state()
@@ -2137,47 +2552,125 @@ class ProductMasterV2(ctk.CTk):
         self._hide_style_loading(generation)
 
     def render_color_row(self, display_index, data_index, row):
-        row_color = ROW_ALT if display_index % 2 == 0 else "#FFFFFF"
-        frame = ctk.CTkFrame(self.colors_scroll, fg_color=row_color, corner_radius=0, height=58)
-        frame.grid(row=display_index - 1, column=0, sticky="ew")
-        frame.grid_columnconfigure(1, weight=2)
-        frame.grid_columnconfigure(2, weight=1)
-        frame.grid_columnconfigure(3, weight=2)
-        frame.grid_columnconfigure(4, weight=1)
-        frame.grid_columnconfigure(5, weight=0)
-        ctk.CTkLabel(frame, text=str(display_index), text_color="#FFFFFF", fg_color=PURPLE, width=28, height=28, corner_radius=14, font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=0, padx=(10, 8), pady=14)
+        is_new_color = is_new_color_setup_row(row)
+        row_color = "#FFF6E8" if is_new_color else (ROW_ALT if display_index % 2 == 0 else "#FFFFFF")
+        frame = ctk.CTkFrame(
+            self.colors_scroll,
+            fg_color=row_color,
+            border_width=1 if is_new_color else 0,
+            border_color="#E3A64C" if is_new_color else row_color,
+            corner_radius=8,
+            height=108,
+        )
+        frame.grid(row=display_index - 1, column=0, sticky="ew", padx=4, pady=4)
+        configure_color_table_columns(frame)
+
+        # Keep every mapping control on one left-to-right row.  This is possible
+        # now that the duplicate Product Catalog is no longer using the first
+        # third of the editor window.
         garment_var = ctk.StringVar(value=clean_text(row.get("Garment Color", "")))
         vendor_code_var = ctk.StringVar(value=clean_text(row.get("Vendor Color Code", "")))
         aliases_var = ctk.StringVar(value=clean_text(row.get("Color Aliases", "")))
+        purchasing_style_var = ctk.StringVar(value=clean_text(row.get("Purchasing Style Number", "")))
         decoration_var = ctk.StringVar(value=clean_text(row.get("Decoration Color", "")))
-        garment_entry = ctk.CTkEntry(frame, textvariable=garment_var, height=40, corner_radius=9, border_color=PURPLE_BORDER, fg_color="#FFFFFF", text_color=TEXT_DARK)
-        garment_entry.grid(row=0, column=1, sticky="ew", padx=5, pady=10)
-        ctk.CTkEntry(frame, textvariable=vendor_code_var, height=40, corner_radius=9, border_color=PURPLE_BORDER, fg_color="#FFFFFF", text_color=TEXT_DARK).grid(row=0, column=2, sticky="ew", padx=5, pady=10)
-        ctk.CTkEntry(frame, textvariable=aliases_var, placeholder_text="e.g. Dark Indigo, Navy", height=40, corner_radius=9, border_color=PURPLE_BORDER, fg_color="#FFFFFF", text_color=TEXT_DARK).grid(row=0, column=3, sticky="ew", padx=5, pady=10)
+        decision_border = "#D98924" if is_new_color else PURPLE_BORDER
+        label_font = ctk.CTkFont(size=10, weight="bold")
+        for column, (label, _minimum) in enumerate(COLOR_TABLE_COLUMNS):
+            if column == PURCHASE_AS_STYLE_COLUMN:
+                mapping_heading = ctk.CTkFrame(
+                    frame, fg_color=KEY_VENDOR_MAPPING_BADGE_BG,
+                    corner_radius=7,
+                )
+                mapping_heading.grid(
+                    row=0, column=column, sticky="ew", padx=5, pady=(8, 3),
+                )
+                mapping_heading.grid_columnconfigure(0, weight=1)
+                ctk.CTkLabel(
+                    mapping_heading, text=label, text_color=PURPLE_DARK,
+                    font=label_font, anchor="w",
+                ).grid(row=0, column=0, sticky="ew", padx=8, pady=(4, 0))
+                ctk.CTkLabel(
+                    mapping_heading, text="Vendor order number", text_color=PURPLE,
+                    font=ctk.CTkFont(size=9), anchor="w",
+                ).grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+                continue
+            ctk.CTkLabel(
+                frame,
+                text=label,
+                text_color="#8A4F00" if is_new_color else PURPLE,
+                font=label_font,
+                anchor="w",
+            ).grid(row=0, column=column, sticky="ew", padx=(10 if column == 0 else 5, 5), pady=(10, 3))
+        ctk.CTkLabel(
+            frame,
+            text="Actions",
+            text_color="#8A4F00" if is_new_color else PURPLE,
+            font=label_font,
+            anchor="center",
+        ).grid(row=0, column=len(COLOR_TABLE_COLUMNS), sticky="ew", padx=(5, 10), pady=(10, 3))
+        garment_entry = ctk.CTkEntry(frame, textvariable=garment_var, height=38, corner_radius=9, border_color=decision_border, fg_color="#FFFFFF", text_color=TEXT_DARK)
+        garment_entry.grid(row=1, column=0, sticky="ew", padx=(10, 5), pady=(0, 10))
+        ctk.CTkEntry(frame, textvariable=vendor_code_var, height=38, corner_radius=9, border_color=PURPLE_BORDER, fg_color="#FFFFFF", text_color=TEXT_DARK).grid(row=1, column=1, sticky="ew", padx=5, pady=(0, 10))
+        ctk.CTkEntry(frame, textvariable=aliases_var, placeholder_text="e.g. Dark Indigo, Navy", height=38, corner_radius=9, border_color=PURPLE_BORDER, fg_color="#FFFFFF", text_color=TEXT_DARK).grid(row=1, column=2, sticky="ew", padx=5, pady=(0, 10))
+        purchase_as_style_entry = ctk.CTkEntry(
+            frame, textvariable=purchasing_style_var, placeholder_text="e.g. 1062",
+            height=38, corner_radius=9, border_width=2, border_color=PURPLE,
+            fg_color=KEY_VENDOR_MAPPING_BG, text_color=PURPLE_DARK,
+        )
+        purchase_as_style_entry.grid(
+            row=1, column=PURCHASE_AS_STYLE_COLUMN, sticky="ew", padx=5, pady=(0, 10),
+        )
+        purchase_as_style_badge = ctk.CTkLabel(
+            frame, text="Custom Vendor Style", height=20, corner_radius=10,
+            fg_color=KEY_VENDOR_MAPPING_BADGE_BG, text_color=PURPLE_DARK,
+            font=ctk.CTkFont(size=9, weight="bold"),
+        )
+
+        def refresh_purchase_as_style_badge(*_args):
+            if normalize_space(purchasing_style_var.get()):
+                purchase_as_style_badge.grid(
+                    row=2, column=PURCHASE_AS_STYLE_COLUMN, sticky="w", padx=7, pady=(0, 7),
+                )
+            else:
+                purchase_as_style_badge.grid_remove()
+
+        purchasing_style_var.trace_add("write", refresh_purchase_as_style_badge)
+        refresh_purchase_as_style_badge()
         decoration_combo = ctk.CTkComboBox(
-            frame, variable=decoration_var, values=self.decoration_color_options, height=40, corner_radius=9,
-            border_color=PURPLE_BORDER, button_color="#EAE3F5", button_hover_color="#DED2EF",
+            frame, variable=decoration_var, values=self.decoration_color_options, height=38, corner_radius=9,
+            border_color=decision_border, button_color="#EAE3F5", button_hover_color="#DED2EF",
             fg_color="#FFFFFF", text_color=TEXT_DARK, dropdown_fg_color="#FFFFFF", dropdown_text_color=TEXT_DARK,
             command=lambda _value, index=data_index: self._set_active_color_row(index),
         )
-        decoration_combo.grid(row=0, column=4, sticky="ew", padx=5, pady=10)
+        decoration_combo.grid(row=1, column=4, sticky="ew", padx=5, pady=(0, 10))
         decoration_combo.bind("<Button-1>", lambda _event, index=data_index: self._set_active_color_row(index), add="+")
+        current_rows = self.get_style_rows(self.current_style_key) if self.current_style_key else pd.DataFrame()
+        is_boot_base_row = (
+            len(current_rows) <= 1
+            and is_boots_product(
+                self.product_name_var.get(), self.category_var.get(), self.style_number_var.get()
+            )
+        )
         delete_button = ctk.CTkButton(
-            frame, text="Delete", width=62, height=32,
+            frame, text="Clear" if is_boot_base_row else "Delete", width=64, height=38,
             fg_color="#FFF1F0", hover_color="#FDE2E0",
             border_width=1, border_color="#E5A09A", text_color=DANGER,
             command=lambda index=data_index: self.delete_color_row(index),
         )
-        delete_button.grid(row=0, column=5, padx=(4, 10), pady=10)
+        delete_button.grid(row=1, column=len(COLOR_TABLE_COLUMNS), sticky="ew", padx=(5, 10), pady=(0, 10))
         self.color_controls.append({
             "index": data_index,
             "garment_var": garment_var,
             "garment_entry": garment_entry,
             "vendor_code_var": vendor_code_var,
             "aliases_var": aliases_var,
+            "purchasing_style_var": purchasing_style_var,
+            "purchase_as_style_entry": purchase_as_style_entry,
+            "purchase_as_style_badge": purchase_as_style_badge,
             "decoration_var": decoration_var,
             "decoration_combo": decoration_combo,
             "delete_button": delete_button,
+            "is_new_color": is_new_color,
         })
 
     def toggle_advanced_fields(self):
@@ -2195,6 +2688,11 @@ class ProductMasterV2(ctk.CTk):
     def on_vendor_changed(self, *_args):
         """Apply vendor defaults while preserving a deliberate saved override."""
         if getattr(self, "_loading_style", False) or self._never_outsource_touched:
+            return
+        if is_boots_product(
+            self.product_name_var.get(), self.category_var.get(), self.style_number_var.get()
+        ):
+            self.never_outsource_var.set(True)
             return
         if self.current_style_key in self.never_outsource_overrides:
             return
@@ -2315,6 +2813,16 @@ class ProductMasterV2(ctk.CTk):
         if hasattr(self, "apply_color_combo"):
             self.apply_color_combo.configure(state="disabled" if none_selected else "normal")
 
+    def _update_color_setup_guidance(self, rows):
+        """Show exactly which imported color needs attention, if any."""
+        if not hasattr(self, "color_setup_summary_label"):
+            return
+        text, needs_attention = new_color_setup_message(rows)
+        self.color_setup_summary_label.configure(
+            text=text,
+            text_color=WARNING if needs_attention else TEXT_MUTED,
+        )
+
     def _sync_visible_color_controls_to_master_data(self) -> None:
         """Preserve unsaved color edits before the color table is rebuilt.
 
@@ -2329,12 +2837,39 @@ class ProductMasterV2(ctk.CTk):
             self.master_data.at[index, "Garment Color"] = normalize_space(control["garment_var"].get())
             self.master_data.at[index, "Vendor Color Code"] = normalize_space(control["vendor_code_var"].get())
             self.master_data.at[index, "Color Aliases"] = normalize_space(control["aliases_var"].get())
+            self.master_data.at[index, "Purchasing Style Number"] = normalize_space(control["purchasing_style_var"].get())
             self.master_data.at[index, "Decoration Color"] = normalize_space(control["decoration_var"].get())
 
     def delete_color_row(self, data_index):
         self._sync_visible_color_controls_to_master_data()
         rows = self.get_style_rows(self.current_style_key) if self.current_style_key else pd.DataFrame()
         if len(rows) <= 1:
+            if is_boots_product(
+                self.product_name_var.get(), self.category_var.get(), self.style_number_var.get()
+            ):
+                # Boots must keep the underlying product row but never a shoe
+                # size in Purchasing Color. Clear the mistaken value safely.
+                self.master_data.at[data_index, "Garment Color"] = ""
+                self.master_data.at[data_index, "Vendor Color Code"] = ""
+                self.master_data.at[data_index, "Color Aliases"] = ""
+                self.master_data.at[data_index, "Purchasing Style Number"] = ""
+                self.master_data.at[data_index, "Decoration Color"] = ""
+                saved = save_product_master(
+                    self.master_data,
+                    affected_style_keys=[self.current_style_key],
+                )
+                if saved is None:
+                    return
+                self.master_data = saved
+                self._loaded_master_stamp = product_master_file_stamp()
+                self.build_style_list()
+                self.filtered_style_keys = self.get_matching_style_keys()
+                if self.current_style_key in self.filtered_style_keys:
+                    self.style_position = self.filtered_style_keys.index(self.current_style_key)
+                self.show_current_style()
+                self.refresh_progress()
+                self.status_label.configure(text="Cleared the mistaken boot purchasing color.")
+                return
             messagebox.showinfo("Color Required", "A product must keep at least one garment-color row.")
             return
         if data_index not in self.master_data.index:
@@ -2345,7 +2880,7 @@ class ProductMasterV2(ctk.CTk):
         self.ensure_session_backup()
         current_key = self.current_style_key
         self.master_data = self.master_data.drop(index=data_index).reset_index(drop=True)
-        saved = save_product_master(self.master_data)
+        saved = save_product_master(self.master_data, affected_style_keys=[current_key])
         if saved is None:
             return
         self.master_data = saved
@@ -2381,6 +2916,7 @@ class ProductMasterV2(ctk.CTk):
             "Product Aliases": self.product_aliases_var.get().strip(),
             "Vendor Color Code": "",
             "Color Aliases": "",
+            "Purchasing Style Number": "",
             "Product Category": self.category_var.get().strip() or infer_category(self.product_name_var.get(), self.style_number_var.get()),
             "Requires Size": bool_text(self.requires_size_var.get()),
             "Requires Color": bool_text(self.requires_color_var.get()),
@@ -2532,6 +3068,17 @@ class ProductMasterV2(ctk.CTk):
         requires_size = self.requires_size_var.get()
         requires_color = self.requires_color_var.get()
         requires_decoration = self.requires_decoration_var.get()
+        if is_boots_product(product_name, category, style_number):
+            # Product Master always saves Boots in their permanent purchasing
+            # configuration, even if an older record or a click changed a
+            # switch before Save.
+            requires_size = True
+            requires_color = False
+            requires_decoration = False
+            self.requires_size_var.set(True)
+            self.requires_color_var.set(False)
+            self.requires_decoration_var.set(False)
+            self.never_outsource_var.set(True)
         decoration_type = self.decoration_type_var.get().strip()
         if is_in_house_decoration(decoration_type):
             requires_decoration = False
@@ -2557,6 +3104,35 @@ class ProductMasterV2(ctk.CTk):
         choice, custom = location_choice_and_custom(decoration_location, decoration_type)
         self.decoration_location_var.set(choice)
         self.custom_decoration_location_var.set(custom)
+
+        # A repeat import may add one new color to a fully configured style.
+        # Preserve the 33 saved color decisions and require a choice only for
+        # the newly added color before clearing its Setup Required marker.
+        pending_thread_controls = []
+        if requires_decoration and not is_blank_decoration(decoration_type) and not is_in_house_decoration(decoration_type):
+            for control in self.color_controls:
+                index = control["index"]
+                if index not in self.master_data.index:
+                    continue
+                source_row = self.master_data.loc[index]
+                purchasing_color = normalize_space(control["garment_var"].get())
+                thread_ink = normalize_space(control["decoration_var"].get())
+                if is_new_color_setup_row(source_row) and purchasing_color and not thread_ink:
+                    pending_thread_controls.append(control)
+        if pending_thread_controls:
+            colors = ", ".join(
+                normalize_space(control["garment_var"].get()) for control in pending_thread_controls[:3]
+            )
+            if len(pending_thread_controls) > 3:
+                colors += f" +{len(pending_thread_controls) - 3} more"
+            messagebox.showwarning(
+                "Thread / Ink Needed for New Color",
+                "Choose the Thread / Ink color only for the new purchasing color before saving:\n\n"
+                + colors,
+                parent=self,
+            )
+            pending_thread_controls[0]["decoration_combo"].focus_set()
+            return False
 
         for index in rows.index:
             self.master_data.at[index, "Product Name"] = product_name
@@ -2588,6 +3164,7 @@ class ProductMasterV2(ctk.CTk):
                 self.master_data.at[index, "Vendor Color Code"] = normalize_space(control["vendor_code_var"].get())
                 self.master_data.at[index, "Color Aliases"] = color_aliases
                 control["aliases_var"].set(color_aliases)
+                self.master_data.at[index, "Purchasing Style Number"] = normalize_space(control["purchasing_style_var"].get())
                 self.master_data.at[index, "Decoration Color"] = "" if (is_blank_decoration(decoration_type) or is_in_house_decoration(decoration_type)) else control["decoration_var"].get().strip()
 
         used_thread_colors = [
@@ -2598,20 +3175,28 @@ class ProductMasterV2(ctk.CTk):
             self.decoration_color_options = save_thread_ink_colors(used_thread_colors, PRODUCT_MASTER_PATH)
             self._refresh_thread_ink_dropdowns()
 
+        new_key = f"style:{style_number}" if style_number else f"product:{product_name.casefold()}"
         saved = save_product_master(
-            self.master_data, expected_style=style_number, expected_vendor=vendor
+            self.master_data,
+            expected_style=style_number,
+            expected_vendor=vendor,
+            affected_style_keys=[original_key, new_key],
         )
         if saved is None:
             return False
         self.master_data = saved
         self._loaded_master_stamp = product_master_file_stamp()
-        if vendor and not any(item.casefold() == vendor.casefold() for item in self.vendor_options):
-            append_vendor_option(self.vendor_options, vendor)
+        # A typed vendor is just as permanent as one added with the button.
+        # Register it after the Product Master write has succeeded so a failed
+        # product save cannot leave a misleading vendor option behind.
+        if vendor:
+            register_purchase_vendor(vendor)
+            self.vendor_options = purchase_vendor_options(self.master_data)
+        if hasattr(self, "vendor_combo"):
             self.vendor_combo.configure(values=self.vendor_options)
-            if hasattr(self, "dashboard_vendor_filter"):
-                self.dashboard_vendor_filter.configure(values=["All Vendors"] + self.vendor_options + ["Unassigned"])
+        if hasattr(self, "dashboard_vendor_filter"):
+            self.dashboard_vendor_filter.configure(values=["All Vendors"] + self.vendor_options + ["Unassigned"])
         self.build_style_list()
-        new_key = f"style:{style_number}" if style_number else f"product:{product_name.casefold()}"
         self.current_style_key = new_key if new_key in self.all_style_keys else None
         if self._never_outsource_touched:
             self.never_outsource_overrides[new_key] = bool(self.never_outsource_var.get())
@@ -2633,6 +3218,10 @@ class ProductMasterV2(ctk.CTk):
         else:
             self.status_label.configure(text=f"Saved ✓ Verified in live Product Master: {PRODUCT_MASTER_PATH}")
             self._show_save_confirmation(f"✓ {saved_name} saved", complete=True)
+        # Remove the temporary NEW marker immediately after a successful save.
+        # Save & Next may select another item synchronously; resolving the
+        # current key on the idle cycle keeps both actions safe.
+        self.after_idle(self.show_current_style)
         return True
 
     def save_and_next_style(self):

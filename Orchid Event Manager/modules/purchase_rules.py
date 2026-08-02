@@ -29,6 +29,7 @@ CATEGORY_OPTIONS = [
     "Pants / Jeans / Shorts",
     "Hats / Headwear",
     "Bags",
+    "Boots",
     "Drinkware",
     "Towels / Blankets",
     "Safety Workwear",
@@ -46,6 +47,17 @@ NO = "No"
 ONE_SIZE_HEADWEAR_STYLES = {"6572"}
 KNOWN_PANT_STYLES = {"1104", "CT102804"}
 KNOWN_COLOR_OPTIONAL_BLANK_STYLES = {"966"}
+
+# These footbeds do not always include the word "insole" in the Shopify title
+# (for example, Rocky Air-Port Footbed).  Style number is therefore the
+# permanent source of truth.  Treat them as Boots even when a legacy Product
+# Master row says Other or still has old color/decoration requirements.
+KNOWN_INSOLE_STYLES = {
+    "RKK0317",
+    "A1Q82",
+    "502440",
+    "RKK0490",
+}
 
 
 def clean(value: Any) -> str:
@@ -67,6 +79,11 @@ def bool_text(value: bool) -> str:
     return YES if value else NO
 
 
+def is_known_insole_style(value: Any) -> bool:
+    """Return True for a permanent Orchid insole/footbed style."""
+    return re.sub(r"\s+", "", clean(value)).upper() in KNOWN_INSOLE_STYLES
+
+
 def _has(text: str, pattern: str) -> bool:
     return bool(re.search(pattern, text, flags=re.IGNORECASE))
 
@@ -75,12 +92,16 @@ def infer_category(product_name: Any, style_number: Any = "") -> str:
     text = f"{clean(product_name)} {clean(style_number)}".casefold()
     lower_body_text = re.sub(r"\bshort[- ]sleeve\b", "sleeve", text)
 
+    if is_known_insole_style(style_number):
+        return "Boots"
     if _has(text, r"\b(fr|fr[- ]?rated|flame[- ]?resistant|fire[- ]?resistant|flame[- ]?retardant|fire[- ]?retardant)\b"):
         return "Flame Resistant"
     if is_blank_garment_product(product_name, style_number=style_number):
         return "Pants / Jeans / Shorts"
     if _has(lower_body_text, r"\b(jean|jeans|pant|pants|trouser|trousers|shorts|slacks?|cargo pant|bib overall)\b"):
         return "Pants / Jeans / Shorts"
+    if _has(text, r"\b(boot|boots|insole|insoles)\b"):
+        return "Boots"
     if _has(text, r"\b(hat|cap|beanie|boonie|booney|visor|headwear|straw hat)\b"):
         return "Hats / Headwear"
     if _has(text, r"\b(backpack|duffel|tote|messenger|bag|briefcase|cooler)\b"):
@@ -114,6 +135,10 @@ def category_defaults(category: Any, product_name: Any = "", style_number: Any =
         return {"requires_size": True, "requires_color": True, "requires_decoration": False}
     if category_text == "Flame Resistant":
         return {"requires_size": True, "requires_color": True, "requires_decoration": False}
+    if category_text == "Boots":
+        # Boots (including insoles) are always purchased by size.  They are
+        # not decorated, and a separate purchasing color is never required.
+        return {"requires_size": True, "requires_color": False, "requires_decoration": False}
     if category_text in {"Hats / Headwear", "Bags", "Drinkware", "Towels / Blankets", "Accessories"}:
         return {"requires_size": False, "requires_color": True, "requires_decoration": True}
     if category_text == "Other":
@@ -131,6 +156,13 @@ def row_rules(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
 
     # These two long-running exceptions are business facts, not suggestions.
     # They deliberately override stale values saved by older versions.
+    if is_known_insole_style(style_key):
+        return {
+            "Product Category": "Boots",
+            "Requires Size": YES,
+            "Requires Color": NO,
+            "Requires Decoration": NO,
+        }
     if style_key in ONE_SIZE_HEADWEAR_STYLES:
         category = "Hats / Headwear"
         return {
@@ -158,6 +190,17 @@ def row_rules(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
 
     category = clean(get("Product Category", "")) or infer_category(product_name, style_number)
     defaults = category_defaults(category, product_name, style_number)
+
+    # This is a permanent Product Master policy, not merely a first-time
+    # default.  It corrects older boot records that were saved before Boots was
+    # introduced or before its purchasing rule was finalized.
+    if category.casefold() == "boots":
+        return {
+            "Product Category": "Boots",
+            "Requires Size": YES,
+            "Requires Color": NO,
+            "Requires Decoration": NO,
+        }
 
     decoration_type = clean(get("Decoration Type", ""))
     service_only = is_internal_service_style(style_number) or is_in_house_service_product(
@@ -193,11 +236,18 @@ def apply_purchase_rule_defaults(frame: pd.DataFrame) -> pd.DataFrame:
     for index, row in result.iterrows():
         rules = row_rules(row)
         for column, value in rules.items():
-            if not clean(result.at[index, column]):
+            # Boots are a locked purchasing category.  Refresh every saved
+            # record so an old Color/Decoration setting cannot create a false
+            # Product Master or Purchase Review prompt.
+            if rules["Product Category"] == "Boots" or not clean(result.at[index, column]):
                 result.at[index, column] = value
         requires_decoration = normalize_bool(result.at[index, "Requires Decoration"], True)
         decoration_type = clean(result.at[index, "Decoration Type"] if "Decoration Type" in result.columns else "")
-        if not requires_decoration and not decoration_type and "Decoration Type" in result.columns:
+        if (
+            not requires_decoration
+            and "Decoration Type" in result.columns
+            and (rules["Product Category"] == "Boots" or not decoration_type)
+        ):
             result.at[index, "Decoration Type"] = BLANK_DECORATION_LABEL
         if not requires_decoration and "Decoration Color" in result.columns:
             result.at[index, "Decoration Color"] = ""

@@ -15,6 +15,7 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import landscape, letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
+from reportlab.lib.utils import ImageReader
 from reportlab.platypus import (
     BaseDocTemplate, CondPageBreak, Frame, Image, NextPageTemplate, PageBreak, PageTemplate,
     Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
@@ -34,7 +35,7 @@ from modules.purchase_rules import normalize_bool, row_rules
 from modules.report_modes import GENERAL_SALES_PERIOD, UNIFORM_SIZING_EVENT, normalize_report_mode
 from modules.xlsx_reader import (
     load_decoration_fulfillment, load_event_name, load_po_numbers,
-    load_report_mode, load_review_lines,
+    load_report_mode, load_review_lines, load_system_info_value,
 )
 from modules.note_rules import (
     decoration_note_requires_review, decoration_note_targets_line,
@@ -48,9 +49,15 @@ from modules.internal_services import (
 from modules.decoration_fulfillment import is_entire_order_outsourced, is_outsourced_decoration
 from modules.outsource_rules import vendor_never_outsource
 from modules.product_resolver import resolve_product
+from modules.report_modes import GENERAL_SALES_PERIOD, UNIFORM_SIZING_EVENT, normalize_report_mode
+from modules.truspec_vendor_products import default_vendor_product_number
 from modules.pdf_page_numbers import PageNumberCanvas
-from modules.job_logo_image import remove_outer_near_white_background
+from modules.job_logo_image import remove_outer_edge_background, remove_outer_near_white_background
 from modules.packet_lock import copy_lock_bundle, sha256_file, verify_packet_lock
+from modules.purchase_vendor_rules import (
+    INTERNAL_VENDOR_REVIEW_REASON,
+    is_internal_purchase_vendor,
+)
 
 PURPLE = colors.HexColor("#5B2AA8")
 PURPLE_DARK = colors.HexColor("#3D176F")
@@ -60,6 +67,14 @@ TEXT = colors.HexColor("#201A2D")
 MUTED = colors.HexColor("#6F667A")
 ROW_ALT = colors.HexColor("#FAF7FE")
 YELLOW = colors.HexColor("#FFF2CC")
+
+# The job name sits in the white band immediately below the masthead rule.
+# The earlier 0.92-inch band felt too tall on every purchasing worksheet.
+# Keep a single shared measurement so vendor POs, Receiving & Decoration, and
+# Non-Included Items always use the same one-third-shorter job-name space.
+REPORT_HEADER_RULE_FROM_TOP = 1.28 * inch
+REPORT_JOB_NAME_BAND_HEIGHT = 0.92 * inch * (2.0 / 3.0)
+REPORT_HEADER_RESERVE = REPORT_HEADER_RULE_FROM_TOP + REPORT_JOB_NAME_BAND_HEIGHT
 
 
 def _resource_path(*parts: str) -> Path:
@@ -85,6 +100,28 @@ def _official_logo_flowable(max_width: float = 1.45 * inch, max_height: float = 
         return Spacer(1, 1)
 
 
+def _official_purchase_order_wordmark():
+    """Return the official flower-preserved ORCHID wordmark for PO mastheads.
+
+    The supplied logo also includes the small ``Uniforms & Apparel`` line.
+    Purchase orders use the upper lockup only, keeping the flower above the I
+    while allowing the letter shapes—not the taller flower—to set alignment.
+    """
+    path = _resource_path("assets", "orchid_logo.png")
+    if not path.exists():
+        return None
+    try:
+        with PILImage.open(path) as source:
+            image = source.convert("RGBA")
+            wordmark = image.crop((0, 0, image.width, min(image.height, 320)))
+            buffer = BytesIO()
+            wordmark.save(buffer, format="PNG")
+            buffer.seek(0)
+            return ImageReader(buffer)
+    except Exception:
+        return None
+
+
 def _job_logo_flowable(path: Path, max_width: float, max_height: float):
     """Return a PDF logo with blank source-canvas padding removed when safe.
 
@@ -98,7 +135,14 @@ def _job_logo_flowable(path: Path, max_width: float, max_height: float):
     try:
         with PILImage.open(source_path) as source:
             image = source.convert("RGBA")
+            # Event artwork uploaded in Orchid is already a transparent PNG.
+            # Keep that supplier/app transparency authoritative; otherwise a
+            # dark logo that reaches the cropped edge could be mistaken for a
+            # background during a second cleanup pass.
+            already_transparent = image.getchannel("A").getextrema()[0] < 255
             image, _removed_white_canvas = remove_outer_near_white_background(image)
+            if not already_transparent:
+                image, _removed_colored_canvas = remove_outer_edge_background(image)
             width, height = image.size
             full_area = max(width * height, 1)
             boxes = []
@@ -171,7 +215,7 @@ def _event_logo_path(workbook_path: Path, event_name: str = "") -> Path | None:
 DETAIL_COLUMNS = [
     "Source ID", "Line ID", "Original Quantity", "Original Order Number", "Original Company",
     "Original Employee Name", "Quantity Override Confirmed",
-    "Vendor", "Decoration Type", "Decoration Location", "Decoration Placement Instructions", "Decoration Color", "Style Number",
+    "Vendor", "Decoration Type", "Decoration Location", "Decoration Placement Instructions", "Decoration Color", "Style Number", "Vendor Product #",
     "Product Name", "Garment Color", "Size", "Quantity", "Company",
     "Employee Name", "Order Number", "Purchase Instructions",
     "Operational Decoration Type", "Operational Decoration Location",
@@ -180,7 +224,7 @@ DETAIL_COLUMNS = [
 ]
 
 COMPACT_COLUMNS = [
-    "Decoration Type", "Decoration Location", "Decoration Placement Instructions", "Decoration Color", "Style Number", "Product Name",
+    "Decoration Type", "Decoration Location", "Decoration Placement Instructions", "Decoration Color", "Style Number", "Vendor Product #", "Product Name",
     "Garment Color", "Size", "Quantity", "Customer(s)", "Purchase Instructions",
 ]
 
@@ -208,6 +252,22 @@ def _display_decoration_type(value: object) -> str:
     return text
 
 
+def _outsourced_report_kind(value: object) -> str:
+    """Return the production department used for an outsourced decoration.
+
+    Stitch N Print processes embroidery and screen printing in separate
+    departments.  This deliberately returns an empty value for anything else
+    so the release step can stop rather than silently put an unfamiliar
+    decoration on the wrong department's job sheet.
+    """
+    text = clean_text(value).casefold()
+    if "embroider" in text:
+        return "embroidery"
+    if "screen" in text:
+        return "screen-printing"
+    return ""
+
+
 
 def _canonical_report_type(value: object) -> str:
     text = clean_text(value).casefold()
@@ -220,6 +280,52 @@ def _canonical_report_type(value: object) -> str:
     if "combined" in text or "general sales" in text:
         return "combined vendor order"
     return text
+
+
+def _vendor_po_number(po_numbers: dict[tuple[str, str], str], vendor: object) -> str:
+    """Return the saved PO number for a vendor, regardless of legacy route name.
+
+    The receiving worksheet includes every vendor Orchid expects to receive
+    from, including manual/non-included routes. Those rows need the same saved
+    PO number as the rest of the packet, never a routing label in its place.
+    """
+    vendor_key = clean_text(vendor).casefold()
+    if not vendor_key:
+        return ""
+
+    preferred = clean_text(po_numbers.get((vendor_key, "combined vendor order"), ""))
+    if preferred:
+        return preferred
+
+    # Older workbooks can carry a decoration-specific PO. Reuse it for this
+    # vendor so historical reports stay meaningful after the layout update.
+    for (stored_vendor, _stored_report), stored_number in po_numbers.items():
+        if clean_text(stored_vendor).casefold() != vendor_key:
+            continue
+        number = clean_text(stored_number)
+        if number:
+            return number
+    return ""
+
+
+def _non_included_vendor_po_number(
+    vendor_detail: pd.DataFrame,
+    po_numbers: dict[tuple[str, str], str],
+    vendor: object,
+) -> str:
+    """Return the PO number that belongs in a Non-Included vendor heading.
+
+    The Non-Included Items report is a manual purchasing worksheet, but the
+    receiving team still needs the actual vendor PO number beside every vendor
+    name.  Prefer a number already assigned to these report rows, then fall
+    back to the saved Purchase Review number for that vendor.
+    """
+    if "Assigned PO Number" in vendor_detail.columns:
+        for value in vendor_detail["Assigned PO Number"].tolist():
+            number = clean_text(value)
+            if number and number.casefold() not in {"po not entered", "po not assigned"}:
+                return number
+    return _vendor_po_number(po_numbers, vendor)
 
 def _decoration_type_sort(value: object) -> tuple[int, str]:
     text = clean_text(value).casefold()
@@ -276,7 +382,19 @@ def _master_requires_never_outsource(
     return bool(resolution.matched and resolution.never_outsource)
 
 
-def _prepare_lines(workbook_path: Path, decoration_fulfillment: str = ""):
+def _prepare_lines(
+    workbook_path: Path,
+    decoration_fulfillment: str = "",
+    report_mode: str = GENERAL_SALES_PERIOD,
+    hold_unresolved_review: bool = False,
+):
+    """Prepare final lines without confusing shipping routing with PO type.
+
+    A Never Outsource item still needs a normal supplier PO during General
+    Sales / Standard Orchid workflow.  The condensed Non-Included Items sheet
+    is reserved for Uniform Sizing Events and Entire Order Outsourced packets.
+    """
+    report_mode = normalize_report_mode(report_mode)
     records = load_review_lines(workbook_path)
     # Final reports must be reproducible from the reviewed workbook. Never
     # silently reread a different live Product Master here: doing so can reroute
@@ -328,6 +446,12 @@ def _prepare_lines(workbook_path: Path, decoration_fulfillment: str = ""):
             placement_instructions = ""
             deco_color = ""
         garment_color, size = split_embedded_size(garment_color, record.get("Size", ""))
+        # Tru-Spec's customer-facing style can be shared across many colors.
+        # Resolve its vendor purchasing number only for the PO display, while
+        # retaining the original style in the reviewed event data.
+        vendor_product_number = default_vendor_product_number(
+            vendor, product, garment_color, record.get("Vendor Product #", "")
+        )
         qty = _quantity(record.get("Quantity", 0))
         rules = row_rules({
             "Product Name": product,
@@ -351,6 +475,11 @@ def _prepare_lines(workbook_path: Path, decoration_fulfillment: str = ""):
         reasons = []
         if not vendor:
             reasons.append("Missing purchase vendor")
+        elif is_internal_purchase_vendor(vendor):
+            # An internal receiving name must never create a supplier section
+            # alongside genuine suppliers. Send it back for a real vendor
+            # assignment instead of emitting an unsafe Orchid PO.
+            reasons.append(INTERNAL_VENDOR_REVIEW_REASON)
         if requires_decoration and not deco_type:
             reasons.append("Missing decoration type")
         if requires_decoration and deco_type and not is_blank_decoration(deco_type) and not deco_color:
@@ -380,6 +509,7 @@ def _prepare_lines(workbook_path: Path, decoration_fulfillment: str = ""):
             "Decoration Placement Instructions": placement_instructions,
             "Decoration Color": deco_color,
             "Style Number": style,
+            "Vendor Product #": vendor_product_number,
             "Product Name": product,
             "Garment Color": garment_color,
             "Size": size,
@@ -403,13 +533,37 @@ def _prepare_lines(workbook_path: Path, decoration_fulfillment: str = ""):
             "Do Not Outsource": "Yes" if do_not_outsource else "No",
         }
         route_to_orchid = bool(
-            do_not_outsource
+            # A sizing event intentionally condenses ship-to-Orchid items for
+            # manual ordering.  General Sales must retain a vendor PO instead.
+            (do_not_outsource and report_mode == UNIFORM_SIZING_EVENT)
             or (
                 is_entire_order_outsourced(decoration_fulfillment)
                 and not is_outsourced_decoration(original_deco_type, decoration_fulfillment)
             )
         )
-        if reasons:
+        # Test packets may intentionally bypass the on-screen Purchase Review.
+        # That must never convert an unanswered customer instruction into an
+        # order.  Instead, retain the current permanent Product Master values
+        # for every ready line and put each unresolved review line into the
+        # separate held-items report.
+        unresolved_review = (
+            hold_unresolved_review
+            and clean_text(record.get("Review Status", "")).casefold() == "needs review"
+        )
+        saved_review_reason = "; ".join(
+            part for part in (
+                clean_text(record.get("Event Review Reason", "")),
+                clean_text(record.get("Review Reason", "")),
+                clean_text(record.get("Action Required", "")),
+            )
+            if part
+        )
+        if unresolved_review:
+            review_rows.append({
+                **row,
+                "Review Reason": saved_review_reason or "Unresolved Purchase Review decision",
+            })
+        elif reasons:
             review_rows.append({**row, "Review Reason": "; ".join(reasons)})
         elif route_to_orchid:
             # During outsourced packets every line that is not actually going to
@@ -863,6 +1017,26 @@ def _customer_label(row: pd.Series, include_company: bool) -> str:
     return "Unspecified"
 
 
+def _employee_order_label(row: pd.Series) -> str:
+    """Return the same person-and-order identifier used on receiving reports."""
+    order = clean_text(row.get("Order Number", ""))
+    return _deduplicated_text(
+        _customer_label(row, include_company=True),
+        f"Order {order}" if order else "",
+    )
+
+
+def _receiving_product_number(row: pd.Series) -> str:
+    """Return the vendor's orderable number for the receiving worksheet.
+
+    Purchase Review retains Orchid's shared customer-facing style number, but
+    vendors such as Tru-Spec order by a color-specific vendor product number.
+    Receiving must match the number on the vendor and Non-Included reports so
+    a receiver never receives a garment against the wrong color's number.
+    """
+    return clean_text(row.get("Vendor Product #", "")) or clean_text(row.get("Style Number", ""))
+
+
 def _aggregate_rows(detail: pd.DataFrame) -> pd.DataFrame:
     if detail.empty:
         return pd.DataFrame(columns=COMPACT_COLUMNS)
@@ -870,12 +1044,12 @@ def _aggregate_rows(detail: pd.DataFrame) -> pd.DataFrame:
     companies = {clean_text(value) for value in detail["Company"] if clean_text(value)}
     include_company = len(companies) > 1
     group_columns = [
-        "Decoration Type", "Decoration Location", "Decoration Placement Instructions", "Decoration Color", "Style Number", "Product Name",
+        "Decoration Type", "Decoration Location", "Decoration Placement Instructions", "Decoration Color", "Style Number", "Vendor Product #", "Product Name",
         "Garment Color", "Size",
     ]
     rows = []
     for keys, group in detail.groupby(group_columns, dropna=False, sort=False):
-        deco_type, deco_location, placement_instructions, deco_color, style, product, garment_color, size = keys
+        deco_type, deco_location, placement_instructions, deco_color, style, vendor_product_number, product, garment_color, size = keys
         customers: OrderedDict[str, int] = OrderedDict()
         notes: OrderedDict[str, None] = OrderedDict()
         for _, source in group.iterrows():
@@ -896,6 +1070,7 @@ def _aggregate_rows(detail: pd.DataFrame) -> pd.DataFrame:
             "Decoration Placement Instructions": clean_text(placement_instructions),
             "Decoration Color": clean_text(deco_color),
             "Style Number": clean_text(style),
+            "Vendor Product #": clean_text(vendor_product_number),
             "Product Name": clean_text(product),
             "Garment Color": clean_text(garment_color),
             "Size": clean_text(size),
@@ -916,8 +1091,15 @@ def _aggregate_rows(detail: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=COMPACT_COLUMNS)
 
 
-def _section_heading(text: str, style, dark: bool = False) -> Table:
-    table = Table([[_paragraph(text, style)]], colWidths=[10.15 * inch])
+def _section_heading(
+    text: str,
+    style,
+    dark: bool = False,
+    *,
+    width: float = 10.15 * inch,
+) -> Table:
+    """Return a section bar aligned to the exact width of its detail table."""
+    table = Table([[_paragraph(text, style)]], colWidths=[width], hAlign="LEFT")
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), PURPLE_DARK if dark else PURPLE_LIGHT),
         ("TEXTCOLOR", (0, 0), (-1, -1), colors.white if dark else PURPLE_DARK),
@@ -931,37 +1113,64 @@ def _section_heading(text: str, style, dark: bool = False) -> Table:
 
 
 def _compact_table(section_detail: pd.DataFrame, body_style, qty_style, header_style) -> Table:
-    """Concise vendor-order table used only for placing the garment order."""
-    group_columns = ["Style Number", "Product Name", "Garment Color", "Size"]
+    """Vendor/manual-order table with a combined employee/order trace.
+
+    This table is used by the Non-Included Items PO.  It must be orderable at
+    a glance, so employee and Shopify-order fields are deliberately *not*
+    part of the purchase-line identity.  They are retained together in the
+    final trace column instead.  A vendor product number remains part of the
+    identity because some vendors (notably Tru-Spec) use a colour-specific
+    product number even where Orchid uses one shared style number.
+    """
+    section_detail = section_detail.copy()
+    if "Vendor Product #" not in section_detail.columns:
+        # Existing completed packets can be reopened safely.  Their rows will
+        # receive the catalog value during preparation; this guard keeps other
+        # report callers and historical data compatible.
+        section_detail["Vendor Product #"] = ""
+    group_columns = [
+        "Vendor Product #", "Style Number", "Product Name", "Garment Color", "Size",
+    ]
     rows = [[
         _paragraph("Product #", header_style),
         _paragraph("Description", header_style),
         _paragraph("Garment Color", header_style),
-        _paragraph("Size", header_style),
+        _paragraph("Size / Width", header_style),
         _paragraph("Quantity", header_style),
+        _paragraph("Employee / Order", header_style),
     ]]
-    grouped = (
-        section_detail.groupby(group_columns, dropna=False, sort=False)["Quantity"]
-        .sum()
-        .reset_index()
-    )
-    grouped = grouped.sort_values(
-        by=["Style Number", "Product Name", "Garment Color", "Size"],
-        key=lambda column: column.map(lambda value: size_sort_key(value) if column.name == "Size" else clean_text(value).casefold()),
-        kind="stable",
-    )
-    for _, row in grouped.iterrows():
+    grouped = list(section_detail.groupby(group_columns, dropna=False, sort=False))
+    grouped.sort(key=lambda item: tuple(
+        size_sort_key(value) if column == "Size" else clean_text(value).casefold()
+        for column, value in zip(group_columns, item[0])
+    ))
+    for keys, source_rows in grouped:
+        vendor_product_number, style, product, garment_color, size = keys
+        employee_orders: OrderedDict[str, int] = OrderedDict()
+        for _, source in source_rows.iterrows():
+            label = _employee_order_label(source)
+            employee_orders[label] = employee_orders.get(label, 0) + _quantity(source.get("Quantity", 0))
+        trace = "<br/>".join(
+            f"{label} ({quantity})" if quantity > 1 else label
+            for label, quantity in employee_orders.items()
+        )
         rows.append([
-            _paragraph(row["Style Number"], body_style),
-            _paragraph(row["Product Name"], body_style),
-            _paragraph(row["Garment Color"], body_style),
-            _paragraph(row["Size"], body_style),
-            _paragraph(str(int(row["Quantity"])), qty_style),
+            _paragraph(clean_text(vendor_product_number) or clean_text(style), body_style),
+            _paragraph(product, body_style),
+            _paragraph(garment_color, body_style),
+            _paragraph(size, body_style),
+            _paragraph(str(int(source_rows["Quantity"].sum())), qty_style),
+            _paragraph(trace, body_style),
         ])
 
+    # Keep the full "Quantity" heading on one line.  The prior 0.55 inch
+    # column left less than 30 points after table padding, which forced the
+    # word to wrap on every vendor PO.  Employee / Order is intentionally
+    # still the widest field, so moving 0.20 inch from it keeps long customer
+    # trace information readable while giving the count column its own space.
     table = Table(
         rows,
-        colWidths=[1.20 * inch, 4.65 * inch, 1.75 * inch, 1.00 * inch, 1.55 * inch],
+        colWidths=[1.05 * inch, 2.55 * inch, 1.15 * inch, 1.05 * inch, 0.75 * inch, 3.60 * inch],
         repeatRows=1,
         splitByRow=1,
     )
@@ -982,6 +1191,105 @@ def _compact_table(section_detail: pd.DataFrame, body_style, qty_style, header_s
     ]))
     return table
 
+
+def _draw_internal_document_header(
+    canvas,
+    doc_obj,
+    *,
+    report_title: str,
+    event_name: str,
+    page_size,
+    left_margin: float,
+    right_margin: float,
+    header_reserve: float,
+) -> None:
+    """Draw the approved PO masthead for Orchid's internal purchasing reports.
+
+    Receiving and non-included purchasing reports can contain multiple vendors,
+    so a single supplier name does not belong in the masthead.  They retain the
+    exact visual structure of a vendor PO—official flower wordmark, ORCHID
+    letter-based alignment, centre divider, quiet date, divider rule, and a
+    centered job-name band—while their report name takes the supplier-name
+    position on the right.  Individual vendor names remain the strong purple
+    section headings directly below that shared masthead.
+    """
+    page_width, page_height = page_size
+    canvas.saveState()
+    top = page_height
+    wordmark_letter_center_y = top - 0.60 * inch
+    wordmark_width = 2.06 * inch
+    wordmark_height = wordmark_width * 320 / 1069
+    letter_center_from_top = (95 + 307) / 2.0
+    letter_center_from_bottom = (320.0 - letter_center_from_top) / 320.0 * wordmark_height
+    wordmark_y = wordmark_letter_center_y - letter_center_from_bottom
+    wordmark = _official_purchase_order_wordmark()
+    if wordmark is not None:
+        canvas.drawImage(
+            wordmark,
+            left_margin + 0.04 * inch,
+            wordmark_y,
+            width=wordmark_width,
+            height=wordmark_height,
+            preserveAspectRatio=True,
+            mask="auto",
+        )
+    else:
+        canvas.setFont("Helvetica", 24)
+        canvas.setFillColor(PURPLE_DARK)
+        canvas.drawString(left_margin + 0.04 * inch, wordmark_letter_center_y - 8, "ORCHID")
+
+    divider_x = page_width / 2.0
+    canvas.setStrokeColor(PURPLE_DARK)
+    canvas.setLineWidth(2.6)
+    canvas.line(
+        divider_x,
+        wordmark_letter_center_y - 0.40 * inch,
+        divider_x,
+        wordmark_letter_center_y + 0.40 * inch,
+    )
+
+    title_text = clean_text(report_title)
+    title_size = 15.5
+    title_center_x = (divider_x + page_width - right_margin) / 2.0
+    max_title_width = (page_width - right_margin) - divider_x - 0.26 * inch
+    while title_size > 10.0 and canvas.stringWidth(title_text, "Helvetica-Bold", title_size) > max_title_width:
+        title_size -= 0.5
+    date_size = 8.4
+    title_visual_height = title_size * 0.925
+    date_visual_height = date_size * 0.925
+    date_center_y = wordmark_letter_center_y - title_visual_height / 2.0 - 3.5 - date_visual_height / 2.0
+    canvas.setFillColor(TEXT)
+    canvas.setFont("Helvetica-Bold", title_size)
+    canvas.drawCentredString(
+        title_center_x,
+        wordmark_letter_center_y - (title_size * 0.255),
+        title_text,
+    )
+    canvas.setFillColor(MUTED)
+    canvas.setFont("Helvetica", date_size)
+    canvas.drawCentredString(
+        title_center_x,
+        date_center_y - (date_size * 0.255),
+        datetime.now().strftime("%B %d, %Y").upper(),
+    )
+
+    rule_y = top - REPORT_HEADER_RULE_FROM_TOP
+    canvas.setStrokeColor(PURPLE_DARK)
+    canvas.setLineWidth(2.1)
+    canvas.line(left_margin, rule_y, page_width - right_margin, rule_y)
+
+    job_text = clean_text(event_name) or "Current Purchase Packet"
+    job_size = 18.0
+    max_job_width = page_width - left_margin - right_margin - 0.70 * inch
+    while job_size > 11.5 and canvas.stringWidth(job_text, "Helvetica-Bold", job_size) > max_job_width:
+        job_size -= 0.5
+    section_top_y = top - header_reserve
+    job_center_y = (rule_y + section_top_y) / 2.0
+    canvas.setFillColor(colors.black)
+    canvas.setFont("Helvetica-Bold", job_size)
+    canvas.drawCentredString(page_width / 2.0, job_center_y - (job_size * 0.255), job_text)
+    canvas.restoreState()
+
 def _build_pdf(
     report_detail: pd.DataFrame,
     pdf_path: Path,
@@ -997,7 +1305,9 @@ def _build_pdf(
     left_margin = 0.38 * inch
     right_margin = 0.38 * inch
     bottom_margin = 0.42 * inch
-    header_reserve = 1.76 * inch
+    # The job name stays centered in a compact shared band below the rule.
+    # This is one-third shorter than the former 0.92-inch white space.
+    header_reserve = REPORT_HEADER_RESERVE
     frame_width = page_width - left_margin - right_margin
     frame_height = page_height - bottom_margin - header_reserve
 
@@ -1038,57 +1348,109 @@ def _build_pdf(
     if not decoration_types:
         decoration_types = [BLANK_DECORATION_LABEL]
 
-    order_date = datetime.now().strftime("%B %d, %Y")
-    logo_path = _resource_path("assets", "orchid_logo.png")
-
     def _draw_page_header(canvas, doc_obj, section_label: str):
+        """Draw the approved vendor-led header for every vendor purchase order.
+
+        The vendor is intentionally stronger than the supporting Purchase
+        Order label.  Both it and the label align to the ORCHID letters,
+        never to the decorative flower above the I.  PO numbers remain in
+        filenames and the footer, where they stay useful without competing
+        with the vendor name before a purchase is placed.
+        """
         canvas.saveState()
-        if logo_path.exists():
+        top = page_height
+        wordmark_letter_center_y = top - 0.60 * inch
+        wordmark_width = 2.06 * inch
+        wordmark_height = wordmark_width * 320 / 1069
+        # In the official top lockup, the ORCHID letters occupy pixel rows
+        # 95–307 of the 320px masthead crop.  Pillow measures those rows from
+        # the *top*, while ReportLab's ``drawImage`` y-coordinate starts at the
+        # *bottom*.  Convert the measured letter centre before placing the
+        # image so Purchase Order and the vendor name align to the letters—not
+        # to the flower floating above the I.
+        letter_center_from_top = (95 + 307) / 2.0
+        letter_center_from_bottom = (320.0 - letter_center_from_top) / 320.0 * wordmark_height
+        wordmark_y = wordmark_letter_center_y - letter_center_from_bottom
+        wordmark = _official_purchase_order_wordmark()
+        if wordmark is not None:
             canvas.drawImage(
-                str(logo_path), left_margin, page_height - 0.95 * inch,
-                width=2.05 * inch, height=0.79 * inch,
-                preserveAspectRatio=True, mask="auto",
+                wordmark,
+                left_margin + 0.04 * inch,
+                wordmark_y,
+                width=wordmark_width,
+                height=wordmark_height,
+                preserveAspectRatio=True,
+                mask="auto",
             )
         else:
-            canvas.setFont("Helvetica-Bold", 17)
+            canvas.setFont("Helvetica", 24)
             canvas.setFillColor(PURPLE_DARK)
-            canvas.drawString(left_margin, page_height - 0.52 * inch, "ORCHID UNIFORMS & APPAREL")
+            canvas.drawString(left_margin + 0.04 * inch, wordmark_letter_center_y - 8, "ORCHID")
 
-        canvas.setFillColor(PURPLE_DARK)
-        title_text = f"{vendor.upper()} PURCHASE ORDER"
-        title_size = 19 if len(title_text) <= 28 else 16.5
-        canvas.setFont("Helvetica-Bold", title_size)
-        canvas.drawCentredString(page_width / 2, page_height - 0.46 * inch, title_text)
-        canvas.setStrokeColor(PURPLE)
-        canvas.setLineWidth(1.2)
-        canvas.line(left_margin, page_height - 0.99 * inch, page_width - right_margin, page_height - 0.99 * inch)
+        purchase_order_size = 14.0
+        purchase_order_x = left_margin + 2.28 * inch
+        canvas.setFillColor(TEXT)
+        canvas.setFont("Helvetica", purchase_order_size)
+        canvas.drawString(
+            purchase_order_x,
+            wordmark_letter_center_y - (purchase_order_size * 0.26),
+            "PURCHASE ORDER",
+        )
 
-        context_label = "EVENT" if report_mode == UNIFORM_SIZING_EVENT else "ORDER TYPE"
-        context_value = event_name or report_mode
-        info = Table([
-            [
-                _paragraph(context_label, label_style),
-                _paragraph("PO NUMBER", label_style),
-                _paragraph("ORDER DATE", label_style),
-            ],
-            [
-                _paragraph(context_value, value_style),
-                _paragraph(po_number, value_style),
-                _paragraph(order_date, value_style),
-            ],
-        ], colWidths=[4.38 * inch, 3.04 * inch, 2.73 * inch])
-        info.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), PURPLE_LIGHT),
-            ("BOX", (0, 0), (-1, -1), 0.7, BORDER),
-            ("INNERGRID", (0, 0), (-1, -1), 0.35, BORDER),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 5),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-            ("TOPPADDING", (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ]))
-        info_width, info_height = info.wrap(frame_width, 0.62 * inch)
-        info.drawOn(canvas, left_margin, page_height - 1.04 * inch - info_height)
+        divider_x = page_width / 2.0
+        canvas.setStrokeColor(PURPLE_DARK)
+        canvas.setLineWidth(2.6)
+        canvas.line(
+            divider_x,
+            wordmark_letter_center_y - 0.40 * inch,
+            divider_x,
+            wordmark_letter_center_y + 0.40 * inch,
+        )
+
+        vendor_text = clean_text(vendor) or "Vendor Not Assigned"
+        vendor_size = 19.0
+        vendor_center_x = (divider_x + page_width - right_margin) / 2.0
+        max_vendor_width = (page_width - right_margin) - divider_x - 0.30 * inch
+        while vendor_size > 12.5 and canvas.stringWidth(vendor_text, "Helvetica-Bold", vendor_size) > max_vendor_width:
+            vendor_size -= 0.5
+        date_size = 8.4
+        vendor_visual_height = vendor_size * 0.925
+        date_visual_height = date_size * 0.925
+        # The vendor *name*, rather than the vendor/date group, shares the
+        # ORCHID-letter centreline.  The quiet date drops below it without
+        # pulling the vendor title upward.
+        vendor_center_y = wordmark_letter_center_y
+        date_center_y = vendor_center_y - vendor_visual_height / 2.0 - 3.5 - date_visual_height / 2.0
+        canvas.setFillColor(TEXT)
+        canvas.setFont("Helvetica-Bold", vendor_size)
+        canvas.drawCentredString(
+            vendor_center_x,
+            vendor_center_y - (vendor_size * 0.255),
+            vendor_text,
+        )
+        canvas.setFillColor(MUTED)
+        canvas.setFont("Helvetica", date_size)
+        canvas.drawCentredString(
+            vendor_center_x,
+            date_center_y - (date_size * 0.255),
+            datetime.now().strftime("%B %d, %Y").upper(),
+        )
+
+        rule_y = top - REPORT_HEADER_RULE_FROM_TOP
+        canvas.setStrokeColor(PURPLE_DARK)
+        canvas.setLineWidth(2.1)
+        canvas.line(left_margin, rule_y, page_width - right_margin, rule_y)
+
+        section_top_y = top - header_reserve
+        job_text = clean_text(event_name) or report_mode or "Current Purchase Packet"
+        job_size = 18.0
+        max_job_width = frame_width - 0.70 * inch
+        while job_size > 11.5 and canvas.stringWidth(job_text, "Helvetica-Bold", job_size) > max_job_width:
+            job_size -= 0.5
+        job_center_y = (rule_y + section_top_y) / 2.0
+        canvas.setFillColor(colors.black)
+        canvas.setFont("Helvetica-Bold", job_size)
+        canvas.drawCentredString(page_width / 2.0, job_center_y - (job_size * 0.255), job_text)
 
         canvas.setFont("Helvetica", 7.5)
         canvas.setFillColor(MUTED)
@@ -1209,23 +1571,24 @@ def _build_pdf(
     doc.build(story, canvasmaker=PageNumberCanvas)
 
 
-def _build_non_included_items_pdf(detail: pd.DataFrame, pdf_path: Path, event_name: str) -> None:
+def _build_non_included_items_pdf(
+    detail: pd.DataFrame,
+    pdf_path: Path,
+    event_name: str,
+    po_numbers: dict[tuple[str, str], str] | None = None,
+) -> None:
     """Create one multi-vendor internal purchase document for Ship-to-Orchid exceptions."""
+    page_size = landscape(letter)
+    left_margin = 0.34 * inch
+    right_margin = 0.34 * inch
+    header_reserve = REPORT_HEADER_RESERVE
     doc = SimpleDocTemplate(
-        str(pdf_path), pagesize=landscape(letter), rightMargin=0.34 * inch,
-        leftMargin=0.34 * inch, topMargin=0.32 * inch, bottomMargin=0.38 * inch,
-        title="Non-Included Items - Internal Purchase Order",
+        str(pdf_path), pagesize=page_size, rightMargin=right_margin,
+        leftMargin=left_margin, topMargin=header_reserve, bottomMargin=0.38 * inch,
+        title="Ship to Orchid Purchase Order",
         author="Orchid Uniforms & Apparel",
     )
     styles = getSampleStyleSheet()
-    title = ParagraphStyle(
-        "NonIncludedTitle", parent=styles["Title"], fontName="Helvetica-Bold",
-        fontSize=18, leading=21, textColor=PURPLE_DARK, alignment=TA_CENTER,
-    )
-    subtitle = ParagraphStyle(
-        "NonIncludedSub", parent=styles["Normal"], fontName="Helvetica-Bold",
-        fontSize=9.5, leading=12, textColor=PURPLE, alignment=TA_CENTER,
-    )
     note = ParagraphStyle(
         "NonIncludedNote", parent=styles["Normal"], fontSize=8.2, leading=10.2,
         textColor=TEXT, alignment=TA_LEFT,
@@ -1245,28 +1608,28 @@ def _build_non_included_items_pdf(detail: pd.DataFrame, pdf_path: Path, event_na
         "NonIncludedQty", parent=body_style, fontName="Helvetica-Bold", alignment=TA_CENTER,
     )
 
-    context = event_name or "Current Purchase Packet"
     story = [
-        _official_logo_flowable(), Spacer(1, 3),
-        _paragraph("NON-INCLUDED ITEMS", title),
-        _paragraph(context, subtitle),
-        _paragraph("INTERNAL PURCHASE ORDER — ORDER MANUALLY AND SHIP TO ORCHID", subtitle),
-        Spacer(1, 9),
+        _paragraph(
+            "SHIP TO: ORCHID UNIFORMS & APPAREL - Each purple section below is the actual supplier to order from.",
+            note,
+        ),
+        Spacer(1, 7),
     ]
 
     for vendor_value, vendor_detail in detail.groupby("Vendor", dropna=False, sort=True):
         vendor = clean_text(vendor_value) or "Vendor Not Assigned"
+        po_number = _non_included_vendor_po_number(vendor_detail, po_numbers or {}, vendor)
+        po_heading = f"PO # {po_number}" if po_number else "PO NUMBER NOT ENTERED"
         story.append(CondPageBreak(0.96 * inch))
-        story.append(_section_heading(vendor, vendor_style, dark=True))
+        story.append(_section_heading(f"{vendor} - {po_heading}", vendor_style, dark=True))
         story.append(Spacer(1, 4))
         story.append(_compact_table(vendor_detail, body_style, qty_style, header_style))
         vendor_total = Table([
-            [_paragraph("VENDOR TOTAL", header_style), _paragraph(str(int(vendor_detail["Quantity"].sum())), header_style)]
-        ], colWidths=[8.60 * inch, 1.55 * inch], hAlign="LEFT")
+            [_paragraph(f"VENDOR TOTAL: {int(vendor_detail['Quantity'].sum())}", header_style)]
+        ], colWidths=[10.15 * inch], hAlign="LEFT")
         vendor_total.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, -1), PURPLE_DARK),
             ("TEXTCOLOR", (0, 0), (-1, -1), colors.white),
-            ("ALIGN", (1, 0), (1, 0), "CENTER"),
             ("BOX", (0, 0), (-1, -1), 0.7, BORDER),
             ("LEFTPADDING", (0, 0), (-1, -1), 5),
             ("RIGHTPADDING", (0, 0), (-1, -1), 5),
@@ -1276,7 +1639,23 @@ def _build_non_included_items_pdf(detail: pd.DataFrame, pdf_path: Path, event_na
         story.append(vendor_total)
         story.append(Spacer(1, 10))
 
-    doc.build(story, canvasmaker=PageNumberCanvas)
+    def draw_header(canvas, doc_obj):
+        _draw_internal_document_header(
+            canvas, doc_obj,
+            report_title="SHIP TO ORCHID PURCHASE ORDER",
+            event_name=event_name,
+            page_size=page_size,
+            left_margin=left_margin,
+            right_margin=right_margin,
+            header_reserve=header_reserve,
+        )
+
+    doc.build(
+        story,
+        onFirstPage=draw_header,
+        onLaterPages=draw_header,
+        canvasmaker=PageNumberCanvas,
+    )
 
 
 
@@ -1533,21 +1912,38 @@ def _build_in_house_receiving_report(
     event_name: str,
     fulfillment_mode: str,
 ) -> None:
-    doc = SimpleDocTemplate(
-        str(pdf_path), pagesize=landscape(letter), rightMargin=0.28 * inch,
-        leftMargin=0.28 * inch, topMargin=0.28 * inch, bottomMargin=0.34 * inch,
-        title="In-House Receiving and Decoration Report",
+    page_size = landscape(letter)
+    page_width, page_height = page_size
+    left_margin = 0.28 * inch
+    right_margin = 0.28 * inch
+    bottom_margin = 0.34 * inch
+    header_reserve = REPORT_HEADER_RESERVE
+    # The first page needs the full Orchid masthead.  Later pages are a
+    # receiving worksheet, so let their rows use that space instead of
+    # repeating the masthead above every continuation page.
+    later_page_top_margin = 0.28 * inch
+    report_width = page_width - left_margin - right_margin
+    first_frame = Frame(
+        left_margin,
+        bottom_margin,
+        report_width,
+        page_height - bottom_margin - header_reserve,
+        id="receiving-first-page",
+    )
+    later_frame = Frame(
+        left_margin,
+        bottom_margin,
+        report_width,
+        page_height - bottom_margin - later_page_top_margin,
+        id="receiving-later-pages",
+    )
+    doc = BaseDocTemplate(
+        str(pdf_path), pagesize=page_size, rightMargin=right_margin,
+        leftMargin=left_margin, topMargin=header_reserve, bottomMargin=bottom_margin,
+        title="Receiving & Decoration Report",
         author="Orchid Uniforms & Apparel",
     )
     styles = getSampleStyleSheet()
-    title = ParagraphStyle(
-        "InHouseTitle", parent=styles["Title"], fontName="Helvetica-Bold",
-        fontSize=18, leading=21, textColor=PURPLE_DARK, alignment=TA_CENTER,
-    )
-    subtitle = ParagraphStyle(
-        "InHouseSub", parent=styles["Normal"], fontName="Helvetica-Bold",
-        fontSize=9.2, leading=11.5, textColor=PURPLE, alignment=TA_CENTER,
-    )
     note = ParagraphStyle(
         "InHouseNote", parent=styles["Normal"], fontSize=7.4, leading=9.0,
         textColor=TEXT, alignment=TA_LEFT,
@@ -1568,14 +1964,7 @@ def _build_in_house_receiving_report(
         "InHouseCenter", parent=body_style, fontName="Helvetica-Bold", alignment=TA_CENTER,
     )
 
-    context = event_name or "Current Purchase Packet"
-    story = [
-        _official_logo_flowable(), Spacer(1, 3),
-        _paragraph("IN-HOUSE RECEIVING & DECORATION REPORT", title),
-        _paragraph(context, subtitle),
-        _paragraph("Internal Receiving & Decoration Worksheet", subtitle),
-        Spacer(1, 8),
-    ]
+    story = []
 
     sort_columns = ["Vendor", "Assigned PO Number", "Style Number", "Garment Color", "Size", "Employee Name", "Order Number"]
     detail = detail.copy()
@@ -1595,10 +1984,21 @@ def _build_in_house_receiving_report(
     ):
         vendor = clean_text(vendor_value) or "Vendor Not Assigned"
         po_number = clean_text(po_value) or "PO Not Assigned"
+        po_heading = (
+            "PO NUMBER NOT ENTERED"
+            if po_number.casefold() in {"po not entered", "po not assigned"}
+            else f"PO # {po_number}"
+        )
         story.append(CondPageBreak(1.02 * inch))
-        story.append(_section_heading(f"{vendor}  —  {po_number}  —  {int(group["Quantity"].sum())} PIECES", vendor_style, dark=True))
+        # The supplier bar and its detail table deliberately share the exact
+        # full report width.  This keeps every purple row aligned edge-to-edge
+        # and removes the unnecessary vendor-total footer.
+        story.append(_section_heading(
+            f"{vendor}  —  {po_heading}", vendor_style, dark=True, width=report_width,
+        ))
         story.append(Spacer(1, 4))
         rows = [[
+            _paragraph("Received", header_style),
             _paragraph("Product #", header_style),
             _paragraph("Description", header_style),
             _paragraph("Garment Color", header_style),
@@ -1608,13 +2008,9 @@ def _build_in_house_receiving_report(
             _paragraph("Decoration / Location", header_style),
             _paragraph("Thread / Ink", header_style),
             _paragraph("Notes / Instructions", header_style),
-            _paragraph("Received", header_style),
         ]]
         for _, row in group.iterrows():
-            employee_order = _deduplicated_text(
-                _customer_label(row, include_company=True),
-                f"Order {clean_text(row.get('Order Number', ''))}" if clean_text(row.get("Order Number", "")) else "",
-            )
+            employee_order = _employee_order_label(row)
             decoration_type = _operational_value(row, "Operational Decoration Type", "Decoration Type")
             decoration_location = _operational_value(row, "Operational Decoration Location", "Decoration Location")
             decoration = " — ".join(filter(None, [
@@ -1622,7 +2018,8 @@ def _build_in_house_receiving_report(
             ]))
             decoration_color = _operational_value(row, "Operational Decoration Color", "Decoration Color")
             rows.append([
-                _paragraph(row.get("Style Number", ""), body_style),
+                _empty_checkbox(),
+                _paragraph(_receiving_product_number(row), body_style),
                 _paragraph(row.get("Product Name", ""), body_style),
                 _paragraph(row.get("Garment Color", ""), body_style),
                 _paragraph(row.get("Size", ""), center_style),
@@ -1631,13 +2028,12 @@ def _build_in_house_receiving_report(
                 _paragraph(decoration, body_style),
                 _paragraph(decoration_color, body_style),
                 _paragraph(_receiving_notes(row), body_style),
-                _empty_checkbox(),
             ])
         table = Table(
             rows,
             colWidths=[
-                0.72*inch, 1.35*inch, 0.78*inch, 0.45*inch, 0.38*inch,
-                1.35*inch, 1.20*inch, 0.65*inch, 2.46*inch, 0.55*inch,
+                0.55*inch, 0.72*inch, 1.35*inch, 0.78*inch, 0.45*inch,
+                0.38*inch, 1.35*inch, 1.20*inch, 0.65*inch, 3.01*inch,
             ],
             repeatRows=1, splitByRow=1, hAlign="LEFT",
         )
@@ -1648,18 +2044,41 @@ def _build_in_house_receiving_report(
             ("BOX", (0, 0), (-1, -1), 0.7, BORDER),
             ("INNERGRID", (0, 0), (-1, -1), 0.3, BORDER),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("ALIGN", (3, 1), (4, -1), "CENTER"),
-            ("ALIGN", (9, 0), (9, -1), "CENTER"),
-            ("VALIGN", (9, 1), (9, -1), "MIDDLE"),
+            ("ALIGN", (4, 1), (5, -1), "CENTER"),
+            ("ALIGN", (0, 0), (0, -1), "CENTER"),
+            ("VALIGN", (0, 1), (0, -1), "MIDDLE"),
             ("LEFTPADDING", (0, 0), (-1, -1), 2.5),
             ("RIGHTPADDING", (0, 0), (-1, -1), 2.5),
             ("TOPPADDING", (0, 0), (-1, -1), 3.2),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 3.2),
         ]))
         story.append(table)
-        story.append(Spacer(1, 9))
+        story.append(Spacer(1, 10))
 
-    doc.build(story, canvasmaker=PageNumberCanvas)
+    def draw_first_page_header(canvas, doc_obj):
+        _draw_internal_document_header(
+            canvas, doc_obj,
+            report_title="RECEIVING & DECORATION REPORT",
+            event_name=event_name,
+            page_size=page_size,
+            left_margin=left_margin,
+            right_margin=right_margin,
+            header_reserve=header_reserve,
+        )
+
+    doc.addPageTemplates([
+        PageTemplate(
+            id="receiving-first-page",
+            frames=[first_frame],
+            onPage=draw_first_page_header,
+            autoNextPageTemplate="receiving-later-pages",
+        ),
+        PageTemplate(id="receiving-later-pages", frames=[later_frame]),
+    ])
+    doc.build(
+        story,
+        canvasmaker=PageNumberCanvas,
+    )
 
 
 def _build_outsourced_decoration_report(
@@ -1669,18 +2088,33 @@ def _build_outsourced_decoration_report(
     fulfillment_mode: str,
     job_logo_path: Path | None = None,
     outsourced_job_name: str = "",
+    cover_artwork: list[dict] | None = None,
+    cover_notes: str = "",
+    department_kind: str = "",
+    outsourced_to: str = "",
 ) -> None:
+    department_kind = _outsourced_report_kind(department_kind)
+    department_name = (
+        "Embroidery" if department_kind == "embroidery"
+        else "Screen Printing" if department_kind == "screen-printing"
+        else "Decoration"
+    )
+    report_title = f"OUTSOURCED {department_name.upper()} JOB REPORT"
+    artwork_heading = (
+        "ARTWORK BY THREAD COLOR" if department_kind == "embroidery"
+        else "ARTWORK BY INK COLOR" if department_kind == "screen-printing"
+        else "ARTWORK REFERENCE"
+    )
     doc = SimpleDocTemplate(
         str(pdf_path), pagesize=landscape(letter), rightMargin=0.34 * inch,
         leftMargin=0.34 * inch, topMargin=0.30 * inch, bottomMargin=0.36 * inch,
-        title="Outsourced Decoration Job Report",
+        title=f"Outsourced {department_name} Job Report",
         author="Orchid Uniforms & Apparel",
     )
     styles = getSampleStyleSheet()
-    # The outsourced decoration report is a production packet. Keep Orchid's
-    # own identity compact in the left corner, reserve the middle for the job
-    # name and customer/job logo, and keep the outside-decorator destination
-    # directly under Orchid's logo.
+    # The cover gives the outside decorator a clean, dedicated artwork page;
+    # production quantities begin on page two without repeatedly consuming
+    # space with the artwork.
     job_name_style = ParagraphStyle(
         "OutJobName", parent=styles["Title"], fontName="Helvetica-Bold",
         fontSize=22, leading=25, textColor=PURPLE_DARK, alignment=TA_CENTER,
@@ -1713,53 +2147,60 @@ def _build_outsourced_decoration_report(
     qty_style = ParagraphStyle(
         "OutQty", parent=body_style, fontName="Helvetica-Bold", alignment=TA_CENTER,
     )
+    cover_title_style = ParagraphStyle(
+        "OutCoverTitle", parent=styles["Title"], fontName="Helvetica-Bold",
+        fontSize=20, leading=23, textColor=PURPLE_DARK, alignment=TA_CENTER,
+    )
+    cover_job_style = ParagraphStyle(
+        "OutCoverJob", parent=styles["Title"], fontName="Helvetica-Bold",
+        # Keep the production job name prominent without forcing long client
+        # names into ReportLab's tight title spacing.
+        fontSize=23, leading=27, textColor=PURPLE, alignment=TA_CENTER,
+    )
+    cover_label_style = ParagraphStyle(
+        "OutCoverLabel", parent=styles["Normal"], fontName="Helvetica-Bold",
+        fontSize=9, leading=11, textColor=PURPLE_DARK,
+    )
+    cover_value_style = ParagraphStyle(
+        "OutCoverValue", parent=styles["Normal"], fontSize=10.5, leading=13,
+        textColor=TEXT,
+    )
+    cover_table_header_style = ParagraphStyle(
+        "OutCoverTableHeader", parent=styles["Normal"], fontName="Helvetica-Bold",
+        fontSize=9, leading=11, textColor=colors.white,
+    )
+    cover_location_style = ParagraphStyle(
+        "OutCoverLocation", parent=cover_value_style, fontName="Helvetica-Bold",
+        fontSize=10.8, leading=13,
+    )
+    cover_location_quantity_style = ParagraphStyle(
+        "OutCoverLocationQuantity", parent=cover_location_style, alignment=TA_CENTER,
+    )
+    cover_artwork_label_style = ParagraphStyle(
+        "OutCoverArtworkLabel", parent=cover_label_style, alignment=TA_CENTER,
+        fontSize=10, leading=12,
+    )
+    # Keep the concise count heading on one line.  The cover uses two
+    # color/count pairs, so the count cells need a slightly wider dedicated
+    # column than the color names.  Disabling long-word splitting protects the
+    # production-facing word "PIECES" from being broken into two lines.
+    cover_count_header_style = ParagraphStyle(
+        "OutCoverCountHeader", parent=cover_artwork_label_style,
+        fontSize=8.4, leading=9.8, splitLongWords=0,
+    )
+    production_title_style = ParagraphStyle(
+        "OutProductionTitle", parent=styles["Heading2"], fontName="Helvetica-Bold",
+        fontSize=14.5, leading=17, textColor=PURPLE_DARK, alignment=TA_CENTER,
+    )
 
     # The manually entered job/logo name is the production name recognized by
     # the outside decorator (for example, “Utilities Department”).  Keep the
     # event/order name as a sensible fallback for older packets.
     context = clean_text(outsourced_job_name) or event_name or "Current Purchase Packet"
-    # Enlarge the compact Orchid routing block by 20% while retaining its
-    # supporting role at the left edge of the production header.
-    orchid_logo = _official_logo_flowable(max_width=1.39 * inch, max_height=0.60 * inch)
-    try:
-        orchid_logo.hAlign = "LEFT"
-    except Exception:
-        pass
-    left_header = [
-        orchid_logo,
-        Spacer(1, 5),
-        _paragraph("OUTSOURCED TO:", outsource_label_style),
-        _paragraph("Stitch N Print", outsource_vendor_style),
-    ]
-    center_header = [
-        _paragraph(context, job_name_style),
-        Spacer(1, 11),
-    ]
-    if job_logo_path and Path(job_logo_path).exists():
-        try:
-            # Crop empty transparent/white export canvas in memory first, then
-            # use the existing large header bounds for the visible artwork.
-            logo = _job_logo_flowable(Path(job_logo_path), 4.76 * inch, 2.03 * inch)
-            center_header.append(logo)
-        except Exception:
-            pass
-    header = Table(
-        [[left_header, center_header, Spacer(1, 1)]],
-        colWidths=[1.65 * inch, 7.02 * inch, 1.65 * inch],
-        hAlign="LEFT",
-    )
-    header.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("ALIGN", (0, 0), (0, 0), "LEFT"),
-        ("ALIGN", (1, 0), (1, 0), "CENTER"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-    ]))
-    story = [header]
-    story.append(Spacer(1, 8))
-
+    # This is a report-cover instruction, not a purchase vendor.  It remains
+    # event-specific because the same decoration type can go to a different
+    # outside partner on a later job.
+    outsourced_destination = clean_text(outsourced_to) or "Stitch N Print"
     detail = detail.copy()
     detail["Report Decoration Type"] = detail.apply(
         lambda row: _operational_value(row, "Operational Decoration Type", "Decoration Type"), axis=1
@@ -1777,6 +2218,297 @@ def _build_outsourced_decoration_report(
         location_sort_key(item[0][1]),
         clean_text(item[0][2]).casefold(),
     ))
+
+    locations = sorted(
+        {clean_text(keys[1]) for keys, _group in routes if clean_text(keys[1])},
+        key=location_sort_key,
+    )
+    location_totals = (
+        detail.assign(_CoverLocation=detail["Report Decoration Location"].map(clean_text))
+        .groupby("_CoverLocation", dropna=False, sort=False)["Quantity"]
+        .sum()
+        .to_dict()
+    )
+    sorted_location_totals = sorted(
+        ((clean_text(location), int(quantity)) for location, quantity in location_totals.items()),
+        key=lambda item: location_sort_key(item[0]),
+    )
+    # The outside decorator should have the entire production overview on the
+    # first page, beside the artwork—not have to turn to the last page just to
+    # learn how many pieces are needed for each thread/ink color.  The report
+    # is already department-specific, so these totals apply only to the
+    # embroidery or screen-printing job in this PDF.
+    outsourced_total = int(detail["Quantity"].sum())
+    color_column_label = "THREAD COLOR" if department_kind == "embroidery" else "INK COLOR"
+    totals_heading = (
+        "EMBROIDERY PIECE TOTALS" if department_kind == "embroidery"
+        else "SCREEN-PRINTING PIECE TOTALS" if department_kind == "screen-printing"
+        else "DECORATION PIECE TOTALS"
+    )
+    total_label = (
+        "TOTAL EMBROIDERED PIECES" if department_kind == "embroidery"
+        else "TOTAL SCREEN-PRINTED PIECES" if department_kind == "screen-printing"
+        else "TOTAL DECORATED PIECES"
+    )
+    color_kind_label = "Thread" if department_kind == "embroidery" else "Ink"
+    color_totals = (
+        detail.assign(_CoverColor=detail["Report Decoration Color"].map(clean_text))
+        .groupby("_CoverColor", dropna=False, sort=False)["Quantity"]
+        .sum()
+        .to_dict()
+    )
+    sorted_color_totals = sorted(color_totals.items(), key=lambda item: clean_text(item[0]).casefold())
+    artwork_entries = []
+    for item in cover_artwork or []:
+        # Each uploaded artwork row carries its decoration type.  Only the
+        # rows belonging to this department belong on its cover page.
+        item_kind = _outsourced_report_kind(item.get("decoration_type", ""))
+        if department_kind and item_kind and item_kind != department_kind:
+            continue
+        try:
+            path = Path(item.get("path", ""))
+        except TypeError:
+            continue
+        if path.is_file():
+            artwork_entries.append({"label": clean_text(item.get("label", "Artwork")) or "Artwork", "path": path})
+    if not artwork_entries and job_logo_path and Path(job_logo_path).is_file():
+        artwork_entries = [{"label": "Artwork Reference", "path": Path(job_logo_path)}]
+
+    # This cover is deliberately a one-page production brief.  The earlier
+    # version gave the artwork cards a fixed generous height; after the color
+    # totals moved up from the production-page footer, that could push the last
+    # artwork card onto a second cover page.  The artwork grid below now uses
+    # the remaining measured page space instead.
+    orchid_logo = _official_logo_flowable(max_width=1.72 * inch, max_height=0.68 * inch)
+    try:
+        orchid_logo.hAlign = "CENTER"
+    except Exception:
+        pass
+    story = [
+        orchid_logo,
+        Spacer(1, 7),
+        _paragraph(report_title, cover_title_style),
+        Spacer(1, 5),
+        _paragraph(context, cover_job_style),
+        Spacer(1, 13),
+    ]
+    # Keep locations separate so Left Chest and Left Sleeve never read as an
+    # instruction to decorate every garment in both places.  Pair that list
+    # with the color-by-color production total, giving the outside decorator a
+    # concise overview before the artwork and garment quantities.
+    location_rows = [
+        [_paragraph("DECORATION LOCATIONS", cover_table_header_style), _paragraph("PIECES", cover_table_header_style)],
+    ]
+    for location, quantity in sorted_location_totals or [("Not specified", int(detail["Quantity"].sum()))]:
+        location_rows.append([
+            _paragraph(location or "Not specified", cover_location_style),
+            _paragraph(str(quantity), cover_location_quantity_style),
+        ])
+    locations_table = Table(location_rows, colWidths=[4.00 * inch, 0.95 * inch], hAlign="LEFT")
+    locations_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), PURPLE_DARK),
+        ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, ROW_ALT]),
+        ("BOX", (0, 0), (-1, -1), 0.6, BORDER),
+        ("INNERGRID", (0, 0), (-1, -1), 0.35, BORDER),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (1, 0), (1, -1), "CENTER"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 4.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4.5),
+    ]))
+    cover_total_label = ParagraphStyle(
+        "OutCoverTotalLabel", parent=cover_label_style, textColor=colors.white,
+    )
+    cover_total_value = ParagraphStyle(
+        "OutCoverTotalValue", parent=cover_location_quantity_style,
+        fontSize=13, leading=15, textColor=colors.white,
+    )
+    # Use two color/count pairs across the available half-page width.  It
+    # keeps typical two- to four-color jobs pleasantly open, while a busy job
+    # with many colors still leaves room for all matching artwork on this one
+    # cover page rather than spilling the artwork to a second cover page.
+    color_rows = [
+        [_paragraph(totals_heading, cover_table_header_style), "", "", ""],
+        [
+            _paragraph(color_column_label, cover_label_style), _paragraph("PIECES", cover_count_header_style),
+            _paragraph(color_column_label, cover_label_style), _paragraph("PIECES", cover_count_header_style),
+        ],
+    ]
+    color_pairs = []
+    for color_name, quantity in sorted_color_totals:
+        clean_color = clean_text(color_name)
+        color_label = clean_color or f"UNASSIGNED {color_kind_label.upper()}"
+        color_pairs.append((_paragraph(color_label.upper(), cover_location_style), _paragraph(str(int(quantity)), cover_location_quantity_style)))
+    for index in range(0, len(color_pairs), 2):
+        left = color_pairs[index]
+        right = color_pairs[index + 1] if index + 1 < len(color_pairs) else ("", "")
+        color_rows.append([left[0], left[1], right[0], right[1]])
+    color_rows.append([
+        _paragraph(total_label, cover_total_label), "", "",
+        _paragraph(str(outsourced_total), cover_total_value),
+    ])
+    color_totals_table = Table(
+        color_rows,
+        # Keep the full table width unchanged, but allocate more room to each
+        # count column so a reader sees "PIECES" as one clean word.
+        colWidths=[1.55 * inch, 0.85 * inch, 1.55 * inch, 0.85 * inch],
+        hAlign="LEFT",
+    )
+    color_totals_table.setStyle(TableStyle([
+        ("SPAN", (0, 0), (-1, 0)),
+        ("SPAN", (0, -1), (2, -1)),
+        ("BACKGROUND", (0, 0), (-1, 0), PURPLE_DARK),
+        ("BACKGROUND", (0, 1), (-1, 1), PURPLE_LIGHT),
+        ("BACKGROUND", (0, 2), (-1, -2), colors.white),
+        ("BACKGROUND", (0, -1), (-1, -1), PURPLE),
+        ("BOX", (0, 0), (-1, -1), 0.6, BORDER),
+        ("INNERGRID", (0, 1), (-1, -1), 0.35, BORDER),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (1, 1), (1, -1), "CENTER"),
+        ("ALIGN", (3, 1), (3, -1), "CENTER"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 4.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4.5),
+    ]))
+    overview_table = Table(
+        [[locations_table, color_totals_table]],
+        colWidths=[5.05 * inch, 5.25 * inch], hAlign="LEFT",
+    )
+    overview_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    notes_table = Table(
+        [[_paragraph("SPECIAL NOTES", cover_label_style), _paragraph(clean_text(cover_notes) or "None", cover_value_style)]],
+        colWidths=[1.65 * inch, 8.50 * inch], hAlign="LEFT",
+    )
+    notes_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, 0), PURPLE_LIGHT),
+        ("BOX", (0, 0), (-1, -1), 0.6, BORDER),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    destination_table = Table(
+        [[_paragraph("OUTSOURCED TO", cover_label_style), _paragraph(outsourced_destination, outsource_vendor_style)]],
+        colWidths=[2.10 * inch, 8.05 * inch], hAlign="LEFT",
+    )
+    destination_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, 0), PURPLE_LIGHT),
+        ("BACKGROUND", (1, 0), (1, 0), colors.white),
+        ("BOX", (0, 0), (-1, -1), 0.75, PURPLE),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    # Measure all non-artwork cover content first.  The remaining height is
+    # reserved for the grid so the following PageBreak always starts garment
+    # quantities on page two, never after an accidental second cover page.
+    cover_prefix = [
+        orchid_logo,
+        Spacer(1, 5),
+        _paragraph(report_title, cover_title_style),
+        Spacer(1, 3),
+        _paragraph(context, cover_job_style),
+        Spacer(1, 6),
+        destination_table,
+        Spacer(1, 8),
+        overview_table,
+        Spacer(1, 6),
+        notes_table,
+        Spacer(1, 7),
+    ]
+    story = list(cover_prefix)
+    if artwork_entries:
+        artwork_heading_flowable = _paragraph(artwork_heading, cover_label_style)
+        # Prefer one artwork row whenever possible.  This keeps the artwork
+        # readable while making room for the color and location instructions
+        # that Stitch N Print needs at the top of the same page.
+        columns = 1 if len(artwork_entries) == 1 else min(len(artwork_entries), 6)
+        artwork_rows = (len(artwork_entries) + columns - 1) // columns
+        card_width = 10.33 * inch / columns
+        prefix_height = sum(item.wrap(doc.width, doc.height)[1] for item in cover_prefix)
+        artwork_heading_height = artwork_heading_flowable.wrap(doc.width, doc.height)[1] + 3
+        # Reserve a small safety margin for ReportLab rounding.  The 0.16-inch
+        # minimum still identifies each uploaded color on unusually dense jobs.
+        available_artwork_height = max(0.72 * inch, doc.height - prefix_height - artwork_heading_height - 6)
+        image_height = min(
+            1.18 * inch if columns < 3 else 0.92 * inch,
+            max(0.16 * inch, (available_artwork_height / artwork_rows) - 0.34 * inch),
+        )
+
+        def build_artwork_table(max_image_height: float):
+            cards = []
+            for item in artwork_entries:
+                try:
+                    image = _job_logo_flowable(item["path"], card_width - 0.30 * inch, max_image_height)
+                    card = Table(
+                        [[_paragraph(item["label"].upper(), cover_artwork_label_style)], [image]],
+                        colWidths=[card_width - 0.14 * inch], hAlign="CENTER",
+                    )
+                    card.setStyle(TableStyle([
+                        ("BACKGROUND", (0, 0), (-1, 0), PURPLE_LIGHT),
+                        ("BOX", (0, 0), (-1, -1), 0.6, BORDER),
+                        ("LINEBELOW", (0, 0), (-1, 0), 0.35, BORDER),
+                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                        ("TOPPADDING", (0, 0), (-1, -1), 4),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                    ]))
+                except Exception:
+                    card = Table(
+                        [[_paragraph(item["label"].upper(), cover_artwork_label_style)]],
+                        colWidths=[card_width - 0.14 * inch], hAlign="CENTER",
+                    )
+                    card.setStyle(TableStyle([
+                        ("BACKGROUND", (0, 0), (-1, -1), PURPLE_LIGHT),
+                        ("BOX", (0, 0), (-1, -1), 0.6, BORDER),
+                        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                        ("TOPPADDING", (0, 0), (-1, -1), 5),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                    ]))
+                cards.append(card)
+            while len(cards) % columns:
+                cards.append(Spacer(1, 1))
+            artwork_table = Table(
+                [cards[index:index + columns] for index in range(0, len(cards), columns)],
+                colWidths=[card_width] * columns, hAlign="LEFT",
+            )
+            artwork_table.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]))
+            return artwork_table
+
+        artwork_table = build_artwork_table(image_height)
+        # Image aspect ratios can leave a card taller than the requested image
+        # area.  Tighten it once more from the measured table height if needed.
+        artwork_height = artwork_table.wrap(doc.width, doc.height)[1]
+        if artwork_height > available_artwork_height:
+            image_height = max(0.16 * inch, image_height * available_artwork_height / artwork_height)
+            artwork_table = build_artwork_table(image_height)
+        story.extend([artwork_heading_flowable, Spacer(1, 3), artwork_table, Spacer(1, 2)])
+    else:
+        story.extend([_paragraph("Artwork will be supplied separately.", cover_value_style), Spacer(1, 2)])
+    story.extend([PageBreak(), _paragraph(report_title, production_title_style), _paragraph(context, job_name_style), Spacer(1, 10)])
 
     for keys, group in routes:
         deco_type, location, color_value = keys
@@ -1851,52 +2583,6 @@ def _build_outsourced_decoration_report(
         story.append(table)
         story.append(Spacer(1, 9))
 
-    screen_total = int(detail.loc[
-        detail["Report Decoration Type"].map(clean_text).str.casefold().str.contains("screen", na=False),
-        "Quantity",
-    ].sum())
-    embroidery_total = int(detail.loc[
-        detail["Report Decoration Type"].map(clean_text).str.casefold().str.contains("embroider", na=False),
-        "Quantity",
-    ].sum())
-    outsourced_total = int(detail["Quantity"].sum())
-    summary_label = ParagraphStyle(
-        "OutSummaryLabel", parent=body_style, fontName="Helvetica-Bold",
-        fontSize=8.2, leading=9.6, textColor=PURPLE_DARK, alignment=TA_CENTER,
-    )
-    summary_value = ParagraphStyle(
-        "OutSummaryValue", parent=summary_label, fontSize=15, leading=17,
-    )
-    story.append(Spacer(1, 8))
-    totals_table = Table([
-        [_paragraph("OUTSOURCED PIECE TOTALS", route_style), "", ""],
-        [
-            _paragraph("SCREEN-PRINTED PIECES", summary_label),
-            _paragraph("EMBROIDERED PIECES", summary_label),
-            _paragraph("TOTAL OUTSOURCED PIECES", summary_label),
-        ],
-        [
-            _paragraph(str(screen_total), summary_value),
-            _paragraph(str(embroidery_total), summary_value),
-            _paragraph(str(outsourced_total), summary_value),
-        ],
-    ], colWidths=[3.38 * inch, 3.38 * inch, 3.39 * inch], splitByRow=0)
-    totals_table.setStyle(TableStyle([
-        ("SPAN", (0, 0), (-1, 0)),
-        ("BACKGROUND", (0, 0), (-1, 0), PURPLE_DARK),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("BACKGROUND", (0, 1), (-1, 1), PURPLE_LIGHT),
-        ("BOX", (0, 0), (-1, -1), 0.7, BORDER),
-        ("INNERGRID", (0, 1), (-1, -1), 0.35, BORDER),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("TOPPADDING", (0, 0), (-1, -1), 7),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-    ]))
-    story.append(totals_table)
-
     doc.build(story, canvasmaker=PageNumberCanvas)
 
 def generate_employee_totals_pdf(review_workbook_path: Path, output_path: Path | None = None) -> Path:
@@ -1912,18 +2598,121 @@ def generate_employee_totals_pdf(review_workbook_path: Path, output_path: Path |
     return output_path
 
 
+def _build_test_review_hold_pdf(detail: pd.DataFrame, pdf_path: Path, event_name: str) -> None:
+    """Create the exception list for a deliberate, non-production test run.
+
+    A test packet can be useful before every order-specific review decision is
+    complete, but an incomplete line cannot be silently treated as approved.
+    This report makes every held line visible beside the generated vendor PDFs.
+    """
+    doc = SimpleDocTemplate(
+        str(pdf_path), pagesize=landscape(letter), rightMargin=0.36 * inch,
+        leftMargin=0.36 * inch, topMargin=0.34 * inch, bottomMargin=0.36 * inch,
+        title=f"Test Review Hold Report - {event_name}", author="Orchid Uniforms & Apparel",
+    )
+    styles = getSampleStyleSheet()
+    title = ParagraphStyle(
+        "TestHoldTitle", parent=styles["Title"], fontName="Helvetica-Bold",
+        fontSize=18, leading=22, textColor=PURPLE_DARK,
+    )
+    subtitle = ParagraphStyle(
+        "TestHoldSubtitle", parent=styles["Normal"], fontSize=9.2, leading=12,
+        textColor=MUTED,
+    )
+    body = ParagraphStyle(
+        "TestHoldBody", parent=styles["Normal"], fontSize=7.4, leading=9,
+        textColor=TEXT,
+    )
+    header = ParagraphStyle(
+        "TestHoldHeader", parent=body, fontName="Helvetica-Bold", textColor=colors.white,
+        alignment=TA_CENTER,
+    )
+    story = [
+        _paragraph("TEST ONLY — HELD FROM PURCHASE ORDERS", title),
+        _paragraph(event_name or "Current Event", subtitle),
+        _paragraph(
+            "These lines were intentionally not placed on a vendor purchase order because their "
+            "Purchase Review decision remains unresolved. Every other included garment was verified "
+            "against the locked import before the test PDFs were released.",
+            subtitle,
+        ),
+        Spacer(1, 10),
+    ]
+    rows = [[
+        _paragraph("Order", header),
+        _paragraph("Employee", header),
+        _paragraph("Product", header),
+        _paragraph("Color / Size", header),
+        _paragraph("Qty", header),
+        _paragraph("Why Held", header),
+    ]]
+    for _, source in detail.iterrows():
+        product = " — ".join(
+            part for part in (
+                clean_text(source.get("Style Number", "")),
+                clean_text(source.get("Product Name", "")),
+            )
+            if part
+        )
+        color_size = " / ".join(
+            part for part in (
+                clean_text(source.get("Garment Color", "")),
+                clean_text(source.get("Size", "")),
+            )
+            if part
+        )
+        rows.append([
+            _paragraph(clean_text(source.get("Order Number", "")) or "—", body),
+            _paragraph(clean_text(source.get("Employee Name", "")) or "—", body),
+            _paragraph(product or "—", body),
+            _paragraph(color_size or "—", body),
+            _paragraph(str(_quantity(source.get("Quantity", 0))), body),
+            _paragraph(clean_text(source.get("Review Reason", "")) or "Needs review", body),
+        ])
+    table = Table(
+        rows,
+        colWidths=[0.70 * inch, 1.45 * inch, 2.65 * inch, 1.45 * inch, 0.45 * inch, 3.20 * inch],
+        repeatRows=1,
+    )
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), PURPLE),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, ROW_ALT]),
+        ("BOX", (0, 0), (-1, -1), 0.7, BORDER),
+        ("INNERGRID", (0, 0), (-1, -1), 0.3, BORDER),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ALIGN", (4, 1), (4, -1), "CENTER"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(table)
+    doc.build(story, canvasmaker=PageNumberCanvas)
+
+
 def generate_final_purchase_orders(
     review_workbook_path: Path,
     reports_root: Path,
     po_number_overrides: dict[tuple[str, str], str] | None = None,
     job_logo_path: Path | None = None,
     outsourced_job_name: str = "",
+    outsourced_cover_artwork: list[dict] | None = None,
+    outsourced_cover_notes: str = "",
+    outsourced_to: dict[str, str] | None = None,
     allow_historical_lock: bool = False,
+    hold_unresolved_review: bool = False,
+    test_mode: bool = False,
 ) -> dict:
     workbook_path = Path(review_workbook_path)
     report_mode = normalize_report_mode(load_report_mode(workbook_path))
     event_name = clean_text(load_event_name(workbook_path))
     decoration_fulfillment = load_decoration_fulfillment(workbook_path)
+    active_packet_id = clean_text(load_system_info_value(workbook_path, "Active Packet ID"))
+    if not active_packet_id and not allow_historical_lock:
+        raise RuntimeError(
+            "Purchase Review is missing its event identity. Regenerate Purchase Review before creating PDFs."
+        )
     selected_job_logo = Path(job_logo_path) if job_logo_path and Path(job_logo_path).exists() else _event_logo_path(workbook_path, event_name)
 
     # Protected 4.9.0 preflight: verify the locked source CSV, live Product
@@ -1936,7 +2725,10 @@ def generate_final_purchase_orders(
         workbook_path, review_records,
         require_current_live_inputs=not bool(allow_historical_lock),
     )
-    ready, review, non_included = _prepare_lines(workbook_path, decoration_fulfillment)
+    ready, review, non_included = _prepare_lines(
+        workbook_path, decoration_fulfillment, report_mode,
+        hold_unresolved_review=hold_unresolved_review,
+    )
     integrity_summary = _validate_final_output_integrity(
         review_records, ready, review, non_included
     )
@@ -1970,6 +2762,7 @@ def generate_final_purchase_orders(
         f"Non-Included source lines: {integrity_summary['non_included_lines']}\n"
         f"Non-Included quantity: {integrity_summary['non_included_quantity']}\n"
         f"Purchase Review blocked lines: {integrity_summary['review_lines']}\n"
+        f"Test-only review hold mode: {'YES' if test_mode else 'NO'}\n"
         "Every included garment was traced to exactly one purchasing route.\n",
         encoding="utf-8",
     )
@@ -1993,16 +2786,11 @@ def generate_final_purchase_orders(
             else:
                 base_name = "__".join([safe_filename(vendor), "Purchase_Order"])
 
-            # Prefer a dedicated combined-vendor PO number. For compatibility
-            # with existing workbooks, fall back to the first entered PO number
-            # for this vendor before creating an automatic number.
-            po_number = clean_text(po_numbers.get((vendor.casefold(), "combined vendor order"), ""))
-            if not po_number:
-                for fallback_type in ("embroidery", "screen printing", "blank garments", "general sales"):
-                    po_number = clean_text(po_numbers.get((vendor.casefold(), fallback_type), ""))
-                    if po_number:
-                        break
-            po_number = po_number or f"PO-{now.strftime('%Y%m%d')}-{report_number:02d}"
+            # Prefer the saved vendor number; legacy decoration-specific
+            # numbers remain supported by the shared lookup helper.
+            po_number = _vendor_po_number(po_numbers, vendor)
+            default_prefix = "TEST" if test_mode else "PO"
+            po_number = po_number or f"{default_prefix}-{now.strftime('%Y%m%d')}-{report_number:02d}"
             po_number_by_vendor[vendor.casefold()] = po_number
             pdf_path = output_dir / f"{safe_filename(po_number)}__{base_name}.pdf"
             _build_pdf(report, pdf_path, po_number, vendor, report_mode, "", event_name=event_name)
@@ -2020,13 +2808,13 @@ def generate_final_purchase_orders(
             report_number += 1
 
     if not non_included.empty:
-        non_included_pdf = output_dir / "Non-Included_Items__Internal_Purchase_Order.pdf"
-        _build_non_included_items_pdf(non_included, non_included_pdf, event_name)
+        non_included_pdf = output_dir / "Ship_to_Orchid_Purchase_Order.pdf"
+        _build_non_included_items_pdf(non_included, non_included_pdf, event_name, po_numbers)
         pdf_files.append(non_included_pdf)
         created_files.append(non_included_pdf)
         summary_rows.append({
             "Vendor": "MULTIPLE VENDORS",
-            "Report": "Non-Included Items",
+            "Report": "Ship to Orchid Purchase Order",
             "Purchase Order Mode": "Internal Manual Purchase",
             "Event Name": event_name,
             "Decoration Sections": int(non_included[["Decoration Type", "Decoration Location", "Decoration Color"]].drop_duplicates().shape[0]),
@@ -2039,6 +2827,8 @@ def generate_final_purchase_orders(
     # the concise vendor purchase orders above.
     in_house_receiving_pdf = None
     outsourced_decoration_pdf = None
+    outsourced_embroidery_pdf = None
+    outsourced_screen_printing_pdf = None
     operational_frames = []
     if not ready.empty:
         ready_operational = ready.copy()
@@ -2049,7 +2839,13 @@ def generate_final_purchase_orders(
         operational_frames.append(ready_operational)
     if not non_included.empty:
         manual_operational = non_included.copy()
-        manual_operational["Assigned PO Number"] = "MANUAL / NON-INCLUDED"
+        # Manual/non-included is an internal routing detail, not the PO number
+        # a receiver needs. Use the saved vendor number in this worksheet.
+        manual_operational["Assigned PO Number"] = manual_operational["Vendor"].map(
+            lambda value: po_number_by_vendor.get(clean_text(value).casefold())
+            or _vendor_po_number(po_numbers, value)
+            or "PO Not Entered"
+        )
         manual_operational["Manual Purchase"] = "Yes"
         operational_frames.append(manual_operational)
 
@@ -2067,20 +2863,62 @@ def generate_final_purchase_orders(
         in_house_detail = operational[~outsourced_mask].copy()
 
         if not in_house_detail.empty:
-            in_house_receiving_pdf = output_dir / "In-House_Receiving_and_Decoration_Report.pdf"
+            in_house_receiving_pdf = output_dir / "Receiving_and_Decoration_Report.pdf"
             _build_in_house_receiving_report(
                 in_house_detail, in_house_receiving_pdf, event_name, decoration_fulfillment
             )
             created_files.append(in_house_receiving_pdf)
 
         if not outsourced_detail.empty:
-            outsourced_decoration_pdf = output_dir / "Outsourced_Decoration_Job_Report.pdf"
-            _build_outsourced_decoration_report(
-                outsourced_detail, outsourced_decoration_pdf, event_name, decoration_fulfillment,
-                job_logo_path=selected_job_logo,
-                outsourced_job_name=outsourced_job_name,
+            outsourced_detail["Outsourced Report Department"] = outsourced_detail.apply(
+                lambda row: _outsourced_report_kind(
+                    _operational_value(row, "Operational Decoration Type", "Decoration Type")
+                ),
+                axis=1,
             )
-            created_files.append(outsourced_decoration_pdf)
+            unknown_outsourced = outsourced_detail[
+                outsourced_detail["Outsourced Report Department"].eq("")
+            ]
+            if not unknown_outsourced.empty:
+                unknown_types = sorted({
+                    _display_decoration_type(
+                        _operational_value(row, "Operational Decoration Type", "Decoration Type")
+                    )
+                    for _, row in unknown_outsourced.iterrows()
+                })
+                raise RuntimeError(
+                    "Orchid could not assign an outsourced decoration department for: "
+                    + ", ".join(unknown_types)
+                    + ". Choose Embroidery or Screen Print before generating the job reports."
+                )
+            report_specs = (
+                ("embroidery", "Outsourced_Embroidery_Job_Report.pdf"),
+                ("screen-printing", "Outsourced_Screen_Printing_Job_Report.pdf"),
+            )
+            for department_kind, filename in report_specs:
+                department_detail = outsourced_detail[
+                    outsourced_detail["Outsourced Report Department"].eq(department_kind)
+                ].copy()
+                if department_detail.empty:
+                    continue
+                report_path = output_dir / filename
+                _build_outsourced_decoration_report(
+                    department_detail, report_path, event_name, decoration_fulfillment,
+                    job_logo_path=selected_job_logo,
+                    outsourced_job_name=outsourced_job_name,
+                    cover_artwork=outsourced_cover_artwork,
+                    cover_notes=outsourced_cover_notes,
+                    department_kind=department_kind,
+                    outsourced_to=(outsourced_to or {}).get(department_kind, ""),
+                )
+                created_files.append(report_path)
+                if department_kind == "embroidery":
+                    outsourced_embroidery_pdf = report_path
+                else:
+                    outsourced_screen_printing_pdf = report_path
+            # Keep the prior result key as a compatibility fallback for older
+            # callers.  New callers use the two department-specific paths.
+            outsourced_decoration_pdf = outsourced_embroidery_pdf or outsourced_screen_printing_pdf
 
     # Uniform Sizing Events also receive Employee Totals and a concise Event
     # Summary. Daily All Orders runs intentionally omit these event-only reports.
@@ -2100,6 +2938,13 @@ def generate_final_purchase_orders(
             decoration_fulfillment,
         )
         created_files.extend([employee_totals_pdf, event_summary_pdf])
+
+    held_review_pdf = None
+    if test_mode and not review.empty:
+        held_review_pdf = output_dir / "TEST_ONLY_Held_for_Review.pdf"
+        _build_test_review_hold_pdf(review, held_review_pdf, event_name)
+        pdf_files.append(held_review_pdf)
+        created_files.append(held_review_pdf)
 
     summary = pd.DataFrame(summary_rows)
 
@@ -2123,12 +2968,15 @@ def generate_final_purchase_orders(
         "event_name": event_name,
         "report_mode": report_mode,
         "decoration_fulfillment": decoration_fulfillment,
+        "active_packet_id": active_packet_id,
         "packet_lock_id": packet_lock_summary["lock_id"],
         "packet_lock_manifest_sha256": packet_lock_summary["manifest_sha256"],
         "source_lines": integrity_summary["source_lines"],
         "vendor_quantity": integrity_summary["vendor_quantity"],
         "non_included_quantity": integrity_summary["non_included_quantity"],
         "blocked_review_lines": integrity_summary["review_lines"],
+        "test_mode": bool(test_mode),
+        "test_held_review_lines": integrity_summary["review_lines"] if test_mode else 0,
         "files": release_files,
     }
     release_manifest_path.write_text(
@@ -2156,8 +3004,11 @@ def generate_final_purchase_orders(
     non_included_pdf = released(non_included_pdf)
     in_house_receiving_pdf = released(in_house_receiving_pdf)
     outsourced_decoration_pdf = released(outsourced_decoration_pdf)
+    outsourced_embroidery_pdf = released(outsourced_embroidery_pdf)
+    outsourced_screen_printing_pdf = released(outsourced_screen_printing_pdf)
     employee_totals_pdf = released(employee_totals_pdf)
     event_summary_pdf = released(event_summary_pdf)
+    held_review_pdf = released(held_review_pdf)
     release_manifest_path = released(release_manifest_path)
     output_dir = final_output_dir
 
@@ -2171,7 +3022,11 @@ def generate_final_purchase_orders(
         "event_name": event_name,
         "decoration_fulfillment": decoration_fulfillment,
         "report_count": len(summary),
-        "decoration_report_count": int(bool(in_house_receiving_pdf)) + int(bool(outsourced_decoration_pdf)),
+        "decoration_report_count": (
+            int(bool(in_house_receiving_pdf))
+            + int(bool(outsourced_embroidery_pdf))
+            + int(bool(outsourced_screen_printing_pdf))
+        ),
         "routes": len(summary),
         "ready_lines": len(ready),
         "ready_quantity": int(ready["Quantity"].sum()) if not ready.empty else 0,
@@ -2179,10 +3034,13 @@ def generate_final_purchase_orders(
         "non_included_quantity": int(non_included["Quantity"].sum()) if not non_included.empty else 0,
         "non_included_pdf": non_included_pdf,
         "review_lines": len(review),
+        "held_review_pdf": held_review_pdf,
         "pdf_files": pdf_files,
         "created_files": created_files,
         "employee_totals_pdf": employee_totals_pdf,
         "event_summary_pdf": event_summary_pdf,
         "in_house_receiving_pdf": in_house_receiving_pdf,
         "outsourced_decoration_pdf": outsourced_decoration_pdf,
+        "outsourced_embroidery_pdf": outsourced_embroidery_pdf,
+        "outsourced_screen_printing_pdf": outsourced_screen_printing_pdf,
     }

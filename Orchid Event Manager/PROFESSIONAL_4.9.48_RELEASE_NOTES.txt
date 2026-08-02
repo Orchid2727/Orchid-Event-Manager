@@ -1,0 +1,11 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.48
+
+COMPACT JOB-NAME BAND
+- Reduces the white space containing the job name by one-third.
+- Applies the same compact spacing to every vendor purchase order, the
+  Receiving & Decoration Report, and the Non-Included Items Purchase Order.
+- Keeps the job name centered between the masthead divider rule and the first
+  section heading or decoration bar on every page.
+
+All purchasing routes, quantities, vendor grouping, saved event data, and
+reliable packet storage remain unchanged.

@@ -1,0 +1,8 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.17
+
+- Adds a dedicated outsourced-decoration cover page before garment quantities.
+- The Logo page now automatically lists only the thread/ink color versions used by the current outsourced job.
+- Each listed artwork row supports Upload, Replace, Open, and Remove.
+- Job Name, decoration locations, and Special Notes are printed on the cover.
+- Event Archive keeps the artwork-by-color setup with the completed packet for later report-only reopening.
+- Includes the 4.9.16 completed-packet, Print All Reports, and expanded-list improvements.

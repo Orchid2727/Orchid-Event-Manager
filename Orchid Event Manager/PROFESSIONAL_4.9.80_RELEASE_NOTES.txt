@@ -1,0 +1,8 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.80
+
+INTERNAL SERVICE-ITEM PURCHASE REVIEW REPAIR
+
+- Treats EMBARK2LOGOS as an Orchid internal service charge, not a garment.
+- Permanently applies the same service treatment to BAGDECORATION, FLAG, and PARKSLEAFLOGOONLY.
+- These internal lines do not require a garment color, size, or decoration decision and never appear on vendor purchase orders or outsourced reports.
+- Keeps real logo-decorated garments in the normal purchasing workflow.

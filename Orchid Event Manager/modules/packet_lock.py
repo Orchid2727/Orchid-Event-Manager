@@ -22,11 +22,16 @@ from typing import Any, Iterable, Mapping
 
 import pandas as pd
 
-from modules.master_sync import live_product_master_path, product_master_signature
+from modules.master_sync import live_product_master_path
 from modules.outsource_rules import ROUTING_POLICY_VERSION, vendor_never_outsource
 from modules.paths import data_dir
 from modules.product_resolver import load_extended_master, normalize_style, resolve_product
-from modules.xlsx_reader import load_decoration_fulfillment, load_report_mode, load_system_info_value
+from modules.xlsx_reader import (
+    load_decoration_fulfillment,
+    load_report_mode,
+    load_review_lines,
+    load_system_info_value,
+)
 
 LOCK_SCHEMA_VERSION = "1"
 LOCK_ROOT_NAME = "packet_locks"
@@ -265,6 +270,185 @@ def _record_map(records: Iterable[Mapping[str, Any]]) -> dict[str, Mapping[str, 
     return result
 
 
+def _included_for_purchase(row: Mapping[str, Any]) -> bool:
+    """Return whether a Purchase Review row can affect a vendor PO route."""
+    return _clean(row.get("Include", "")).casefold() in {"yes", "y", "true", "1", "include"}
+
+
+def _yes(value: object) -> bool:
+    return _clean(value).casefold() in {"yes", "y", "true", "1"}
+
+
+def _routing_signature(
+    row: Mapping[str, Any],
+    master: pd.DataFrame,
+    overrides: Mapping[str, bool],
+) -> dict[str, object]:
+    """Resolve the permanent Product Master fields that can change PO routing.
+
+    Thread/ink color, names, aliases, images, and catalog-only fields are
+    deliberately absent. They do not change the vendor, Orchid-routing flag,
+    decoration type, or decoration location used by a PO.
+    """
+    style = _clean(row.get("Product #", row.get("Style Number", "")))
+    product = _clean(row.get("Description", row.get("Product Name", "")))
+    color = _clean(row.get("Garment Color", row.get("Color", "")))
+    try:
+        resolution = resolve_product(style, product, color, master, master_prepared=True)
+    except Exception:
+        resolution = None
+    if resolution is None:
+        return {
+            "matched": False,
+            "vendor": "",
+            "decoration_type": "",
+            "decoration_location": "",
+            "never_outsource": False,
+        }
+    return {
+        "matched": bool(resolution.matched),
+        "vendor": _clean(resolution.vendor).casefold(),
+        "decoration_type": _clean(resolution.decoration_type).casefold(),
+        "decoration_location": _clean(resolution.decoration_location).casefold(),
+        "never_outsource": bool(
+            resolution.never_outsource
+            or _style_override(overrides, style, product)
+            or vendor_never_outsource(resolution.vendor)
+        ),
+    }
+
+
+def _review_routing_signature(row: Mapping[str, Any]) -> dict[str, object]:
+    """Return the routing values that the current Purchase Review will print."""
+    return {
+        "vendor": _clean(row.get("Purchase Vendor", "")).casefold(),
+        "decoration_type": _clean(row.get("Decoration Type", "")).casefold(),
+        "decoration_location": _clean(row.get("Decoration Location", "")).casefold(),
+        "never_outsource": _yes(row.get("Do Not Outsource", "")),
+    }
+
+
+def _routing_status_from_manifest(
+    records: list[dict[str, object]],
+    manifest_path: Path,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compare only active-event routing changes against the protected lock.
+
+    A Purchase Review is a routing snapshot, but a saved thread/ink color,
+    catalog description, alias, or image cannot invalidate it. The comparison
+    is limited to this event's vendor, decoration type/location, and Never
+    Outsource routes. Explicit Purchase Review overrides remain in force.
+    """
+    if str(manifest.get("routing_policy_version", "")) != ROUTING_POLICY_VERSION:
+        return {
+            "current": False,
+            "reason": "Orchid's routing policy changed after this Purchase Review was created.",
+            "changes": [],
+        }
+
+    try:
+        locked_master_path = _verify_file_entry(manifest_path, manifest, "product_master")
+        locked_overrides_path = _verify_file_entry(manifest_path, manifest, "never_outsource_overrides")
+        live_master_path = Path(live_product_master_path()).expanduser().resolve()
+        if not live_master_path.is_file():
+            raise FileNotFoundError(f"Live Product Master was not found: {live_master_path}")
+        locked_master = load_extended_master(locked_master_path)
+        live_master = load_extended_master(live_master_path)
+        locked_overrides = _load_overrides(locked_overrides_path)
+        live_overrides = _load_overrides(_override_path(live_master_path))
+    except Exception as error:
+        return {
+            "current": False,
+            "reason": f"Orchid could not compare the active Product Master routing: {error}",
+            "changes": [],
+        }
+
+    fields = {
+        "vendor": "Purchase Vendor",
+        "decoration_type": "Decoration Type",
+        "decoration_location": "Decoration Location",
+        "never_outsource": "Do Not Outsource",
+    }
+    changes: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str, tuple[str, ...]]] = set()
+    for index, row in enumerate(records, start=1):
+        if not _included_for_purchase(row):
+            continue
+        locked = _routing_signature(row, locked_master, locked_overrides)
+        live = _routing_signature(row, live_master, live_overrides)
+        review = _review_routing_signature(row)
+        affected = tuple(
+            label for key, label in fields.items()
+            # If the saved review still has the locked default, refreshing it
+            # would change that printed PO route. A saved review override is
+            # already explicit and therefore does not need interruption.
+            if locked.get(key) != live.get(key) and review.get(key) == locked.get(key)
+        )
+        if not affected:
+            continue
+        identity = (
+            _clean(row.get("Source ID", "")) or str(index),
+            _clean(row.get("Product #", row.get("Style Number", ""))),
+            _clean(row.get("Garment Color", row.get("Color", ""))),
+            affected,
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        changes.append({
+            "source_id": identity[0],
+            "style": identity[1],
+            "garment_color": identity[2],
+            "fields": list(affected),
+        })
+
+    if not changes:
+        return {"current": True, "reason": "", "changes": []}
+    preview = "; ".join(
+        f"{change['style'] or 'Unknown product'}{(' / ' + change['garment_color']) if change['garment_color'] else ''} "
+        f"({', '.join(change['fields'])})"
+        for change in changes[:4]
+    )
+    if len(changes) > 4:
+        preview += f"; plus {len(changes) - 4} more"
+    return {
+        "current": False,
+        "reason": f"{len(changes)} active purchase route(s) changed: {preview}.",
+        "changes": changes,
+    }
+
+
+def review_routing_status(
+    workbook_path: Path,
+    records: list[dict[str, object]] | None = None,
+) -> dict[str, Any]:
+    """Return whether an active Purchase Review still has current PO routing.
+
+    Missing or invalid packet-lock material is deliberately treated as stale so
+    final reports remain protected. This lets the UI offer a direct recovery
+    action without byte-comparing the entire Product Master.
+    """
+    workbook_path = Path(workbook_path)
+    try:
+        manifest_path, saved_lock_id, saved_manifest_hash = _resolve_manifest(workbook_path)
+        if saved_manifest_hash and sha256_file(manifest_path) != saved_manifest_hash:
+            raise RuntimeError("Protected packet manifest no longer matches the Purchase Review workbook.")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if str(manifest.get("schema_version", "")) != LOCK_SCHEMA_VERSION:
+            raise RuntimeError("Protected packet lock uses an unsupported schema.")
+        if saved_lock_id and str(manifest.get("lock_id", "")) != saved_lock_id:
+            raise RuntimeError("Protected packet lock ID does not match the Purchase Review workbook.")
+        current_records = records if records is not None else load_review_lines(workbook_path)
+        return _routing_status_from_manifest(current_records, manifest_path, manifest)
+    except Exception as error:
+        return {
+            "current": False,
+            "reason": f"Purchase Review must be refreshed before creating PDFs: {error}",
+            "changes": [],
+        }
+
+
 def _same_text(left: object, right: object) -> bool:
     return _clean(left).casefold() == _clean(right).casefold()
 
@@ -294,22 +478,14 @@ def verify_packet_lock(
     overrides_path = _verify_file_entry(manifest_path, manifest, "never_outsource_overrides")
     ledger_path = _verify_file_entry(manifest_path, manifest, "source_ledger")
 
+    routing_status = {"current": True, "reason": "", "changes": []}
     if require_current_live_inputs:
-        current_master = Path(live_product_master_path()).expanduser().resolve()
-        current_overrides = _override_path(current_master)
-        current_master_hash = str(product_master_signature(current_master).get("sha256", ""))
-        locked_master_hash = str(manifest["files"]["product_master"]["sha256"])
-        if not current_master_hash or current_master_hash != locked_master_hash:
+        routing_status = _routing_status_from_manifest(records, manifest_path, manifest)
+        if not routing_status.get("current"):
             raise RuntimeError(
-                "The live Product Master changed after this Purchase Review was created. No PDFs were created.\n\n"
-                "Regenerate Purchase Review so every vendor and Never Outsource route is recalculated from the current live master."
-            )
-        current_override_hash = sha256_file(current_overrides) if current_overrides.is_file() else sha256(b"{}\n").hexdigest()
-        locked_override_hash = str(manifest["files"]["never_outsource_overrides"]["sha256"])
-        if current_override_hash != locked_override_hash:
-            raise RuntimeError(
-                "The Never Outsource override file changed after this Purchase Review was created. No PDFs were created.\n\n"
-                "Regenerate Purchase Review before creating purchase orders."
+                "Product Master routing changed after this Purchase Review was created. No PDFs were created.\n\n"
+                + str(routing_status.get("reason", ""))
+                + "\n\nSelect Regenerate Purchase Review on the Purchase Orders page. Orchid will return you there when the refresh is complete."
             )
 
     if _clean(load_report_mode(workbook_path)).casefold() != _clean(manifest.get("report_mode", "")).casefold():
@@ -381,6 +557,7 @@ def verify_packet_lock(
         "source_quantity": sum(_canonical_quantity(row.get("Original Quantity", 0)) for row in ledger_map.values()),
         "never_outsource_violations": 0,
         "require_current_live_inputs": require_current_live_inputs,
+        "routing_status": routing_status,
     }
 
 

@@ -1,0 +1,10 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.51
+
+VERSION-IDENTITY REPAIR
+- Fixes the mislabeled 4.9.50 package: the app window, sidebar, About screen,
+  launcher, app bundle, and version file now all identify the installed build
+  consistently as 4.9.51.
+- Retains the 4.9.50 Tru-Spec purchasing-number repair, including the
+  color-specific Pro Vector, 24/7, and Agility product numbers.
+- No Test 2 data, report layouts, headers, receiving-report rules, or packet
+  storage behavior has changed.

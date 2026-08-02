@@ -1,0 +1,6 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.23
+
+- Keeps the entire outsourced decoration cover on one page: job details, location counts, color-by-color piece totals, special notes, and matching artwork stay together.
+- Uses a compact two-column color summary when a job uses several thread or ink colors, preserving the same clear totals without pushing artwork onto a second page.
+- Scales the artwork grid to the remaining cover space, then starts garment quantities on page 2.
+- Leaves the separate embroidery and screen-printing reports, uploaded artwork, vendor POs, and event reports unchanged.

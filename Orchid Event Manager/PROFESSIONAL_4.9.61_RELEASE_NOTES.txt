@@ -1,0 +1,9 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.61
+
+Georgia Boot 2XLR insole-size repair
+
+- Reads the Shopify footwear choice "2XLR 13-14" as the purchasing size 2XL.
+- Removes the shoe-fit range from garment color.
+- RKK0317 and the other permanent insole styles remain Boots: size required,
+  no color or decoration required, and Never Outsource.
+- Regenerating Purchase Review repairs an already-imported boot-sales event.

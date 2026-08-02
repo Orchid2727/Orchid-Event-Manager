@@ -1,0 +1,11 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.29
+
+CURRENT EVENT CLEANUP
+- Removed the decorative Import Orders icon above the active job name.
+- The current job name and uploaded logo now lead the page without an unused
+  symbol or extra vertical gap.
+- Import Shopify CSV, Add Orders CSV, Replace CSV, and all existing packet
+  actions remain available in their normal action area.
+
+No purchase-order, Purchase Review, Product Master, or report logic changed
+in this build.

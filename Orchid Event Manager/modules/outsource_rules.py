@@ -5,12 +5,16 @@ from typing import Any
 
 import pandas as pd
 
+from modules.purchase_rules import is_known_insole_style
+
 NEVER_OUTSOURCE_COLUMN = "Never Outsource"
 YES = "Yes"
 NO = "No"
 # Increment when a routing policy change requires existing Purchase Reviews to
 # be rebuilt before reports are generated.
-ROUTING_POLICY_VERSION = "3"
+# Version 4 adds permanent insole style recognition.  Existing reviews must be
+# rebuilt once so their no-color / never-outsource routing is refreshed.
+ROUTING_POLICY_VERSION = "4"
 
 # These vendors ship to Orchid for in-house handling rather than directly to an
 # outside decorator.  Include both the catalog name and its common short form
@@ -69,6 +73,25 @@ def is_bags_category(category: Any = "") -> bool:
     return clean(category).casefold() == "bags"
 
 
+def is_boots_category(category: Any = "") -> bool:
+    """Return True for Orchid's saved boots and footwear category."""
+    return clean(category).casefold() == "boots"
+
+
+def is_boots_product(product_name: Any = "", category: Any = "", style_number: Any = "") -> bool:
+    """Return True for a boot, boot accessory, or insole.
+
+    Category is checked first so saved Product Master records are decisive;
+    the title/style fallback protects a newly imported boot before setup.
+    """
+    if is_boots_category(category):
+        return True
+    if is_known_insole_style(style_number):
+        return True
+    text = f"{clean(product_name)} {clean(style_number)}".casefold()
+    return bool(re.search(r"\b(boot|boots|insole|insoles)\b", text))
+
+
 def default_never_outsource(product_name: Any = "", category: Any = "", style_number: Any = "") -> bool:
     """Return the Orchid shipping default for products that must stay in house."""
     return (
@@ -76,6 +99,7 @@ def default_never_outsource(product_name: Any = "", category: Any = "", style_nu
         or is_pants_jeans_shorts_category(category)
         or is_flame_resistant_category(category)
         or is_bags_category(category)
+        or is_boots_product(product_name, category, style_number)
     )
 
 
@@ -85,6 +109,10 @@ def resolve_never_outsource(
     category: Any = "",
     style_number: Any = "",
 ) -> bool:
+    # Boots are an Orchid-only purchasing category.  This intentionally
+    # outranks a stale explicit No saved by a build before the Boots policy.
+    if is_boots_product(product_name, category, style_number):
+        return True
     text = clean(value)
     if text:
         return normalize_bool(text, False)
@@ -99,7 +127,9 @@ def apply_never_outsource_defaults(frame: pd.DataFrame) -> pd.DataFrame:
         return result
     for index, row in result.iterrows():
         current = clean(row.get(NEVER_OUTSOURCE_COLUMN, ""))
-        if current:
+        if is_boots_product(row.get("Product Name", ""), row.get("Product Category", ""), row.get("Style Number", "")):
+            result.at[index, NEVER_OUTSOURCE_COLUMN] = YES
+        elif current:
             result.at[index, NEVER_OUTSOURCE_COLUMN] = YES if normalize_bool(current) else NO
         else:
             result.at[index, NEVER_OUTSOURCE_COLUMN] = YES if (
@@ -148,6 +178,8 @@ def apply_never_outsource_overrides(frame: pd.DataFrame, product_master_path) ->
         style = re.sub(r"\s+", "", clean(row.get("Style Number", ""))).upper()
         product = re.sub(r"\s+", " ", clean(row.get("Product Name", "")).casefold()).strip()
         key = f"style:{style}" if style else f"product:{product}"
-        if key in overrides:
+        if is_boots_product(row.get("Product Name", ""), row.get("Product Category", ""), row.get("Style Number", "")):
+            result.at[index, NEVER_OUTSOURCE_COLUMN] = YES
+        elif key in overrides:
             result.at[index, NEVER_OUTSOURCE_COLUMN] = YES if overrides[key] else NO
     return result

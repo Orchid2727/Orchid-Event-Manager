@@ -609,10 +609,6 @@ def _live_routes(
         include = clean(record.get("Include", "Yes")).casefold()
         if include not in {"yes", "y", "true", "1", "include"}:
             continue
-        if clean(record.get("Do Not Outsource", "No")).casefold() in {"yes", "y", "true", "1"}:
-            # This rare line-level exception is purchased manually and appears
-            # on the consolidated Non-Included Items internal document.
-            continue
         if _record_is_service_only(record):
             continue
         vendor = clean(record.get("Purchase Vendor", ""))

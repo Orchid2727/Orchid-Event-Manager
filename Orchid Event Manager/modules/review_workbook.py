@@ -52,7 +52,8 @@ from modules.product_resolver import load_extended_master, resolve_product
 from modules.purchase_rules import normalize_bool, row_rules
 from modules.internal_services import (
     HEMMING_ALTERATION_LABEL, SEW_ON_PATCH_LABEL,
-    decoration_charge_label, is_in_house_decoration, is_in_house_service_product, is_internal_service_style,
+    decoration_charge_label, is_final_sale_accounting_product,
+    is_in_house_decoration, is_in_house_service_product, is_internal_service_style,
 )
 from modules.report_modes import GENERAL_SALES_PERIOD, UNIFORM_SIZING_EVENT, normalize_report_mode
 from modules.decoration_fulfillment import (
@@ -63,8 +64,13 @@ from modules.packet_lock import assert_live_product_master, create_packet_lock
 from modules.source_identity import manual_entry_correction_signature, strict_legacy_signature
 from modules.outsource_rules import (
     ROUTING_POLICY_VERSION,
+    is_boots_product,
     resolve_never_outsource,
     vendor_never_outsource,
+)
+from modules.purchase_vendor_rules import (
+    INTERNAL_VENDOR_REVIEW_REASON,
+    is_internal_purchase_vendor,
 )
 from modules.decoration_inference import (
     count_unique_decisions,
@@ -104,6 +110,7 @@ PERMANENT_GAP_LABELS = {
     "missing decoration type",
     "missing decoration color",
     "product master setup required",
+    INTERNAL_VENDOR_REVIEW_REASON.casefold(),
 }
 EVENT_GAP_LABELS = {
     "missing product number",
@@ -212,6 +219,7 @@ ALL_COLUMNS = [
     "Decoration Placement Instructions",
     "Decoration Color",
     "Product #",
+    "Vendor Product #",
     "Description",
     "Garment Color",
     "Size",
@@ -395,6 +403,32 @@ def _mandatory_note_review_flags(
     return flags
 
 
+def _boolean_mask(values: object, index: pd.Index) -> pd.Series:
+    """Return a real boolean mask, including for an empty StringDtype Series.
+
+    pandas 3 preserves StringDtype for some empty ``map``/``apply`` results.
+    Bitwise mask operations on those empty string arrays raise instead of
+    producing an empty boolean result.  Purchase Review must still build an
+    Employee Totals workbook for an event containing only a Final Sale Boot or
+    other non-purchase line, so normalize every dynamic mask explicitly.
+    """
+    if isinstance(values, pd.Series):
+        values = values.reindex(index).tolist()
+    elif values is None:
+        values = []
+    else:
+        values = list(values)
+    normalized: list[bool] = []
+    for value in values:
+        try:
+            normalized.append(False if pd.isna(value) else bool(value))
+        except (TypeError, ValueError):
+            normalized.append(False)
+    if len(normalized) < len(index):
+        normalized.extend([False] * (len(index) - len(normalized)))
+    return pd.Series(normalized[:len(index)], index=index, dtype=bool)
+
+
 def _sheet_name(value: str) -> str:
     value = re.sub(r"[\\/*?:\[\]]+", "-", clean_text(value))
     return (value or "Unassigned")[:31]
@@ -545,7 +579,7 @@ def _build_review_data(
     merged = apply_routing_overrides(merged)
     for column in [
         "Vendor", "Decoration Type", "Decoration Location", "Decoration Placement Instructions", "Decoration Color", "Product Name",
-        "Style Number", "Garment Color", "Size", "Master Match",
+        "Style Number", "Vendor Product #", "Garment Color", "Size", "Master Match",
         "Parser Source", "Parse Confidence", "Detected Vendor", "Resolver Issue",
         "Product Category", "Product Aliases", "Requires Size", "Requires Color", "Requires Decoration", "Never Outsource",
         "Decoration Source",
@@ -588,21 +622,40 @@ def _build_review_data(
     # embroidery routes. Preserve any saved Product Master placement and fill a
     # missing legacy placement with Left Chest. An explicit contradictory order
     # note (for example, "Do not embroider CT100615") is still reviewed below.
-    always_embroidery_mask = merged["Style Number"].map(always_embroidery_rain_style)
+    always_embroidery_mask = _boolean_mask(
+        merged["Style Number"].map(always_embroidery_rain_style), merged.index
+    )
     if always_embroidery_mask.any():
         merged.loc[always_embroidery_mask, "Decoration Type"] = "Embroidery"
-        missing_location = always_embroidery_mask & merged["Decoration Location"].map(lambda value: not clean_text(value))
+        missing_location = always_embroidery_mask & _boolean_mask(
+            merged["Decoration Location"].map(lambda value: not clean_text(value)), merged.index
+        )
         merged.loc[missing_location, "Decoration Location"] = LEFT_CHEST
         merged.loc[always_embroidery_mask, "Requires Decoration"] = "Yes"
 
     allow_decoration_prompts = decoration_note_prompts_enabled(report_mode, decoration_fulfillment)
-    merged["_Mandatory Note Review"] = _mandatory_note_review_flags(
-        merged, allow_decoration_prompts=allow_decoration_prompts
+    merged["_Mandatory Note Review"] = _boolean_mask(
+        _mandatory_note_review_flags(merged, allow_decoration_prompts=allow_decoration_prompts),
+        merged.index,
     )
     outsourced_sizing_event = waterproof_decoration_prompts_enabled(
         report_mode, decoration_fulfillment
     )
-    forced_waterproof_style_mask = merged["Style Number"].map(waterproof_style_requires_review)
+    # A boot may truthfully contain the word "Waterproof" (for example Georgia
+    # Boot Muddog G5594), but boots are never decorated. Exclude the permanent
+    # Boots category before evaluating rainwear decoration prompts.
+    boots_mask = _boolean_mask(
+        merged.apply(
+            lambda row: is_boots_product(
+                row.get("Product Name", ""), row.get("Product Category", ""), row.get("Style Number", "")
+            ),
+            axis=1,
+        ),
+        merged.index,
+    )
+    forced_waterproof_style_mask = _boolean_mask(
+        merged["Style Number"].map(waterproof_style_requires_review), merged.index
+    ) & ~boots_mask
     if outsourced_sizing_event:
         waterproof_context = merged.apply(
             lambda row: " ".join(filter(None, [
@@ -616,14 +669,21 @@ def _build_review_data(
         )
         merged["_Waterproof Decoration Review"] = (
             forced_waterproof_style_mask
-            | (waterproof_context.map(waterproof_apparel_requires_review) & ~always_embroidery_mask)
+            | (
+                _boolean_mask(
+                    waterproof_context.map(waterproof_apparel_requires_review), merged.index
+                )
+                & ~always_embroidery_mask
+                & ~boots_mask
+            )
         )
     else:
         # These exact waterproof styles are always reviewed, even in Standard
         # Orchid Workflow and general sales reports.
         merged["_Waterproof Decoration Review"] = forced_waterproof_style_mask
     merged["_Mandatory Note Review"] = (
-        merged["_Mandatory Note Review"] | merged["_Waterproof Decoration Review"]
+        _boolean_mask(merged["_Mandatory Note Review"], merged.index)
+        | _boolean_mask(merged["_Waterproof Decoration Review"], merged.index)
     )
 
     rows = []
@@ -663,12 +723,13 @@ def _build_review_data(
             deco_location_raw, deco_type, requires_decoration=requires_decoration,
             product_name=description, category=row.get("Product Category", ""),
         )
-        # When Product Master says color is not required, do not carry a parsed
-        # waist/size fragment (for example 58 from 58x34) as a garment color.
-        # This also keeps pants/jeans/bibs from generating false review decisions.
-        if not requires_color:
-            color = ""
-            row["Garment Color"] = ""
+        # "Color is not required" means a blank Shopify color must not block
+        # purchasing.  It does *not* mean a valid color selected by the
+        # customer should be discarded.  This distinction is essential for
+        # boots: some styles have no color option, while A64CQ, for example,
+        # must keep Black Full Grain and Medium Brown Full Grain on separate
+        # PO lines.  Shopify variant parsing already prevents size/width text
+        # from reaching this field as a false color.
         if not requires_decoration and not deco_type:
             deco_type = BLANK_DECORATION_LABEL
             row["Decoration Type"] = deco_type
@@ -689,6 +750,10 @@ def _build_review_data(
             reasons.append("Missing size")
         if not vendor:
             reasons.append("Missing purchase vendor")
+        elif is_internal_purchase_vendor(vendor):
+            # “Orchid Uniforms & Apparel” is where these non-outsourced boots
+            # will be received. It is not the supplier they are ordered from.
+            reasons.append(INTERNAL_VENDOR_REVIEW_REASON)
         if requires_decoration and not deco_type:
             reasons.append("Missing decoration type")
         if requires_decoration and deco_type and not is_blank_decoration(deco_type) and not is_in_house_decoration(deco_type) and not deco_color:
@@ -749,6 +814,7 @@ def _build_review_data(
             "Decoration Placement Instructions": placement_instructions,
             "Decoration Color": deco_color,
             "Product #": style,
+            "Vendor Product #": clean_text(row.get("Vendor Product #", "")),
             "Description": description,
             "Garment Color": color,
             "Size": size,
@@ -831,18 +897,33 @@ def _revalidate_detail(
     if detail.empty:
         return detail.copy()
     result = detail.copy()
-    scoped_note_flags = _mandatory_note_review_flags(
-        result, allow_decoration_prompts=allow_decoration_prompts
+    scoped_note_flags = _boolean_mask(
+        _mandatory_note_review_flags(result, allow_decoration_prompts=allow_decoration_prompts),
+        result.index,
     )
     # Known waterproof styles always require an explicit decoration decision,
     # regardless of workflow mode. This is an event-level confirmation and does
     # not change the permanent Product Master decoration default.
-    waterproof_style_mask = result.apply(
-        lambda row: waterproof_style_requires_review(
-            row.get("Product #", row.get("Style Number", ""))
+    boots_mask = _boolean_mask(
+        result.apply(
+            lambda row: is_boots_product(
+                row.get("Description", row.get("Product Name", "")),
+                row.get("Product Category", ""),
+                row.get("Product #", row.get("Style Number", "")),
+            ),
+            axis=1,
         ),
-        axis=1,
+        result.index,
     )
+    waterproof_style_mask = _boolean_mask(
+        result.apply(
+            lambda row: waterproof_style_requires_review(
+                row.get("Product #", row.get("Style Number", ""))
+            ),
+            axis=1,
+        ),
+        result.index,
+    ) & ~boots_mask
     scoped_note_flags = scoped_note_flags | waterproof_style_mask
     if allow_waterproof_prompts:
         waterproof_context = result.apply(
@@ -855,15 +936,21 @@ def _revalidate_detail(
             ])),
             axis=1,
         )
-        permanent_embroidery_mask = result.apply(
-            lambda row: always_embroidery_rain_style(
-                row.get("Product #", row.get("Style Number", ""))
+        permanent_embroidery_mask = _boolean_mask(
+            result.apply(
+                lambda row: always_embroidery_rain_style(
+                    row.get("Product #", row.get("Style Number", ""))
+                ),
+                axis=1,
             ),
-            axis=1,
+            result.index,
         )
         scoped_note_flags = scoped_note_flags | (
-            waterproof_context.map(waterproof_apparel_requires_review)
+            _boolean_mask(
+                waterproof_context.map(waterproof_apparel_requires_review), result.index
+            )
             & ~permanent_embroidery_mask
+            & ~boots_mask
         )
     for index, row in result.iterrows():
         style = clean_text(row.get("Product #", ""))
@@ -899,8 +986,9 @@ def _revalidate_detail(
             deco_location_raw, deco_type, requires_decoration=requires_decoration,
             product_name=description, category=row.get("Product Category", ""),
         )
-        if not requires_color:
-            color = ""
+        # Optional color values remain visible and continue to separate
+        # purchasing rows.  Only the *requirement* is optional here; do not
+        # erase an actual Shopify color selection.
         if not requires_decoration and not deco_type:
             deco_type = BLANK_DECORATION_LABEL
             deco_color = ""
@@ -937,11 +1025,13 @@ def _revalidate_detail(
         raw_note = clean_text(row.get("Shopify Order Notes", ""))
         line_note = clean_text(row.get("Shopify Line Notes", ""))
         purchase_instructions = clean_text(row.get("Purchase Instructions", "")) or combine_purchase_instructions(raw_note, line_note)
-        forced_waterproof_style = waterproof_style_number(style)
+        is_boots = is_boots_product(description, row.get("Product Category", ""), style)
+        forced_waterproof_style = "" if is_boots else waterproof_style_number(style)
         waterproof_decoration_review = bool(
             forced_waterproof_style
             or (
                 allow_waterproof_prompts
+                and not is_boots
                 and not always_embroidery_rain_style(style)
                 and waterproof_apparel_requires_review(" ".join(filter(None, [
                     description, clean_text(row.get("Original Shopify Line", "")),
@@ -1084,6 +1174,21 @@ def _apply_previous_review_edits(
         if re.search(r"\b[2-8]X(?:L)?\s+TL\b", clean_text(row.get("Original Shopify Line", "")), re.I)
         and normalize_size(row.get("Size", "")).endswith("XLT")
     }
+    # A regenerated event must also replace a stale shoe-width value from an
+    # older Review & Edit sheet. Earlier builds could retain ``Regular`` as
+    # the Size for Shopify's ``11 / Regular`` boot option. The current parser
+    # now has the authoritative *size and width* in the fresh source line, so
+    # never replay an old Size or Garment Color over that repair.
+    repaired_footwear_indexes = {
+        index
+        for index, row in result.iterrows()
+        if bool(re.fullmatch(
+            r"(?:[4-9]|1[0-6])(?:\.5)?\s*/\s*"
+            r"(?:medium|narrow|wide|extra wide|ee|eee)",
+            normalize_size(row.get("Size", "")),
+            re.I,
+        ))
+    }
     previously_ready_indexes: set[object] = set()
     explicit_do_not_outsource_indexes: set[object] = set()
 
@@ -1147,7 +1252,7 @@ def _apply_previous_review_edits(
         for field in fields:
             if field not in edit:
                 continue
-            if index in repaired_tall_indexes and field in {"Garment Color", "Size"}:
+            if index in (repaired_tall_indexes | repaired_footwear_indexes) and field in {"Garment Color", "Size"}:
                 continue
             # A regenerated workbook must pick up a corrected Product Master
             # description.  Review & Edit contains the original value for
@@ -1437,6 +1542,7 @@ def generate_review_workbook(
     reports_root: Path,
     report_mode: str = GENERAL_SALES_PERIOD,
     event_name: str = "",
+    active_packet_id: str = "",
     decoration_fulfillment: str = STANDARD_ORCHID_WORKFLOW,
     regenerate_helper: Path | None = None,
     previous_review_path: Path | None = None,
@@ -2368,6 +2474,15 @@ def generate_review_workbook(
             and pd.to_numeric(row.get("Quantity", 0), errors="coerce") > 0
             and _employee_order_key(row.get("Order Number", ""))
         }
+        # Final Sale Boot is a stock-sale accounting line, not a purchase line.
+        # It must still remain in Employee Totals so the $50 is visible for the
+        # employee/event budget even when an order contains no other item.
+        included_employee_order_keys.update({
+            _employee_order_key(row.get("Name", ""))
+            for _, row in raw.iterrows()
+            if is_final_sale_accounting_product(row.get("Lineitem name", ""))
+            and _employee_order_key(row.get("Name", ""))
+        })
         employee_totals = _build_employee_totals(raw, included_employee_order_keys)
         employee_ws = _write_dataframe_sheet(
             workbook,
@@ -2524,20 +2639,25 @@ def generate_review_workbook(
     system_info.write(8, 1, report_mode)
     system_info.write(9, 0, "Event Name")
     system_info.write(9, 1, event_name)
-    system_info.write(10, 0, "Packet Lock ID")
-    system_info.write(10, 1, str(packet_lock.get("lock_id", "")))
-    system_info.write(11, 0, "Packet Lock Manifest Path")
-    system_info.write(11, 1, str(packet_lock.get("manifest_path", "")))
-    system_info.write(12, 0, "Packet Lock Manifest SHA256")
-    system_info.write(12, 1, str(packet_lock.get("manifest_sha256", "")))
-    system_info.write(13, 0, "Locked Source Lines")
-    system_info.write(13, 1, int(packet_lock.get("source_line_count", 0)))
-    system_info.write(14, 0, "Locked Source Quantity")
-    system_info.write(14, 1, int(packet_lock.get("source_quantity", 0)))
-    system_info.write(15, 0, "Product Master Routing SHA256")
-    system_info.write(15, 1, str(master_signature.get("routing_sha256", "")))
-    system_info.write(16, 0, "Never Outsource Override SHA256")
-    system_info.write(16, 1, str(master_signature.get("override_sha256", "")))
+    # The source hash proves which CSV was used.  The event ID additionally
+    # proves which *event instance* owns this review, so a workbook from an
+    # earlier run of the same-named event cannot be reopened as the current one.
+    system_info.write(10, 0, "Active Packet ID")
+    system_info.write(10, 1, clean_text(active_packet_id))
+    system_info.write(11, 0, "Packet Lock ID")
+    system_info.write(11, 1, str(packet_lock.get("lock_id", "")))
+    system_info.write(12, 0, "Packet Lock Manifest Path")
+    system_info.write(12, 1, str(packet_lock.get("manifest_path", "")))
+    system_info.write(13, 0, "Packet Lock Manifest SHA256")
+    system_info.write(13, 1, str(packet_lock.get("manifest_sha256", "")))
+    system_info.write(14, 0, "Locked Source Lines")
+    system_info.write(14, 1, int(packet_lock.get("source_line_count", 0)))
+    system_info.write(15, 0, "Locked Source Quantity")
+    system_info.write(15, 1, int(packet_lock.get("source_quantity", 0)))
+    system_info.write(16, 0, "Product Master Routing SHA256")
+    system_info.write(16, 1, str(master_signature.get("routing_sha256", "")))
+    system_info.write(17, 0, "Never Outsource Override SHA256")
+    system_info.write(17, 1, str(master_signature.get("override_sha256", "")))
     system_info.hide()
 
     workbook.close()
@@ -2547,6 +2667,7 @@ def generate_review_workbook(
             "source_csv": str(Path(shopify_csv_path).expanduser().resolve()),
             "report_mode": report_mode,
             "event_name": event_name,
+            "active_packet_id": clean_text(active_packet_id),
             "decoration_fulfillment": decoration_fulfillment,
             "previous_workbook": str(output_path.resolve()),
             "created_at": now.isoformat(),

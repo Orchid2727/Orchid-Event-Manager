@@ -1,0 +1,9 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.24
+
+- In-House Receiving & Decoration Report now labels every vendor section with
+  its saved PO number, such as “Berne Apparel - PO # Berne Line 2026.”
+- Replaces the internal “MANUAL / NON-INCLUDED” heading label with the vendor's
+  real saved PO number. Manual receiving vendors now appear in PO-number
+  assignment so every receiving section can be identified correctly.
+- Moves the Received checkbox column to the far left, immediately before
+  Product #, while preserving the wide Notes / Instructions column.

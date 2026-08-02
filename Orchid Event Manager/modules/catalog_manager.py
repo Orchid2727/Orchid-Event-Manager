@@ -15,9 +15,10 @@ from modules.blank_garment_rules import (
 )
 from modules.paths import backups_dir, seed_product_master_path
 from modules.outsource_rules import apply_never_outsource_defaults
-from modules.purchase_rules import category_defaults, infer_category
+from modules.purchase_rules import apply_purchase_rule_defaults, category_defaults, infer_category
 from modules.product_intelligence import apply_product_intelligence
 from modules.product_resolver import MASTER_COLUMNS as COLUMNS, default_product_id, ensure_master_columns
+from modules.internal_services import is_in_house_service_product, is_phantom_product_label
 
 
 def clean_text(value) -> str:
@@ -54,6 +55,20 @@ def clean_master(master: pd.DataFrame) -> pd.DataFrame:
     master["Product Name"] = master["Product Name"].map(canonical_product_name)
     master["Style Number"] = master["Style Number"].map(normalize_style)
     master["Garment Color"] = master["Garment Color"].map(normalize_space)
+    # Keep the Settings-page cleanup consistent with the Product Master editor.
+    # Otherwise an old service charge could disappear when Product Master opens
+    # but return if the catalog was later cleaned from Settings.
+    internal_mask = master.apply(
+        lambda row: is_in_house_service_product(
+            row.get("Product Name", ""),
+            decoration_type=row.get("Decoration Type", ""),
+            style_number=row.get("Style Number", ""),
+            garment_color=row.get("Garment Color", ""),
+        ) or is_phantom_product_label(row.get("Product Name", ""))
+          or is_phantom_product_label(row.get("Style Number", "")),
+        axis=1,
+    )
+    master = master.loc[~internal_mask].copy()
 
     def key(row):
         style = normalize_style(row["Style Number"])
@@ -106,7 +121,16 @@ def clean_master(master: pd.DataFrame) -> pd.DataFrame:
         if style in KNOWN_BLANK_GARMENT_STYLES and not clean_text(row.get("Garment Color", "")):
             result.at[index, "Requires Color"] = "No"
 
-    result = apply_never_outsource_defaults(apply_product_intelligence(apply_blank_garment_defaults(result)))
+    # Apply permanent purchasing rules before saving the cleaned Product Master.
+    # This ensures a known insole is repaired to Boots / no color / no
+    # decoration even when the record was created in an older app version.
+    result = apply_never_outsource_defaults(
+        apply_product_intelligence(
+            apply_purchase_rule_defaults(
+                apply_blank_garment_defaults(result)
+            )
+        )
+    )
     if result.empty:
         return result
     return result.sort_values(

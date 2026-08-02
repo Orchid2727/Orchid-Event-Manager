@@ -1,0 +1,8 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.93
+===============================================
+
+Product Master workspace polish
+-------------------------------
+- The purchasing-color workspace now extends all the way down to the Save bar.
+- Removed the unused blank strip below the color mappings.
+- No Product Master fields, purchasing-color mappings, aliases, or reports changed.

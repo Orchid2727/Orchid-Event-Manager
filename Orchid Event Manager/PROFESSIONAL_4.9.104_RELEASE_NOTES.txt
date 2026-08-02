@@ -1,0 +1,18 @@
+Orchid Purchase Manager Professional 4.9.104
+
+Product Master setup navigation
+
+- Makes Needs Setup a direct dashboard action. Click its count to open only
+  unfinished products.
+- Adds a clear Set Up Next button beside the Product Catalog search and in the
+  editor filter bar.
+- Keeps each product's exact missing-field guidance visible while it is open.
+
+Report name
+
+- Renames Non-Included Items Purchase Order to Ship to Orchid Purchase Order
+  in the PDF, Purchase Orders list, report summary, and dashboard action.
+- Existing older Non-Included purchase-order files remain discoverable.
+
+Purchasing rules, Product Master routing, Purchase As Style # behavior, and
+all existing vendor/color safeguards are unchanged.

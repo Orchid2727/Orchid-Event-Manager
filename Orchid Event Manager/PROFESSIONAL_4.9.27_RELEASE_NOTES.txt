@@ -1,0 +1,9 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.27
+
+- Vendor purchase orders now keep the full Quantity column heading on one line.
+- The Quantity column is wider, while Employee / Order remains a practical trace
+  column for the customer, employee, and order reference.
+- No purchasing routes, item quantities, report sections, or outsourced-report
+  layouts were changed.
+- Application title, sidebar, About panel, app bundle, launcher, and bootstrap
+  identify the installed build as 4.9.27.

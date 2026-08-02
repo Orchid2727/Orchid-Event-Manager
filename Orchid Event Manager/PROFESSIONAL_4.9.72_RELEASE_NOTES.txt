@@ -1,0 +1,8 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.72
+
+Product Master reliability repair
+
+- Removes the nested macOS Product Master app handoff that repeatedly left the dashboard on “Opening Product Master…”.
+- Opens Product Master directly with the same ready-to-run Orchid Python runtime as the dashboard.
+- Safely repairs legacy Product Master files that are missing Garment Color before the editor starts.
+- Does not alter the current event, Purchase Review, reports, or saved product rules merely by opening Product Master.

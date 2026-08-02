@@ -1,0 +1,7 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.19
+
+- Replaces the hard-to-read Logo-page segmented control with two clear department tabs.
+- Embroidery uses a dark Orchid-purple active tab with white lettering.
+- Screen Printing uses a dark navy-blue active tab with white lettering.
+- Inactive tabs remain visibly distinct: light lavender for Embroidery and light blue for Screen Printing.
+- Keeps department-specific artwork, locations, and report generation unchanged.

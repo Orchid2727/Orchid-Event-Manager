@@ -1,0 +1,15 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.65
+
+PRODUCT MASTER SPEED UPDATE
+
+- Search and filtering use a prepared catalog index instead of rescanning every
+  saved product and rebuilding its search text for each typed character.
+- Product cards refresh after a short typing pause, keeping the editor responsive
+  while searching large Product Masters.
+- A normal save now cleans only the product style being edited, then reopens the
+  live CSV to verify the saved result. Full-catalog cleanup remains in place for
+  catalog-wide operations such as deleting a product.
+- Carries forward the Boots safeguard: the final purchasing-color row says Clear
+  and removes a mistaken shoe size without deleting the boot product record.
+
+NO PRODUCT MASTER, PURCHASE REVIEW, OR REPORT REWORK IS REQUIRED.

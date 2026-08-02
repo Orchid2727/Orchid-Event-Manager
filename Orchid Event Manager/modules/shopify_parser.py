@@ -6,7 +6,13 @@ import pandas as pd
 
 from modules.routing_rules import apply_parsed_product_overrides
 from modules.smart_parser import load_master_index, parse_manual_custom_item
-from modules.internal_services import infer_in_house_decoration, is_decoration_charge, is_internal_service_style
+from modules.internal_services import (
+    infer_in_house_decoration,
+    is_decoration_charge,
+    is_final_sale_accounting_product,
+    is_internal_service_style,
+    is_phantom_product_label,
+)
 from modules.source_identity import build_source_id, source_base_signature
 
 SIZE_ALIASES = {
@@ -56,10 +62,127 @@ PRODUCT_WORDS = {
 
 PLACEHOLDER_VARIANT_VALUES = {"temp", "temporary", "tbd", "placeholder", "default title"}
 
+# Georgia Boot insoles (and similar footwear accessories) use one Shopify
+# option such as ``XL 11-12 1/2``.  The first part is the insole's actual
+# purchase size; the numeric range is only a shopper-facing shoe-fit guide.
+# It must never become a garment color or replace the selected size.
+_SHOE_FIT_NUMBER = r"\d{1,2}(?:\.\d+|\s+\d/\d)?"
+_SHOE_FIT_RANGE = rf"{_SHOE_FIT_NUMBER}\s*(?:-|–|—|to)\s*{_SHOE_FIT_NUMBER}"
+_SHOE_FIT_RANGE_ONLY = re.compile(rf"^\s*{_SHOE_FIT_RANGE}\s*$", re.I)
+_SHOE_FIT_SIZE_VARIANT = re.compile(
+    rf"^\s*(?P<size>2XLR|2XL|2X|XXL|XL|X-LARGE|XLARGE|LARGE|LR|L|MEDIUM|MED|ME|M|SMALL|S)"
+    rf"\s*(?:[-–—:]\s*|\(\s*)?{_SHOE_FIT_RANGE}\s*\)?\s*$",
+    re.I,
+)
+
+# Finished boots use a different Shopify pattern than insoles: the selected
+# shoe size and width are separate values, for example ``11 / Regular``. Both
+# values are required to order the correct boot.  Width is not a garment color,
+# but it must travel with the size into Purchase Review and every PO.
+_FOOTWEAR_SHOE_SIZE = re.compile(r"^(?:[4-9]|1[0-6])(?:\.5)?$", re.I)
+_FOOTWEAR_WIDTHS = {
+    "REGULAR", "REG", "MEDIUM", "M", "NARROW", "N", "WIDE", "W",
+    "XWIDE", "X-WIDE", "EXTRA WIDE", "EE", "EEE",
+}
+_FOOTWEAR_WIDTH_DISPLAY = {
+    "REGULAR": "Medium", "REG": "Medium", "MEDIUM": "Medium", "M": "Medium",
+    "NARROW": "Narrow", "N": "Narrow",
+    "WIDE": "Wide", "W": "Wide",
+    "XWIDE": "Extra Wide", "X-WIDE": "Extra Wide", "EXTRA WIDE": "Extra Wide",
+    "EE": "EE", "EEE": "EEE",
+}
+
+# Shopify exports do not carry the option labels ("Color", "Size", etc.) in
+# every format.  A standalone number, Tall marker, or footwear-width value can
+# therefore fall through the generic option parser and become a fake color.
+# These are deliberately narrow *value* rules: they protect genuine color names
+# while making the common uniform and footwear sizing formats impossible to save
+# as a Purchasing Color.
+_NUMERIC_APPAREL_SIZE = re.compile(
+    r"^(?:SIZE\s*)?(?P<number>00|0|[1-9]|[1-5]\d|6[0-4])"
+    r"(?:\s*(?P<fit>P|PETITE|R|REG|REGULAR|T|TL|TALL|W))?$",
+    re.I,
+)
+_SIZE_ONLY_MARKERS = {"T", "TL", "TALL", "REGULAR", "REG", "PETITE", "P"}
+
 
 def valid_variant_value(value: object) -> str:
     cleaned = clean(value)
     return "" if cleaned.casefold() in PLACEHOLDER_VARIANT_VALUES else cleaned
+
+
+def shoe_fit_size_variant(value: object) -> str:
+    """Return the selected size from a Shopify shoe-fit option, if present.
+
+    For example, ``XL 11-12 1/2`` means size ``XL``.  The 11-12 1/2 text is
+    guidance for choosing an insole and is not a product color.
+    """
+    match = _SHOE_FIT_SIZE_VARIANT.fullmatch(valid_variant_value(value))
+    if not match:
+        return ""
+    selected_size = match.group("size")
+    # Georgia Boot uses ``ME`` for Medium, ``LR`` for Large, and ``2XLR`` for
+    # 2XL Regular in its combined footwear-option format. Keep those
+    # vendor-specific shorthands local to shoe-fit parsing; they must not
+    # become universal apparel size aliases.
+    return {"ME": "M", "LR": "L", "2XLR": "2XL"}.get(
+        selected_size.upper(), normalize_size(selected_size)
+    )
+
+
+def is_shoe_fit_range(value: object) -> bool:
+    """True when a value is only a shopper-facing shoe-size range."""
+    return bool(_SHOE_FIT_RANGE_ONLY.fullmatch(valid_variant_value(value)))
+
+
+def has_shoe_fit_size_variant(*values: object) -> bool:
+    """Whether any supplied Shopify option is a combined size/fit-range value."""
+    return any(shoe_fit_size_variant(value) for value in values)
+
+
+def _footwear_tokens(value: object) -> list[str]:
+    """Return the meaningful pieces of a Shopify footwear option/title."""
+    cleaned = valid_variant_value(value)
+    return [piece for piece in (clean(part) for part in cleaned.split("/")) if piece]
+
+
+def _is_footwear_width(value: object) -> bool:
+    return clean(value).upper() in _FOOTWEAR_WIDTHS
+
+
+def _is_footwear_shoe_size(value: object) -> bool:
+    return bool(_FOOTWEAR_SHOE_SIZE.fullmatch(clean(value)))
+
+
+def _footwear_width_display(value: object) -> str:
+    """Return the supplier-facing width label for a boot option."""
+    return _FOOTWEAR_WIDTH_DISPLAY.get(clean(value).upper(), "")
+
+
+def footwear_size_width_variant(*values: object) -> str:
+    """Return a numeric boot size when Shopify pairs it with a boot width.
+
+    ``11 / Regular`` and ``10.5 / Wide`` are footwear options, not a color
+    followed by an apparel size.  Requiring both a valid shoe size *and* a
+    width keeps a standalone number from being misread elsewhere in Shopify.
+    """
+    tokens = [token for value in values for token in _footwear_tokens(value)]
+    has_width = any(_is_footwear_width(token) for token in tokens)
+    shoe_size = next((token for token in tokens if _is_footwear_shoe_size(token)), "")
+    return shoe_size if has_width and shoe_size else ""
+
+
+def footwear_size_with_width_variant(*values: object) -> str:
+    """Return an orderable finished-boot size, including its required width."""
+    tokens = [token for value in values for token in _footwear_tokens(value)]
+    shoe_size = next((token for token in tokens if _is_footwear_shoe_size(token)), "")
+    width = next((_footwear_width_display(token) for token in tokens if _is_footwear_width(token)), "")
+    return f"{shoe_size} / {width}" if shoe_size and width else ""
+
+
+def has_footwear_size_variant(*values: object) -> bool:
+    """Whether Shopify options contain either an insole or boot-size selection."""
+    return bool(footwear_size_with_width_variant(*values) or has_shoe_fit_size_variant(*values))
 
 
 def extract_variant_color_size(option_1: object, option_2: object, option_3: object, variant_title: object) -> tuple[str, str]:
@@ -68,30 +191,67 @@ def extract_variant_color_size(option_1: object, option_2: object, option_3: obj
     color = ""
     size = ""
 
+    boot_size = footwear_size_with_width_variant(*options, variant_title)
+    if boot_size:
+        # Keep a genuine color if Shopify supplied one as a separate option,
+        # but never store the numeric shoe size or its width as a color.
+        size = boot_size
+        for value in options:
+            if (
+                not _is_footwear_shoe_size(value)
+                and not _is_footwear_width(value)
+                and is_purchasing_color(value)
+            ):
+                color = value
+                break
+
     # Waist and inseam may be stored as adjacent option values.
-    if len(options) >= 3 and re.fullmatch(r"\d{2}", options[1]) and re.fullmatch(r"\d{2}|UH", options[2], re.I):
+    if not size and len(options) >= 3 and re.fullmatch(r"\d{2}", options[1]) and re.fullmatch(r"\d{2}|UH", options[2], re.I):
         color = options[0]
         size = f"{options[1]}x{options[2]}" if options[2].upper() != "UH" else f"{options[1]}/UH"
-    else:
+    elif not size:
         for value in options:
-            if not size and is_size(value):
+            shoe_fit_size = shoe_fit_size_variant(value)
+            if shoe_fit_size:
+                if not size:
+                    size = shoe_fit_size
+            elif not size and is_size(value):
                 size = normalize_size(value)
+            elif not is_purchasing_color(value):
+                # A size marker without its paired size (for example, ``TL``)
+                # is not enough to invent a Size value, but it must never be
+                # allowed to become a Purchasing Color.
+                continue
             elif not color:
                 color = value
 
     title = valid_variant_value(variant_title)
     if title and (not color or not size):
-        pieces = [valid_variant_value(piece) for piece in title.split("/")]
-        pieces = [piece for piece in pieces if piece]
-        size_positions = [index for index, piece in enumerate(pieces) if is_size(piece)]
-        if size_positions and not size:
-            size = normalize_size(pieces[size_positions[0]])
-        if not color:
-            non_sizes = [piece for piece in pieces if not is_size(piece)]
-            if non_sizes:
-                color = " / ".join(non_sizes)
+        title_boot_size = footwear_size_with_width_variant(title)
+        shoe_fit_size = shoe_fit_size_variant(title)
+        if title_boot_size:
+            # ``11 / Regular`` has already supplied the shoe size above. Do
+            # not let the generic slash-title fallback turn it into a color.
+            if not size:
+                size = title_boot_size
+        elif shoe_fit_size:
+            if not size:
+                size = shoe_fit_size
+        else:
+            pieces = [valid_variant_value(piece) for piece in title.split("/")]
+            pieces = [piece for piece in pieces if piece]
+            size_positions = [index for index, piece in enumerate(pieces) if is_size(piece)]
+            if size_positions and not size:
+                size = normalize_size(pieces[size_positions[0]])
+            if not color:
+                non_sizes = [
+                    piece for piece in pieces
+                    if not is_size(piece) and is_purchasing_color(piece)
+                ]
+                if non_sizes:
+                    color = " / ".join(non_sizes)
 
-    return valid_variant_value(color), normalize_size(size)
+    return (valid_variant_value(color) if is_purchasing_color(color) else ""), normalize_size(size)
 
 
 def clean(value) -> str:
@@ -127,6 +287,16 @@ def normalize_size(value) -> str:
         waist, inseam = int(compact[:2]), int(compact[2:])
         if 24 <= waist <= 60 and 24 <= inseam <= 40:
             return f"{waist}x{inseam}"
+    numeric_match = _NUMERIC_APPAREL_SIZE.fullmatch(upper)
+    if numeric_match:
+        number = numeric_match.group("number")
+        fit = (numeric_match.group("fit") or "").upper()
+        suffix = {
+            "T": "T", "TL": "T", "TALL": "T",
+            "W": "W", "P": "P", "PETITE": "P",
+            "R": "", "REG": "", "REGULAR": "",
+        }.get(fit, "")
+        return f"{number}{suffix}"
     return raw
 
 
@@ -135,9 +305,47 @@ def is_size(value) -> bool:
     if normalized.upper() in set(SIZE_ALIASES.values()):
         return True
     return bool(
+        _NUMERIC_APPAREL_SIZE.fullmatch(clean(value))
+        or _FOOTWEAR_SHOE_SIZE.fullmatch(clean(value))
+        or bool(footwear_size_with_width_variant(clean(value)))
+        or
         re.fullmatch(r"\d{2}x\d{2}", normalized, re.I)
         or re.fullmatch(r"\d{2}/UH", normalized, re.I)
     )
+
+
+def is_purchasing_color(value: object) -> bool:
+    """Return whether a Shopify variant value may be stored as a color.
+
+    A false result never guesses at a color.  If the value is a recognized
+    size, the caller can still place it in Size; a lone fit marker simply stays
+    out of both fields so Purchase Review can request the real missing value.
+    """
+    cleaned = valid_variant_value(value)
+    if not cleaned:
+        return False
+    upper = cleaned.upper()
+    return not (
+        is_size(cleaned)
+        or is_shoe_fit_range(cleaned)
+        or _is_footwear_width(cleaned)
+        or upper in _SIZE_ONLY_MARKERS
+    )
+
+
+def sanitize_color_size(color: object, size: object) -> tuple[str, str]:
+    """Defensively prevent a size-like value from reaching Garment Color.
+
+    This also protects regenerated events that still contain a pre-fix parsed
+    row: a recoverable size is moved into Size, while a lone marker is removed.
+    """
+    cleaned_color = valid_variant_value(color)
+    cleaned_size = normalize_size(size)
+    if is_purchasing_color(cleaned_color):
+        return cleaned_color, cleaned_size
+    if not cleaned_size and is_size(cleaned_color):
+        cleaned_size = normalize_size(cleaned_color)
+    return "", cleaned_size
 
 
 def valid_style(value) -> bool:
@@ -172,11 +380,12 @@ def _lineitem_has_internal_service_style(lineitem_name: object) -> bool:
     text = clean(lineitem_name).upper()
     if not text:
         return False
-    # Product 750 is Orchid's embroidery-charge code. Require a standalone token
-    # so a garment style such as 7500 is not accidentally removed.
+    # Products 750 and 750B are Orchid embroidery-charge codes. Require a
+    # standalone token so a garment style such as 7500 is not accidentally
+    # removed when a SKU is absent from the export.
     return any(
         re.search(rf"(?<![A-Z0-9]){re.escape(code)}(?![A-Z0-9])", text)
-        for code in {"750"}
+        for code in {"750", "750B"}
     )
 
 
@@ -184,7 +393,9 @@ def is_decoration_service(lineitem_name, style_number: object = "", *variant_val
     name = clean(lineitem_name).lower()
     return (
         is_internal_service_style(style_number)
+        or is_phantom_product_label(lineitem_name)
         or _lineitem_has_internal_service_style(lineitem_name)
+        or is_final_sale_accounting_product(lineitem_name, *variant_values)
         or is_decoration_charge(lineitem_name, *variant_values)
         or any(term in name for term in SERVICE_TERMS)
         or bool(infer_in_house_decoration(name))
@@ -740,6 +951,10 @@ def parse_shopify_orders(csv_path, product_master_path=None, normalized_orders: 
             row.get("Variant Option 1", ""), row.get("Variant Option 2", ""),
             row.get("Variant Option 3", ""), row.get("Variant Title", ""),
         )
+        footwear_size_selection = has_footwear_size_variant(
+            row.get("Variant Option 1", ""), row.get("Variant Option 2", ""),
+            row.get("Variant Option 3", ""), row.get("Variant Title", ""),
+        )
         if not lineitem_name or is_decoration_service(
             lineitem_name, row.get("Lineitem sku", ""), *variant_values
         ):
@@ -752,6 +967,12 @@ def parse_shopify_orders(csv_path, product_master_path=None, normalized_orders: 
             parsed["Garment Color"] = direct_color
         if direct_size:
             parsed["Size"] = direct_size
+        if footwear_size_selection and not direct_color:
+            # Report Toaster includes the variant title in Lineitem name.  Its
+            # generic parser can temporarily place a footwear selection such
+            # as ``XL 11-12 1/2`` or ``11 / Regular`` in Garment Color.  That
+            # is not a color.
+            parsed["Garment Color"] = ""
         if direct_color or direct_size:
             parsed["Needs Review"] = _review_reason_after_variant_override(parsed)
 
@@ -785,6 +1006,21 @@ def parse_shopify_orders(csv_path, product_master_path=None, normalized_orders: 
                 parser_source = smart.get("Parser Source", "Smart Custom Item")
                 parse_confidence = smart.get("Parse Confidence", "Medium")
                 detected_vendor = smart.get("Detected Vendor", detected_vendor)
+
+        # The normalizer has already used the Shopify options, but apply the
+        # same guard to every parser path (including smart/manual parsing and
+        # rows retained from an older event).  No size-like text can proceed to
+        # Product Master as a new Purchasing Color.
+        parsed_color, parsed_size = sanitize_color_size(
+            parsed.get("Garment Color", ""), parsed.get("Size", "")
+        )
+        if (
+            parsed_color != clean_text(parsed.get("Garment Color", ""))
+            or parsed_size != normalize_size(parsed.get("Size", ""))
+        ):
+            parsed["Garment Color"] = parsed_color
+            parsed["Size"] = parsed_size
+            parsed["Needs Review"] = _review_reason_after_variant_override(parsed)
 
         quantity = pd.to_numeric(row.get("Lineitem quantity", 0), errors="coerce")
         quantity = 0 if pd.isna(quantity) else int(quantity)

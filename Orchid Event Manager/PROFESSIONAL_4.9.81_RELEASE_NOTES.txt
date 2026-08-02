@@ -1,0 +1,9 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.81
+
+REPLACE CSV EVENT-ISOLATION REPAIR
+
+- Replace CSV now creates a unique active-packet identity before a new Purchase Review is processed.
+- Purchase Review, Employee Totals, report opening, and purchase-order generation verify the selected CSV and the protected workbook lock before using any event data.
+- Historical workbooks and completed packets can no longer become the current event merely because they are newer files.
+- The legacy upgrade path adopts a prior workbook only when its protected source hash exactly matches the saved current CSV.
+- If the active packet cannot be proven, Orchid stops with a clear message instead of showing old orders.

@@ -1,0 +1,11 @@
+Orchid Purchase Manager Professional 4.9.102
+
+CURRENT EVENT EMPTY STATE
+
+- Removes the faint visual divider between the cat illustration and the No Active Purchase Packet actions.
+- Centers the cat illustration and empty-state actions together as one responsive composition.
+- Preserves the existing logo-ready layout for active purchase packets.
+
+DATA SAFETY
+
+- No Product Master, purchase review, vendor routing, quantity, or report-generation rules changed.

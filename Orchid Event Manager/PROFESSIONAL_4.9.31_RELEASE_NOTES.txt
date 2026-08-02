@@ -1,0 +1,12 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.31
+
+IN-HOUSE RECEIVING & DECORATION REPORT
+- Vendor headers now show only the vendor and its purchase order number.
+- Moved the piece total from the vendor header to a full-width footer below
+  each vendor table.
+- Each footer is left-aligned and reads together, for example:
+  VENDOR TOTAL: 2
+- Expanded the Notes / Instructions column so the table and vendor bars share
+  the same clean width.
+
+No purchasing, routing, purchase-order numbering, or report data rules changed.

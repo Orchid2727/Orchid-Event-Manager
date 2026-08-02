@@ -14,6 +14,8 @@ from modules.decoration_locations import default_decoration_location, normalize_
 from modules.purchase_rules import bool_text, category_defaults, infer_category
 from modules.routing_rules import preferred_vendor_for_brand_text
 from modules.outsource_rules import NEVER_OUTSOURCE_COLUMN
+from modules.shopify_parser import is_purchasing_color
+from modules.internal_services import is_in_house_service_product, is_phantom_product_label
 from modules.xlsx_reader import read_table
 
 COLUMNS = [
@@ -29,6 +31,7 @@ COLUMNS = [
     "Product Aliases",
     "Vendor Color Code",
     "Color Aliases",
+    "Purchasing Style Number",
     "Product Category",
     "Requires Size",
     "Requires Color",
@@ -199,6 +202,7 @@ _COLOR_SPECIFIC_FIELDS = {
     "Garment Color",
     "Vendor Color Code",
     "Color Aliases",
+    "Purchasing Style Number",
     "Decoration Color",
     "Setup Required",
 }
@@ -210,15 +214,20 @@ def _is_setup_required(row: pd.Series) -> bool:
 
 def _matching_color_indexes(rows: pd.DataFrame, color: Any) -> list[Any]:
     key = _normalized_catalog_text(color).replace("grey", "gray")
-    if not key or rows.empty:
+    if rows.empty:
         return []
+    if not key:
+        # A no-color product such as Boots still needs one base Product Master
+        # row.  Match that blank row instead of making a duplicate on every
+        # future import.
+        return [index for index, row in rows.iterrows() if not _color_terms(row)]
     return [index for index, row in rows.iterrows() if key in _color_terms(row)]
 
 
 def _comparison_value(column: str, value: Any) -> str:
     if column == "Style Number":
         return normalize_style(value)
-    if column in {"Garment Color", "Vendor Color Code", "Color Aliases"}:
+    if column in {"Garment Color", "Vendor Color Code", "Color Aliases", "Purchasing Style Number"}:
         return _normalized_catalog_text(value).replace("grey", "gray")
     return clean(value).casefold()
 
@@ -410,6 +419,8 @@ def sync_shopify_catalog_enrichment(parsed_orders: pd.DataFrame, master_path: Pa
         incoming_keys: set[str] = set()
         for raw in group["Garment Color"]:
             color = clean(raw)
+            if not is_purchasing_color(color):
+                continue
             key = _normalized_catalog_text(color).replace("grey", "gray")
             if color and key and key not in incoming_keys:
                 incoming_colors.append(color)
@@ -429,6 +440,7 @@ def sync_shopify_catalog_enrichment(parsed_orders: pd.DataFrame, master_path: Pa
             row["Garment Color"] = color
             row["Vendor Color Code"] = ""
             row["Color Aliases"] = ""
+            row["Purchasing Style Number"] = ""
             # Thread/ink is color-specific and must be confirmed for a newly seen garment color.
             row["Decoration Color"] = ""
             row["Setup Required"] = "Yes"
@@ -504,7 +516,21 @@ def sync_review_product_candidates(review_path: Path, master_path: Path) -> dict
         if not style and not description:
             continue
         product_name = description or style
-        colors = _split_colors(candidate.get("Garment Color(s)", candidate.get("Garment Color", "")))
+        # A stale review workbook from an older build can still list a Shopify
+        # decoration fee as a candidate.  It records a sale but is never an
+        # item Orchid purchases, so do not materialize it in Product Master.
+        if (
+            is_in_house_service_product(product_name, style_number=style)
+            or is_phantom_product_label(style)
+            or is_phantom_product_label(description)
+        ):
+            continue
+        colors = [
+            color for color in _split_colors(
+                candidate.get("Garment Color(s)", candidate.get("Garment Color", ""))
+            )
+            if not color or is_purchasing_color(color)
+        ] or [""]
         current_vendor = clean(candidate.get("Current Vendor", candidate.get("Suggested Vendor", "")))
         _, inferred_vendor = preferred_vendor_for_brand_text(f"{product_name} {style}")
         vendor = current_vendor or inferred_vendor

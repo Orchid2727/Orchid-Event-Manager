@@ -46,6 +46,7 @@ ALIAS_COLUMNS = [
     "Product Aliases",
     "Vendor Color Code",
     "Color Aliases",
+    "Purchasing Style Number",
 ]
 MASTER_COLUMNS = BASE_COLUMNS + ALIAS_COLUMNS + RULE_COLUMNS + [NEVER_OUTSOURCE_COLUMN, "Setup Required"]
 
@@ -272,6 +273,7 @@ class ResolveResult:
     decoration_color: str
     master_color: str
     vendor_color_code: str
+    purchasing_style_number: str
     product_category: str
     requires_size: bool
     requires_color: bool
@@ -288,6 +290,10 @@ class ResolveResult:
             "Product Aliases": self.product_aliases,
             "Master Garment Color": self.master_color,
             "Master Vendor Color Code": self.vendor_color_code,
+            # This is the supplier's orderable style for the matched color.
+            # Shopify may use one friendly style for every color, while the
+            # vendor assigns each color its own ordering number.
+            "Vendor Product #": self.purchasing_style_number,
             "Product Category": self.product_category,
             "Requires Size": "Yes" if self.requires_size else "No",
             "Requires Color": "Yes" if self.requires_color else "No",
@@ -350,7 +356,7 @@ def resolve_product(
         })
         return ResolveResult(
             False, "No", "", style_key, clean(parsed_product), "", parsed_color_text,
-            "", "", "", "", "", "", "",
+            "", "", "", "", "", "", "", "",
             inferred["Product Category"],
             normalize_bool(inferred["Requires Size"], True),
             normalize_bool(inferred["Requires Color"], True),
@@ -390,6 +396,7 @@ def resolve_product(
     product_id = clean(routing_source.get("Product ID", "")) or default_product_id(master_style, product_name)
     master_color = clean(routing_source.get("Garment Color", ""))
     vendor_code = clean(routing_source.get("Vendor Color Code", ""))
+    purchasing_style_number = clean(routing_source.get("Purchasing Style Number", ""))
     resolved_color = parsed_color_text
     issue = "Product Master setup required" if setup_required else ""
 
@@ -427,6 +434,7 @@ def resolve_product(
         deco_color,
         master_color,
         vendor_code,
+        purchasing_style_number,
         product_category,
         requires_size,
         requires_color,

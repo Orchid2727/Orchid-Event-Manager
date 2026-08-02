@@ -1,0 +1,22 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.82
+
+SEALED EVENT WORKFLOW
+
+- Removed Replace CSV. A CSV is never swapped inside an existing event.
+- Current Event now uses Start New Event, Add Orders CSV, and Finish / Archive Event.
+- Each Purchase Review now stores the active Event ID as well as the CSV lock.
+- Every final PDF release stores that same Event ID and packet-lock ID.
+- Orchid opens a report only when both identities match the current event.
+
+STALE-REPORT PREVENTION
+
+- Same-named Event Archive folders are no longer searched by modified date.
+- An older Line Boots 2026 packet cannot open as the current boot event.
+- A v4.9.81 review can be regenerated once to add the Event ID; it is blocked
+  from reports until that one safe regeneration completes.
+
+BOOT-EVENT ACCEPTANCE CHECK
+
+- A current boot CSV excluding James Smith #1747 and Ricardo Rodriguez #1762
+  cannot display their orders in Purchase Review, Employee Totals, or POs.
+- Valid Ricardo Rodriguez #1757 remains part of the boot event.

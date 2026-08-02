@@ -131,7 +131,14 @@ def build_audit_view_snapshot(
         "selected_type": selected,
         "total": len(normalized_records),
         "needs_attention": len(unresolved),
-        "verified": sum(1 for item in normalized_records if bool(item.get("verified"))),
+        # A saved audit choice is one verification, even if a later workbook
+        # reconciliation merges two formerly separate display groups.  Counting
+        # only rendered groups made the audit report fewer confirmations than it
+        # had just saved (for example: 8 saved, then 6 shown after Rebuild).
+        "verified": sum(
+            int(item.get("verification_count", 1 if bool(item.get("verified")) else 0) or 0)
+            for item in normalized_records
+        ),
         "affected_lines": sum(len(item.get("line_records", [])) for item in normalized_records),
     }
 
@@ -251,6 +258,12 @@ def build_decoration_color_audit(
         include = clean(raw.get("Include", "Yes")).casefold()
         if include not in {"yes", "y", "true", "1"}:
             continue
+        # Boots—including insoles—are permanently blank, Never Outsource
+        # purchase items.  An older saved review can still carry an obsolete
+        # embroidery or screen-print label, but it must never create a thread
+        # or ink-color audit row.
+        if clean(raw.get("Product Category", "")).casefold() == "boots":
+            continue
         deco_type = decoration_family(raw.get("Decoration Type", ""))
         if (
             not deco_type
@@ -352,16 +365,58 @@ def build_decoration_color_audit(
                 issues.append("Product or category default differs from this garment color")
             issues.append("No exact style + garment color rule")
 
-        verified_record = verified_map.get(key, {})
-        verified_color = clean(verified_record.get("color", "")) if isinstance(verified_record, dict) else ""
-        verified_location = clean(verified_record.get("location", "")) if isinstance(verified_record, dict) else ""
+        # The visible audit key can change when a saved Purchase Review decision
+        # is reconciled into the workbook.  Retain the immutable line IDs on an
+        # audit confirmation and use them as a fallback, rather than allowing a
+        # successful confirmation to vanish after the display is rebuilt.
+        group_line_ids = {
+            clean(line_id) for line_id in group.get("line_ids", []) if clean(line_id)
+        }
+        matching_verifications: list[dict] = []
+        # State written by early RC13 test copies could contain both the normal
+        # confirmation and its durable event override.  They describe the same
+        # approval and must not be counted twice.  Conversely, two distinct
+        # original groups which later merge must remain two confirmations.
+        seen_confirmation_signatures: set[tuple] = set()
+        for verification_key, candidate in verified_map.items():
+            if not isinstance(candidate, dict):
+                continue
+            candidate_key = clean(verification_key)
+            candidate_line_ids = {
+                clean(line_id)
+                for line_id in candidate.get("line_ids", [])
+                if clean(line_id)
+            }
+            direct_key_match = candidate_key == key
+            line_match = bool(group_line_ids and candidate_line_ids & group_line_ids)
+            if not direct_key_match and not line_match:
+                continue
+            candidate_color = clean(candidate.get("color", ""))
+            candidate_location = clean(candidate.get("location", ""))
+            if normalize_color(candidate_color) != normalize_color(current_color):
+                continue
+            if candidate_location and candidate_location.casefold() != event_location.casefold():
+                continue
+            confirmation_signature = (
+                tuple(sorted(candidate_line_ids)),
+                normalize_color(candidate_color),
+                candidate_location.casefold(),
+            )
+            if confirmation_signature in seen_confirmation_signatures:
+                continue
+            seen_confirmation_signatures.add(confirmation_signature)
+            matching_verifications.append(candidate)
+
+        verified_record = matching_verifications[0] if matching_verifications else {}
+        verified_color = clean(verified_record.get("color", "")) if verified_record else ""
+        verified_location = clean(verified_record.get("location", "")) if verified_record else ""
         # A saved event decision must complete the current-event audit even when
         # Product Master has not yet produced an exact style + garment-color
         # match. That exact-rule status is still displayed for catalog follow-up,
         # but it cannot reopen an already-approved event decision forever.
         # Actual write failures are persisted separately and remain blocking.
         verified = bool(
-            verified_record
+            matching_verifications
             and normalize_color(verified_color) == normalize_color(current_color)
             and (not verified_location or verified_location.casefold() == event_location.casefold())
         )
@@ -380,6 +435,7 @@ def build_decoration_color_audit(
                 "issues": issues,
                 "suspicious": bool(issues),
                 "verified": verified,
+                "verification_count": len(matching_verifications),
                 "order_count": len(group.pop("orders")),
                 "employee_count": len(group.pop("employees")),
                 "quantity": int(quantity) if float(quantity).is_integer() else quantity,

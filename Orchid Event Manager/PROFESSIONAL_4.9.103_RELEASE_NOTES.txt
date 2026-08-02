@@ -1,0 +1,11 @@
+Orchid Purchase Manager Professional 4.9.103
+
+CURRENT EVENT EMPTY-STATE REPAIR
+
+- Restores the cat/computer illustration and No Active Purchase Packet actions on the empty Current Event page.
+- Uses the app's proven grid layout for this screen, avoiding the macOS placement failure that could leave the page blank.
+- Keeps the faint decorative divider removed and centers the two empty-state panels together.
+
+DATA SAFETY
+
+- No Product Master, purchase review, vendor routing, quantity, or report-generation rules changed.

@@ -1,0 +1,19 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.16
+
+Completed Purchase Packet
+- The internal packet verification receipt is now hidden from the Finder folder.
+- The visible completed packet contains only the four vendor POs and five supporting reports.
+
+Printing
+- Purchase Orders includes Print All Reports.
+- It combines the exact manifest-verified packet PDFs into one print-ready PDF in the saved packet order.
+- Source POs and reports are never changed by printing.
+
+Screen Space
+- Purchase Orders and Employee Totals now use the lower window area that was previously reserved as an empty spacer.
+
+Responsiveness
+- Purchase-document and Employee Totals lists do not rebuild when their saved source state has not changed.
+- This prevents avoidable screen lag and preserves an unsaved discount while it is being entered.
+
+The v4.9.15 active-route safety checks, Test 2 audit reconciliation, completed-packet verification, and report-generation rules remain unchanged.

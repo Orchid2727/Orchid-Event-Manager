@@ -1,0 +1,18 @@
+Orchid Purchase Manager Professional 4.9.100
+
+EDITABLE OUTSOURCED DESTINATION
+
+- Adds an editable Outsourced To field to Outsourced Report Covers.
+- Defaults to Stitch N Print for older and new events without a saved value.
+- Saves a separate destination for Embroidery and Screen Printing within the active event.
+- Prints the selected destination prominently on the matching outsourced job-report cover.
+
+OUTSOURCED COVER POLISH
+
+- Reworks the cover setup into a clear Job Name / Outsourced To panel.
+- Updates the instruction text so it supports any outside decorator.
+- Adds a framed Outsourced To band on the PDF cover, directly below the production job name.
+
+DATA SAFETY
+
+- This changes event-level cover metadata only; Product Master, vendor purchase routing, garment quantities, and artwork files are unchanged.
