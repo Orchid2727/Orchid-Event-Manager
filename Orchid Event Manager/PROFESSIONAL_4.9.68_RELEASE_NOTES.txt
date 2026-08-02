@@ -1,0 +1,8 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.68
+
+Product Master launch reliability repair
+
+- Ignores stale Product Master process records, including a PID that macOS has reused for another app.
+- Shows “Opening Product Master…” on both Product Master action buttons while the editor starts.
+- Verifies that the launched process is Product Master before reporting success.
+- Shows a clear error if Product Master cannot start. Current event, Product Master data, and purchase reports remain unchanged.

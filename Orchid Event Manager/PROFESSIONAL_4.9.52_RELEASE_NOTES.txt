@@ -1,0 +1,13 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.52
+
+RECEIVING & DECORATION TRU-SPEC REPAIR
+- The Receiving & Decoration Report now prints Vendor Product # when one is
+  available, exactly like the vendor purchase orders and Non-Included Items
+  report.
+- Confirmed Tru-Spec color-specific ordering numbers therefore carry through
+  to receiving: Pro Vector Coyote 1556, Pro Vector Black 1560, 24/7 Original
+  Tactical Pant color numbers, and Agility color numbers.
+- Original Shopify style numbers remain preserved in the event data; only the
+  displayed purchasing number changes where the vendor requires it.
+- No report header, spacing, vendor-bar, PO-number, or packet-storage behavior
+  changed in this update.

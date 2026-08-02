@@ -1,0 +1,6 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.58
+
+What's new
+- Georgia Boot insole option LR 9–10.5 now imports as Size L.
+- The footwear-specific parser recognizes the full shown option set: ME → M, LR → L, XL → XL, and 2XL → 2XL.
+- Shoe-fit ranges remain shopper guidance only; they do not become a color or trigger a missing-size Purchase Review prompt.

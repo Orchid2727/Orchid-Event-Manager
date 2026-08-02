@@ -1,0 +1,16 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.90
+
+PRODUCT MASTER COLOR-TABLE ALIGNMENT
+
+- The purchasing-color headings now use the same visible viewport as the
+  scrollable color rows.  Each heading sits directly over its editable field.
+- Delete remains beside the row number in the first, always-visible Actions
+  column.  It is not moved to the far right or hidden behind the scrollbar.
+- No Product Master data was changed, including Purchasing Colors, Shopify
+  Color Aliases, Vendor Color Codes, Purchase As Style # values, or Thread /
+  Ink settings.
+
+VALIDATION
+
+- Product Master table geometry and Delete-control regression coverage is
+  included with the full application test suite.

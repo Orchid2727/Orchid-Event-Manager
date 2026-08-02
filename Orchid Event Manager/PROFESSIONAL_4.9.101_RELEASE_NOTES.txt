@@ -1,0 +1,19 @@
+Orchid Purchase Manager Professional 4.9.101
+
+OUTSOURCED REPORT ARTWORK
+
+- Restores a complete artwork row on the Embroidery tab: Upload/Replace, Open, and Remove.
+- Adds the same always-available department-specific artwork row to Screen Printing.
+- Each department keeps its own artwork reference, so an embroidery file never replaces a screen-printing file.
+- The reference row works even before Purchase Review has determined the job's thread or ink colors.
+- Color-specific artwork rows still appear automatically once they are available.
+
+REPORT ACCURACY
+
+- A department-wide artwork reference prints only when that department has no color-specific artwork, avoiding duplicate images on the cover.
+- Purchase-order generation now carries artwork from both Embroidery and Screen Printing tabs to their matching report covers.
+
+DATA SAFETY
+
+- Existing event artwork and legacy job-logo files remain untouched.
+- No Product Master, purchase review, vendor routing, quantity, or report layout rules changed.

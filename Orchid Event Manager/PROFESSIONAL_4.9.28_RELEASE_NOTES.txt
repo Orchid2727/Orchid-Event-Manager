@@ -1,0 +1,13 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.28
+
+- The In-House Receiving & Decoration Report removes the redundant
+  “Internal Receiving & Decoration Worksheet” line.
+- The event/job name, such as “Test 2,” is now a larger, more prominent line
+  directly beneath the report title.
+- Non-Included Items removes the internal manual-order instruction line, uses
+  the same larger job-name treatment, and keeps each vendor total together on
+  the left, for example “VENDOR TOTAL: 2.”
+- Vendor purchase-order Quantity headers and all outsourced-report layouts
+  remain unchanged.
+- Application title, sidebar, About panel, app bundle, launcher, and bootstrap
+  identify the installed build as 4.9.28.

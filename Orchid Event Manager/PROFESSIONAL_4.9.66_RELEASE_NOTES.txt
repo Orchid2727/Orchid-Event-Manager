@@ -1,0 +1,5 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.66
+
+Product Master now identifies only the newly imported garment color that needs
+a Thread / Ink choice. New colors are shown first with an orange NEW marker;
+all previously configured color settings remain unchanged.

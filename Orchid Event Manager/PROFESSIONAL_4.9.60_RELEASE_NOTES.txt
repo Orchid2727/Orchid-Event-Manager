@@ -1,0 +1,10 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.60
+
+Permanent insole purchasing-rule repair
+
+- Treats RKK0317, A1Q82, 502440, and RKK0490 as Boots even if a Shopify title
+  says Footbed rather than Insole.
+- Enforces Size required, Color not required, Decoration not required, and
+  Never Outsource for all four styles.
+- Repairs older Product Master records and clears their false garment-color
+  Purchase Review prompts when the review is regenerated.

@@ -1,0 +1,7 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.56
+
+What's new
+- Boots and insoles always require Size.
+- Boots and insoles never require Color or Decoration.
+- Boots and insoles always route to Orchid as Never Outsource.
+- Older Boot records are corrected automatically when they are opened or used.

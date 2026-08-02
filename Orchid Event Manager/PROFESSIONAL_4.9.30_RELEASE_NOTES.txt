@@ -1,0 +1,10 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.30
+
+NON-INCLUDED ITEMS REPORT
+- Each vendor section now shows its saved purchase order number in the heading.
+- Example: Berne Apparel - PO # Berne Line 2026.
+- The report keeps the compact left-aligned vendor total below each vendor table.
+
+This update is limited to the Non-Included Items report heading. Vendor purchase
+orders, In-House Receiving, outsourced decoration reports, and PO entry behavior
+remain unchanged.

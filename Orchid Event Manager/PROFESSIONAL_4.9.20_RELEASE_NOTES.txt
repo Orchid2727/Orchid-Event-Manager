@@ -1,0 +1,6 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.20
+
+- Adds a practical footer to each department-specific outsourced job report.
+- Each footer lists the total pieces for every thread or ink color used by that department.
+- A final row gives the total embroidered or screen-printed pieces for that report.
+- Event Summary scheduling totals and all vendor purchase-order totals remain unchanged.

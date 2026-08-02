@@ -1,0 +1,7 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.57
+
+What's new
+- Shopify boot and insole variants such as ME 6–8.5 now import as Size M.
+- Decimal shoe-fit ranges and hyphen, en-dash, or em-dash formats are recognized.
+- The shoe-fit guide is not treated as a garment color.
+- Boots retain their permanent Product Master rule: Size required; no Color or Decoration required; Never Outsource.

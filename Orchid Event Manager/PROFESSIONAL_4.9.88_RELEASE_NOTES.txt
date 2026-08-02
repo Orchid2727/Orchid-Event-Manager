@@ -1,0 +1,15 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.88
+
+PRODUCT MASTER PURCHASING-COLOR TABLE POLISH
+
+- Purchasing-color headers now sit directly over their matching editable fields.
+- The header uses the same shared column layout as the color rows, so adding a
+  field cannot shift one without the other.
+- The header accounts for the color table's vertical scrollbar, preventing its
+  labels from drifting left of the inputs.
+- Compact identifiers remain fully readable: Purchasing Color, Vendor Color
+  Code, Shopify Color Alias, Purchase As Style #, Thread / Ink, and Remove.
+
+VALIDATION
+
+- The full regression suite passes: 110 tests.

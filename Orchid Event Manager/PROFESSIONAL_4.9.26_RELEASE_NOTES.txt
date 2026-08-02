@@ -1,0 +1,11 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.26
+
+- Outsourced embroidery and screen-printing report cover sheets now reserve
+  enough width for every PIECES heading to remain on one line.
+- The two-column color summary keeps its existing total width, one-page cover
+  layout, artwork grid, location totals, special notes, and production pages.
+- The count header is protected from being broken across two lines in narrow
+  cells, while the color names retain ample room for normal thread and ink
+  labels.
+- Application title, sidebar, About panel, app bundle, launcher, and bootstrap
+  identify the installed build as 4.9.26.

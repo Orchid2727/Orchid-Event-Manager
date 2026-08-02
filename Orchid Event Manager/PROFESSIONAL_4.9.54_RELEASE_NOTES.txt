@@ -1,0 +1,19 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.54
+
+INCLUDED REPAIR
+
+- Shopify and Report Toaster insole variants that combine the selected size with
+  a shoe-fit guide now import correctly. Examples:
+    Medium 6-8 1/2  -> M
+    Large 9-10 1/2  -> L
+    XL 11-12 1/2    -> XL
+    2XL 13-14 1/2   -> 2XL
+- The shoe-size range is guidance for the shopper only. Orchid no longer places
+  it in Garment Color or creates a false Missing size Purchase Review decision.
+
+VALIDATION
+
+- Added a direct Report Toaster regression test for Georgia Boot CC5 Insole
+  product GB00111 with Size required and Color not required.
+- The test verifies that the line is Ready in Purchase Review without manual
+  correction.

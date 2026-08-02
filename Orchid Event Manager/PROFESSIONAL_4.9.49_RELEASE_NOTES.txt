@@ -1,0 +1,9 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.49
+
+RECEIVING & DECORATION REPORT CLEANUP
+- Aligns each vendor heading and its detail table to the same full page width.
+- Removes the Vendor Total bars.
+- Prints the main Orchid Receiving & Decoration header on page one only.
+
+All purchasing routes, quantities, vendor grouping, purchase-order layouts,
+saved event data, and reliable packet storage remain unchanged.

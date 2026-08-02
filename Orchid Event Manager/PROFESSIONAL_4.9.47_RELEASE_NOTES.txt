@@ -1,0 +1,10 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.47
+
+REPORT HEADER CONSISTENCY
+- Applies the approved purchase-order masthead to the Receiving & Decoration
+  Report and the Non-Included Items Purchase Order.
+- The masthead repeats on every page of both reports.
+
+RECEIVING REPORT NAME
+- Renames the former In-House Receiving & Decoration Report to Receiving &
+  Decoration Report throughout the app and generated PDF.

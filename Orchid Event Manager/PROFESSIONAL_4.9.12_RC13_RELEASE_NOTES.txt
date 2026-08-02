@@ -1,0 +1,33 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.12 RC13
+PURCHASE-ORDER HANDOFF AND RELEASE-VISIBILITY CORRECTION
+
+WHY THIS BUILD EXISTS
+In 4.9.11 RC12, Purchase Review reconciliation could finish successfully while the next PO-number assignment window failed to appear in front on macOS. The Purchase Orders page then remained in the Ready state with zero documents, making the completed reconciliation look like completed report generation.
+
+FIXED
+- The Step 5 action is now labeled “Prepare & Assign PO Numbers” to distinguish reconciliation from actual PDF generation.
+- After reconciliation, Orchid returns control to Tk before opening the PO-number assignment window.
+- The assignment window is explicitly deiconified, raised, focused, and temporarily kept on top so it cannot remain hidden behind the main window on macOS.
+- If the assignment window cannot open, Orchid now states clearly that no reports were generated.
+- After final generation, Orchid verifies the final output folder, expected released PDF count, and FINAL_RELEASE_MANIFEST.json before reporting success.
+- The Purchase Orders page is force-refreshed after generation so it cannot remain on the pre-generation Ready state.
+- A clear Purchase Orders Created confirmation shows the verified PDF count and final folder path.
+- The last generated report folder is saved in current event state.
+
+PROTECTED CORE
+No changes were made to:
+- Shopify/source parsing
+- immutable Source ID or Packet Lock
+- quantity calculations
+- vendor routing
+- Never Outsource rules
+- Purchase Review decision logic
+- Decoration Color Audit calculations
+- PDF content/grouping generation
+- final output integrity reconciliation
+
+TEST 2 RETEST
+Open the existing Test 2 event, select Prepare & Assign PO Numbers, enter the four vendor PO numbers, and select Save & Generate Purchase Orders. The PDFs should be listed immediately on the Purchase Orders page.
+
+TEST LIMITATION
+Native macOS launch and window-order behavior cannot be executed in the Linux build environment. Python compilation, modal-handoff source checks, final-release verification simulation, protected-module hash comparison, and ZIP integrity checks were completed.

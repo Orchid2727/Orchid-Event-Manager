@@ -1,0 +1,6 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.22
+
+- Moves each outsourced embroidery or screen-printing report's color-by-color piece totals and final department total to its dedicated logo cover page.
+- Pairs that color summary with the existing decoration-location piece counts, so Stitch N Print can review the complete production overview before the artwork.
+- Removes the duplicate piece-total table from the bottom of the production pages.
+- Keeps the separate Embroidery and Screen Printing reports, their uploaded artwork, vendor purchase orders, and event reports unchanged.

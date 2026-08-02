@@ -1,0 +1,13 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.92
+
+PRODUCT MASTER — FULL-WIDTH EDITOR
+
+- Removed the redundant Product Catalog pane from the Style Editor.
+- Reclaimed that space for Product Information and Decoration Defaults &
+  Purchasing Colors.
+- Each purchasing-color mapping now appears in one left-to-right row:
+  Purchasing Color, Vendor Color Code, Shopify Color Alias, Purchase As Style
+  #, Thread / Ink, and Delete/Clear.
+- Labels and editable controls use the same shared grid columns, preventing
+  alignment drift.
+- No Product Master data was changed.

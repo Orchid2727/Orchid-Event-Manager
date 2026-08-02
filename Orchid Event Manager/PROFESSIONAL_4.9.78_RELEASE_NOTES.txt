@@ -1,0 +1,9 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.78
+
+BOOT ORDERING AND NON-INCLUDED ITEMS PURCHASE ORDER SAFETY REPAIR
+
+- Keeps finished-boot size and width together from Shopify through Purchase Review and the final PO, for example 11 / Medium and 10.5 / Wide.
+- Labels the PO column Size / Width and keeps Medium and Wide boots on separate purchasing lines.
+- Makes it clear that non-included items ship to Orchid while each purple section is the actual supplier.
+- Prevents Orchid Uniforms & Apparel from being printed as a purchase vendor. Those lines return to Product Master/Purchase Review until the actual supplier is assigned.
+- Retains the 4.9.77 identical-line combining behavior and employee/order trace.

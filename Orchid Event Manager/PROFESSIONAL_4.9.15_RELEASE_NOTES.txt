@@ -1,0 +1,11 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.15
+
+This source update narrows the active-event Product Master safeguard to actual
+PO routing changes and adds the direct Purchase Orders recovery action.
+
+Protected routing fields: Purchase Vendor, Decoration Type, Decoration
+Location, and Do Not Outsource / Never Outsource.
+
+Thread/ink color and catalog-only Product Master saves do not force a Purchase
+Review refresh. Final packet protection and report-generation validation remain
+in place.

@@ -1,0 +1,14 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.91
+
+PRODUCT MASTER PURCHASING-COLOR CARDS
+
+- Replaced the clipped one-line purchasing-color table with compact,
+  two-column editing cards that fit the Product Master pane at its narrowest
+  supported window size.
+- Every identifier sits directly above its own editable field: Purchasing
+  Color, Vendor Color Code, Shopify Color Alias, Purchase As Style #, and
+  Thread / Ink.
+- Delete now has its own full-width action bar at the top of each card, so it
+  cannot be cut off by a data-field width or a scrollbar.
+- No Product Master data was changed, including purchasing colors, aliases,
+  purchase-as style numbers, and thread / ink selections.

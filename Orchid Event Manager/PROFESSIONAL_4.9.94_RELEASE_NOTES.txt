@@ -1,0 +1,13 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.94
+===============================================
+
+Decoration-service cleanup
+--------------------------
+- Shopify product 750B (Higher Stitch Count Embroidered Left Chest Logo) is
+  recognized as an Orchid decoration charge, not a garment.
+- Decoration-only charges are excluded from Product Master, Purchase Review,
+  vendor purchase orders, and outsourced-decoration reports.
+- Existing saved decoration-charge rows are removed from Product Master on
+  upgrade. Orchid saves a dated Product Master backup before that cleanup.
+- Normal garments that happen to use embroidery continue through the standard
+  purchasing workflow unchanged.

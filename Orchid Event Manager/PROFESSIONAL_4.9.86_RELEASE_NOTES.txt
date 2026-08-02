@@ -1,0 +1,18 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.86
+
+BOOT PURCHASING-COLOR PRESERVATION
+
+- Keeps every valid Shopify-selected boot color on the Purchase Review and
+  purchase order, even when a color is optional for that boot style.
+- A64CQ now separates Black Full Grain and Medium Brown Full Grain using the
+  saved Product Master Color Aliases.
+- Boots and insoles with no color option still remain purchase-ready; blank
+  color values do not create a new review requirement.
+- Shoe sizes and widths remain protected from being treated as colors.
+
+SAFETY RESULT
+
+- A purchase rule that says color is not required no longer erases a color
+  selected in Shopify. It only permits an actually blank color to proceed.
+- This release adds an end-to-end regression test for A64CQ black/brown alias
+  routing, including review regeneration.

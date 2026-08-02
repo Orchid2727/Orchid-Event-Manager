@@ -1,0 +1,8 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.79
+
+PRODUCT MASTER SERVICE-ITEM SAVE RELIABILITY REPAIR
+
+- Fixes the Product Master save error for internal service/add-on items with no purchasing color, including BAGDECORATION.
+- Retains Blank Garment (No Decoration), Orchid Uniforms & Apparel, and the existing in-house service rules exactly as selected.
+- Stops the post-save Needs Setup refresh from crashing when a style legitimately has no real color rows.
+- Retains the prior boot size/width, vendor-routing, and PO safety fixes.

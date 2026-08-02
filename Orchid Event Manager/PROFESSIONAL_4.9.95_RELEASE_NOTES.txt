@@ -1,0 +1,19 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.95
+===============================================
+
+Product Master cleanup
+----------------------
+- EMBARK, American Flag, and Embark 2 Logo Embroidery are permanently
+  recognized as Shopify decoration-service charges.
+- Product 800 is recognized as Orchid in-house bulk stock. It remains in the
+  Shopify sale but is never a Product Master, Purchase Review, or vendor PO
+  item.
+- Existing saved copies of those items are removed automatically when Product
+  Master opens. Orchid saves a dated Product Master backup first.
+- Bare color/size labels such as Medium Black are rejected as phantom product
+  records and cannot return through a later import.
+- The same exclusions apply during import, Product Master synchronization,
+  Purchase Review, final purchase-order generation, and catalog cleanup.
+
+Existing boot purchasing, A64CQ color aliases, Tru-Spec purchase-as style
+numbers, and purchase-order folder opening behavior are unchanged.

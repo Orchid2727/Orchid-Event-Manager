@@ -1,0 +1,6 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.67
+
+Shopify size and fit values are now identified before Product Master updates.
+Numeric apparel sizes, Tall markers, footwear widths, shoe sizes, and insole
+fit ranges cannot become Purchasing Colors. Genuine garment colors remain
+unchanged, and legacy parsed rows are screened before color enrichment.

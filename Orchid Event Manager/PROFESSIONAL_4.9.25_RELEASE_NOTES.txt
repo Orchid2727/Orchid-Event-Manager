@@ -1,0 +1,12 @@
+ORCHID PURCHASE MANAGER PROFESSIONAL 4.9.25
+
+- Current Event now cleans the saved job logo into a transparent event copy,
+  removing the visible rectangular image canvas while leaving the original
+  upload unchanged.
+- Existing job-logo previews use the same cleanup immediately, so an event
+  already in progress does not need a new upload to display cleanly.
+- Current Event uses the available lower page space more efficiently: the
+  action area has reduced unused padding, a compact logo preview, and a fully
+  visible Open Product Master button.
+- Application title, sidebar version, About panel, app bundle, launcher, and
+  bootstrap labels now consistently identify the installed build as 4.9.25.
